@@ -22,6 +22,7 @@ export interface NodeRecord {
   ssh_key_id?: string;
   candidate_key_id?: string;
   legacy_known_hosts_disabled?: boolean;
+  zone_id?: string | null;
 }
 
 export interface Membership {
@@ -36,6 +37,22 @@ export interface Membership {
   user_interface: string;
   user_address: string;
   network_ready: boolean;
+  zone_id?: string | null;
+}
+
+export interface ZoningConfig {
+  mode: 'disabled' | 'awareness' | 'forced_awareness';
+  zones: string[];
+}
+
+export interface ZoningStatus {
+  applied_mode: ZoningConfig['mode'];
+  applied_zones: string[];
+  observed_zones: Record<string, string>;
+  status: 'disabled' | 'pending' | 'applied' | 'drift' | 'failed';
+  last_run_id?: number | null;
+  observed_at?: string | null;
+  last_error?: string;
 }
 
 export interface WorkloadObservation {
@@ -83,6 +100,8 @@ export interface Cluster {
   theme_color: string;
   desired_version: string;
   network_defaults: { mode: 'shared' | 'dedicated' };
+  zoning?: ZoningConfig;
+  zoning_status?: ZoningStatus;
   elasticsearch_settings: ElasticsearchSettings;
   log_monitoring?: LogMonitoring;
   members: Membership[];
@@ -165,6 +184,18 @@ export interface NodeBreakdown {
   name: string;
   node_type: string;
   roles: string[];
+  zone: string;
+  shards: number;
+  disk_total_bytes: number;
+  disk_available_bytes: number;
+  disk_used_bytes: number;
+  heap_used_bytes: number;
+  heap_max_bytes: number;
+}
+
+export interface ZoneBreakdown {
+  zone: string;
+  nodes: number;
   shards: number;
   disk_total_bytes: number;
   disk_available_bytes: number;
@@ -194,6 +225,7 @@ export interface ClusterMetrics {
   pending_tasks?: number;
   index_health?: Record<string, { status?: string; active_primary_shards?: number; unassigned_shards?: number }>;
   node_breakdown?: NodeBreakdown[];
+  zone_breakdown?: ZoneBreakdown[];
 }
 
 export interface ClusterSummary {
@@ -264,5 +296,6 @@ export interface TopologyResponse {
 export interface VersionResponse {
   assignments: Array<Assignment & { desired_version: string }>;
   available_versions: string[];
+  recommended_version?: string;
   registry_error?: string;
 }

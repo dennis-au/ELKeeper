@@ -4,6 +4,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConsoleContext } from '../app-context';
 import { HostsPage } from './HostsPage';
 
+const cluster = {
+  id: 1, name: 'lab-a', slug: 'lab-a', theme_color: '#0077CC', desired_version: '8.19.0',
+  ports: { elasticsearch_http: 9200, elasticsearch_transport: 9300, kibana: 5601, fleet: 8220, logstash_api: 9600 },
+  network_defaults: { mode: 'shared' as const },
+  zoning: { mode: 'awareness' as const, zones: ['zone-a', 'zone-b'] },
+  elasticsearch_settings: { allocation_enable: 'all' as const, rebalance_enable: 'all' as const, disk_watermark_low: '85%', disk_watermark_high: '90%', disk_watermark_flood_stage: '95%', recovery_max_bytes_per_sec: '40mb' },
+  members: [], assignments: [],
+};
+
 const state = vi.hoisted(() => ({ nodes: [] as Array<Record<string, unknown>>, dashboard: { hosts: [] as Array<Record<string, unknown>> } }));
 const apiMock = vi.hoisted(() => vi.fn());
 
@@ -37,12 +46,53 @@ describe('HostsPage enrollment', () => {
 
     expect(screen.getByText('Operating system')).toBeInTheDocument();
     expect(screen.getByText('Podman version')).toBeInTheDocument();
+    expect(screen.getByText('Zone')).toBeInTheDocument();
     expect(screen.getByRole('img', { name: 'Podman host server' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Add host' }));
     expect(screen.getByText('SSH host public key (optional)')).toBeInTheDocument();
     expect(screen.getByText(/ELKeeper uses the remote hostname/i)).toBeInTheDocument();
     expect(screen.getByText(/DNS hostnames are rejected/i)).toBeInTheDocument();
     expect(screen.getByRole('radio', { name: 'Bootstrap with a one-time password' })).not.toBeDisabled();
+  });
+
+  it('selects a cluster-defined zone while enrolling a host', async () => {
+    apiMock.mockResolvedValue({ run_id: 92 });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <ConsoleContext.Provider value={{ clusters: [cluster], selectedCluster: cluster, selectedClusterId: 1, setSelectedClusterId: () => undefined, watchRun: () => undefined, refreshAll: async () => undefined }}>
+          <HostsPage />
+        </ConsoleContext.Provider>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Add host' }));
+    fireEvent.change(screen.getByLabelText('Inventory name'), { target: { value: 'node-zone-a' } });
+    fireEvent.change(screen.getByLabelText('SSH IP address'), { target: { value: '192.0.2.141' } });
+    fireEvent.change(screen.getByLabelText('Zone'), { target: { value: 'zone-a' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save host' }));
+    await waitFor(() => expect(apiMock).toHaveBeenCalledWith('/api/nodes/enroll', expect.objectContaining({ method: 'POST' })));
+    const request = apiMock.mock.calls.find(([path]) => path === '/api/nodes/enroll')?.[1];
+    expect(JSON.parse(String(request?.body))).toEqual(expect.objectContaining({ zone_id: 'zone-a', zone_cluster_id: 1 }));
+  });
+
+  it('edits a host zone from the inventory action menu', async () => {
+    state.nodes = [{ id: 1, name: 'node-a', address: '192.0.2.101', ssh_port: 22, ssh_user: 'root', enabled: true, ssh_auth_state: 'controller_key', zone_id: 'zone-a' }];
+    apiMock.mockResolvedValue({ run_id: 93 });
+    const watchRun = vi.fn();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <ConsoleContext.Provider value={{ clusters: [cluster], selectedCluster: cluster, selectedClusterId: 1, setSelectedClusterId: () => undefined, watchRun, refreshAll: async () => undefined }}>
+          <HostsPage />
+        </ConsoleContext.Provider>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'All actions, row 1' }));
+    fireEvent.click(await screen.findByText('Edit zone'));
+    fireEvent.change(screen.getByLabelText('Host zone'), { target: { value: 'zone-b' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save zone' }));
+    await waitFor(() => expect(apiMock).toHaveBeenCalledWith('/api/nodes/1/zone', expect.objectContaining({ method: 'PUT', body: JSON.stringify({ cluster_id: 1, zone_id: 'zone-b' }) })));
+    expect(watchRun).toHaveBeenCalledWith(93);
   });
 
   it('marks the selected enrollment authentication method as checked', async () => {

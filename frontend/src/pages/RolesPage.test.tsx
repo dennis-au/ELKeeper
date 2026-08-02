@@ -1,14 +1,16 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ConsoleContext } from '../app-context';
 import type { Cluster } from '../types';
-import { RolesPage } from './RolesPage';
+import { managedWorkloadColumns, RolesPage, workloadImageVersion } from './RolesPage';
 
 const state = vi.hoisted(() => ({
-  api: vi.fn((path: string) => {
+  versionResponse: { available_versions: ['8.20.0', '8.19.0'], recommended_version: '8.20.0', assignments: [] },
+  api: vi.fn((path: string, _options?: RequestInit) => {
     if (path === '/api/health') return Promise.resolve({ roles: [{ id: 'master', label: 'Master' }] });
     if (path === '/api/clusters/1/topology') return Promise.resolve({ topology: '', access_urls: [] });
+    if (path === '/api/clusters/1/versions?role=master') return Promise.resolve(state.versionResponse);
     if (path === '/api/runs') return Promise.resolve([]);
     if (path === '/api/clusters/1/workload-changes/apply') return Promise.resolve({ run_id: 77 });
     if (path === '/api/nodes/1/storage') return Promise.resolve({
@@ -42,7 +44,10 @@ const cluster: Cluster = {
 };
 
 describe('RolesPage storage selection', () => {
-  afterEach(() => cleanup());
+  afterEach(() => {
+    cleanup();
+    state.versionResponse = { available_versions: ['8.20.0', '8.19.0'], recommended_version: '8.20.0', assignments: [] };
+  });
   it('browses host mounts and fills a dedicated workload path from the selected mount', async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
@@ -53,12 +58,19 @@ describe('RolesPage storage selection', () => {
       </QueryClientProvider>,
     );
 
+    expect(screen.getByRole('heading', { name: 'Placement' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Resources' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Storage' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Advanced configuration' })).toBeInTheDocument();
+    expect(screen.getByText('Host required')).toBeInTheDocument();
     fireEvent.change(screen.getAllByLabelText('Host')[1], { target: { value: '1' } });
+    await waitFor(() => expect(screen.getByText('Storage required')).toBeInTheDocument());
     const mountSelect = await screen.findByLabelText('Host storage mount');
     expect(screen.getByText('/dev/sdb1 · xfs · 1 KiB free of 2 KiB')).toBeInTheDocument();
     expect(screen.getAllByText('selectable')).toHaveLength(2);
     fireEvent.change(mountSelect, { target: { value: '/srv/elastic' } });
     expect(screen.getByLabelText('Storage path')).toHaveValue('/srv/elastic/elastic-control/lab-a/master-1');
+    await waitFor(() => expect(screen.getByText('Ready to stage')).toBeInTheDocument());
     expect(state.api).toHaveBeenCalledWith('/api/nodes/1/storage');
   });
 
@@ -74,6 +86,7 @@ describe('RolesPage storage selection', () => {
     );
 
     fireEvent.change(screen.getAllByLabelText('Host')[1], { target: { value: '1' } });
+    expect(await screen.findByLabelText('Image version')).toHaveValue('8.20.0');
     fireEvent.change(await screen.findByLabelText('Host storage mount'), { target: { value: '/srv/elastic' } });
     fireEvent.click(screen.getByRole('button', { name: 'Add to pending changes' }));
 
@@ -84,6 +97,40 @@ describe('RolesPage storage selection', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Apply 1 change' }));
     expect(await screen.findByRole('button', { name: 'Apply 1 change' })).toBeDisabled();
     expect(state.api).toHaveBeenCalledWith('/api/clusters/1/workload-changes/apply', expect.objectContaining({ method: 'POST' }));
+    const request = state.api.mock.calls.find(([path]) => path === '/api/clusters/1/workload-changes/apply')?.[1];
+    expect(JSON.parse(String(request?.body)).changes[0].image_version).toBe('8.20.0');
+  });
+
+  it('defaults staged workloads to the current cluster version when one is recommended', async () => {
+    state.versionResponse = { available_versions: ['8.20.0', '8.19.0'], recommended_version: '8.19.0', assignments: [] };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <ConsoleContext.Provider value={{ clusters: [cluster], selectedCluster: cluster, selectedClusterId: 1, setSelectedClusterId: () => undefined, watchRun: () => undefined, refreshAll: async () => undefined }}>
+          <RolesPage />
+        </ConsoleContext.Provider>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByLabelText('Image version')).toHaveValue('8.19.0'));
+  });
+
+  it('shows the observed running image version immediately after the workload role', async () => {
+    const clusterWithAssignment: Cluster = {
+      ...cluster,
+      assignments: [{
+        id: 9, cluster_id: 1, node_id: 1, node_name: 'node-a', role: 'master', state: 'active', revision: 1,
+        image_version: '8.19.0', config: { cpu: '2', memory: '4g', storage_path: '/srv/elastic/master-1' },
+        observation: {
+          image: 'docker.elastic.co/elasticsearch/elasticsearch:8.19.1', digest: 'sha256:test', version: '8.19.1',
+          running: true, cached: true, observed_at: '2026-08-02T00:00:00Z', error: '',
+        },
+      }],
+    };
+    expect(managedWorkloadColumns.slice(0, 2).map((column) => column.id)).toEqual(['role', 'version']);
+    expect(managedWorkloadColumns[1].display).toBe('Image version');
+    expect(workloadImageVersion(clusterWithAssignment.assignments[0])).toBe('8.19.1');
+    expect(workloadImageVersion({ ...clusterWithAssignment.assignments[0], image_version: '8.19.0', observation: undefined })).toBe('not observed');
   });
 
   it('keeps a staged workload editable until the complete change set is applied', async () => {
@@ -97,7 +144,9 @@ describe('RolesPage storage selection', () => {
     );
 
     fireEvent.change(screen.getAllByLabelText('Host')[1], { target: { value: '1' } });
+    await waitFor(() => expect(screen.getByLabelText('Image version')).toHaveValue('8.20.0'));
     fireEvent.change(await screen.findByLabelText('Host storage mount'), { target: { value: '/srv/elastic' } });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Add to pending changes' })).not.toBeDisabled());
     fireEvent.click(screen.getByRole('button', { name: 'Add to pending changes' }));
 
     fireEvent.click(await screen.findByRole('button', { name: 'Edit pending workload master on node-a' }));
@@ -120,7 +169,9 @@ describe('RolesPage storage selection', () => {
     );
 
     fireEvent.change(screen.getAllByLabelText('Host')[1], { target: { value: '1' } });
+    await waitFor(() => expect(screen.getByLabelText('Image version')).toHaveValue('8.20.0'));
     fireEvent.change(await screen.findByLabelText('Host storage mount'), { target: { value: '/srv/elastic' } });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Add to pending changes' })).not.toBeDisabled());
     fireEvent.click(screen.getByRole('button', { name: 'Add to pending changes' }));
     await screen.findByRole('heading', { name: 'Pending changes' });
 

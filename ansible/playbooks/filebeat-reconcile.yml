@@ -160,6 +160,18 @@
                 labels.elkeeper_host: "{{ inventory_hostname }}"
                 labels.elkeeper_role: "{{ assignment.role }}"
                 labels.elkeeper_workload: "{{ workload }}"
+          processors:
+            - decode_json_fields:
+                fields: ["message"]
+                target: ""
+                overwrite_keys: true
+                add_error_key: false
+          {% if assignment.role in ['master', 'hot', 'warm', 'ml', 'ingest', 'coordinating'] %}
+            - add_fields:
+                target: service
+                fields:
+                  type: elasticsearch
+          {% endif %}
           setup.ilm.enabled: false
           setup.template.enabled: false
           output.elasticsearch:
@@ -167,6 +179,7 @@
             username: {{ filebeat_username }}
             password: ${ECP_FILEBEAT_PASSWORD}
             index: "logs-elkeeper.{{ cluster.slug }}-default"
+            pipeline: "_none"
             ssl.certificate_authorities: ["/usr/share/filebeat/certs/ca.crt"]
       no_log: true
       when:
@@ -202,6 +215,7 @@
           [Container]
           Image={{ filebeat_image }}
           ContainerName={{ filebeat_workload }}
+          User=0
           Label=io.elastic-control.managed=true
           Label=io.elastic-control.cluster-id={{ cluster.id }}
           Label=io.elastic-control.cluster-slug={{ cluster.slug }}
@@ -250,6 +264,38 @@
       failed_when: filebeat_running.stdout | trim != 'true'
       when:
         - filebeat_enabled | bool
+        - (filebeat_log_path.rc | default(3)) == 0
+        - (filebeat_security_ready.rc | default(1)) == 0
+
+    - name: Ensure the cluster log data view exists in Kibana
+      ansible.builtin.uri:
+        url: "https://{{ membership.user_address }}:{{ assignment.ports.kibana }}/api/data_views/data_view"
+        method: POST
+        user: elastic
+        password: "{{ credentials.elastic_password }}"
+        force_basic_auth: true
+        validate_certs: true
+        ca_path: "{{ cert_root }}/ca.crt"
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body:
+          override: true
+          data_view:
+            id: "elkeeper-logs-{{ cluster.slug }}"
+            title: "logs-elkeeper.{{ cluster.slug }}-*"
+            name: "ELKeeper {{ cluster.name }} logs"
+            timeFieldName: "@timestamp"
+            allowNoIndex: true
+        status_code: [200, 201]
+      register: filebeat_kibana_data_view
+      retries: 30
+      delay: 2
+      until: filebeat_kibana_data_view.status in [200, 201]
+      no_log: true
+      when:
+        - filebeat_enabled | bool
+        - assignment.role == 'kibana'
         - (filebeat_log_path.rc | default(3)) == 0
         - (filebeat_security_ready.rc | default(1)) == 0
 

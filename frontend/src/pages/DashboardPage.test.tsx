@@ -13,9 +13,13 @@ const state = vi.hoisted(() => {
     metrics: {
       cluster_id: 1, status: 'green', nodes: 3, data_nodes: 2, active_shards: 12, unassigned_shards: 0,
       node_breakdown: [
-        { id: 'hot-id', name: 'hot-1', node_type: 'Hot data', roles: ['master', 'data_hot'], shards: 7, disk_used_bytes: 600, disk_total_bytes: 1000, disk_available_bytes: 400, heap_used_bytes: 300, heap_max_bytes: 600 },
-        { id: 'warm-id', name: 'warm-1', node_type: 'Warm data', roles: ['data_warm'], shards: 4, disk_used_bytes: 800, disk_total_bytes: 2000, disk_available_bytes: 1200, heap_used_bytes: 200, heap_max_bytes: 800 },
-        { id: 'other-id', name: 'ingest-1', node_type: 'Ingest', roles: ['ingest'], shards: 0, disk_used_bytes: 200, disk_total_bytes: 500, disk_available_bytes: 300, heap_used_bytes: 100, heap_max_bytes: 400 },
+        { id: 'hot-id', name: 'hot-1', node_type: 'Hot data', roles: ['master', 'data_hot'], zone: 'zone-a', shards: 7, disk_used_bytes: 600, disk_total_bytes: 1000, disk_available_bytes: 400, heap_used_bytes: 300, heap_max_bytes: 600 },
+        { id: 'warm-id', name: 'warm-1', node_type: 'Warm data', roles: ['data_warm'], zone: 'zone-b', shards: 4, disk_used_bytes: 800, disk_total_bytes: 2000, disk_available_bytes: 1200, heap_used_bytes: 200, heap_max_bytes: 800 },
+        { id: 'other-id', name: 'ingest-1', node_type: 'Ingest', roles: ['ingest'], zone: '', shards: 0, disk_used_bytes: 200, disk_total_bytes: 500, disk_available_bytes: 300, heap_used_bytes: 100, heap_max_bytes: 400 },
+      ],
+      zone_breakdown: [
+        { zone: 'zone-a', nodes: 1, shards: 7, disk_used_bytes: 600, disk_total_bytes: 1000, disk_available_bytes: 400, heap_used_bytes: 300, heap_max_bytes: 600 },
+        { zone: 'zone-b', nodes: 1, shards: 4, disk_used_bytes: 800, disk_total_bytes: 2000, disk_available_bytes: 1200, heap_used_bytes: 200, heap_max_bytes: 800 },
       ],
     },
     history: [],
@@ -141,7 +145,7 @@ describe('DashboardPage', () => {
     );
 
     expect(await screen.findByRole('heading', { name: 'User access endpoints' })).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /https:\/\/192\.168\.0\.102:5601/ })).toHaveAttribute('href', 'https://192.0.2.102:5601');
+    expect(screen.getByRole('link', { name: /https:\/\/192\.0\.2\.102:5601/ })).toHaveAttribute('href', 'https://192.0.2.102:5601');
   });
 
   it('opens Kibana Discover with the selected cluster log data-stream filter', async () => {
@@ -170,6 +174,7 @@ describe('DashboardPage', () => {
 
     const link = await screen.findByRole('link', { name: 'Open Kibana logs' });
     expect(link).toHaveAttribute('href', expect.stringContaining('/app/discover#/'));
+    expect(link.getAttribute('href')).toContain("dataViewId:'elkeeper-logs-production'");
     expect(link.getAttribute('href')).toContain('data_stream.dataset');
     expect(link.getAttribute('href')).toContain('elkeeper.production');
   });
@@ -201,7 +206,10 @@ describe('DashboardPage', () => {
     expect(screen.getByText('Hot data')).toBeInTheDocument();
     expect(screen.getByText('Warm data')).toBeInTheDocument();
     expect(screen.getByText('Ingest')).toBeInTheDocument();
-    expect(screen.getByText('7')).toBeInTheDocument();
+    expect(screen.getAllByText('Zone').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('zone-a').length).toBeGreaterThan(0);
+    expect(screen.getByRole('heading', { name: 'Zone capacity and shard distribution' })).toBeInTheDocument();
+    expect(screen.getAllByText('7').length).toBeGreaterThan(0);
   });
 
   it('explains the selected cluster health status on hover and focus', async () => {

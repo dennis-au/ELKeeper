@@ -3,14 +3,14 @@ import {
   EuiBadge, EuiBasicTable, EuiButton, EuiButtonEmpty, EuiCallOut, EuiCheckbox, EuiConfirmModal,
   EuiFieldNumber, EuiFieldPassword, EuiFieldText, EuiForm, EuiFormRow, EuiHealth, EuiModal,
   EuiIcon, EuiModalBody, EuiModalFooter, EuiModalHeader, EuiModalHeaderTitle, EuiOverlayMask, EuiPanel,
-  EuiRadioGroup, EuiSpacer, EuiSwitch, EuiText, EuiTitle,
+  EuiRadioGroup, EuiSelect, EuiSpacer, EuiSwitch, EuiText, EuiTitle,
 } from '@elastic/eui';
 import type { EuiBasicTableColumn } from '@elastic/eui';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, jsonBody, queries } from '../api';
 import { useConsole } from '../app-context';
 import { timeAgo } from '../format';
-import type { HostRuntime, NodeRecord } from '../types';
+import type { Cluster, HostRuntime, NodeRecord } from '../types';
 
 function isIpAddress(value: string) {
   const address = value.trim();
@@ -19,9 +19,9 @@ function isIpAddress(value: string) {
   return address.includes(':') && /^[0-9A-Fa-f:.]+$/.test(address);
 }
 
-function HostEditor({ node, onClose, onRun }: { node?: NodeRecord; onClose: () => void; onRun: (runId: number) => void }) {
+function HostEditor({ node, cluster, onClose, onRun }: { node?: NodeRecord; cluster?: Cluster; onClose: () => void; onRun: (runId: number) => void }) {
   const queryClient = useQueryClient();
-  const [form, setForm] = useState({ name: node?.name || '', address: node?.address || '', ssh_user: node?.ssh_user || 'root', ssh_port: node?.ssh_port || 22, enabled: node?.enabled ?? true, ssh_host_key: node?.ssh_host_key || '', auth_method: 'controller_key', password: '', install_controller_key: true });
+  const [form, setForm] = useState({ name: node?.name || '', address: node?.address || '', ssh_user: node?.ssh_user || 'root', ssh_port: node?.ssh_port || 22, enabled: node?.enabled ?? true, ssh_host_key: node?.ssh_host_key || '', auth_method: 'controller_key', password: '', install_controller_key: true, zone_id: node?.zone_id || cluster?.zoning?.zones[0] || '' });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [testingPassword, setTestingPassword] = useState(false);
@@ -49,6 +49,8 @@ function HostEditor({ node, onClose, onRun }: { node?: NodeRecord; onClose: () =
           ssh_host_key: form.ssh_host_key, auth_method: form.auth_method,
           password: form.auth_method === 'password' ? form.password : undefined,
           install_controller_key: form.install_controller_key,
+          zone_id: form.zone_id || undefined,
+          zone_cluster_id: form.zone_id ? cluster?.id : undefined,
         }) });
         onRun(result.run_id);
       }
@@ -65,6 +67,7 @@ function HostEditor({ node, onClose, onRun }: { node?: NodeRecord; onClose: () =
           <EuiFormRow label="SSH IP address" helpText="IPv4 or IPv6 literal only. DNS hostnames are rejected." isInvalid={Boolean(form.address) && !isIpAddress(form.address)} error={Boolean(form.address) && !isIpAddress(form.address) ? 'Enter a valid IP address.' : undefined}><EuiFieldText value={form.address} onChange={(event) => setForm({ ...form, address: event.target.value })} autoComplete="off" spellCheck={false} /></EuiFormRow>
           <EuiFormRow label="SSH user"><EuiFieldText value={form.ssh_user} onChange={(event) => setForm({ ...form, ssh_user: event.target.value })} /></EuiFormRow>
           <EuiFormRow label="SSH port"><EuiFieldNumber min={1} max={65535} value={form.ssh_port} onChange={(event) => setForm({ ...form, ssh_port: Number(event.target.value) })} /></EuiFormRow>
+          {!node && <EuiFormRow label="Zone" helpText={cluster ? `Zones defined by ${cluster.name}.` : 'Select a cluster first to assign a host zone.'}><EuiSelect value={form.zone_id} disabled={!cluster?.zoning?.zones.length} onChange={(event) => setForm({ ...form, zone_id: event.target.value })} options={[{ value: '', text: cluster?.zoning?.zones.length ? 'Select zone' : 'No zones defined' }, ...(cluster?.zoning?.zones || []).map((zone) => ({ value: zone, text: zone }))]} /></EuiFormRow>}
           <EuiFormRow><EuiCheckbox id="host-enabled" label="Enabled for controller operations" checked={form.enabled} onChange={(event) => setForm({ ...form, enabled: event.target.checked })} /></EuiFormRow>
         </div>
         {node && <><EuiSpacer size="s" /><EuiFormRow label="SSH host public key (optional)" helpText="Leave blank to skip host-key validation. A supplied OpenSSH host key remains pinned and replacement is audited."><EuiFieldText value={form.ssh_host_key} onChange={(event) => setForm({ ...form, ssh_host_key: event.target.value })} placeholder="ssh-ed25519 AAAA..." /></EuiFormRow></>}
@@ -82,12 +85,15 @@ function HostEditor({ node, onClose, onRun }: { node?: NodeRecord; onClose: () =
 
 export function HostsPage() {
   const queryClient = useQueryClient();
-  const { watchRun, clusters } = useConsole();
+  const { watchRun, clusters, selectedCluster } = useConsole();
   const { data: nodes = [] } = useQuery({ queryKey: ['nodes'], queryFn: queries.nodes });
   const { data: dashboard } = useQuery({ queryKey: ['dashboard'], queryFn: queries.dashboard, refetchInterval: 10000 });
   const [editing, setEditing] = useState<NodeRecord | 'new'>();
   const [confirm, setConfirm] = useState<{ action: 'initialize' | 'reboot' | 'deinitialize' | 'delete' | 'removeLegacyKnownHosts'; node: NodeRecord }>();
   const [keyInstall, setKeyInstall] = useState<NodeRecord>();
+  const [zoneEdit, setZoneEdit] = useState<NodeRecord>();
+  const [zoneId, setZoneId] = useState('');
+  const [zoneBusy, setZoneBusy] = useState(false);
   const [bootstrapPassword, setBootstrapPassword] = useState('');
   const [bootstrapBusy, setBootstrapBusy] = useState(false);
   const [revokeOnDelete, setRevokeOnDelete] = useState(false);
@@ -132,11 +138,21 @@ export function HostsPage() {
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Controller key installation failed'); }
     finally { setBootstrapBusy(false); }
   };
+  const saveZone = async () => {
+    if (!zoneEdit || !selectedCluster || !zoneId) return;
+    setZoneBusy(true); setError('');
+    try {
+      const result = await api<{ run_id: number }>(`/api/nodes/${zoneEdit.id}/zone`, { method: 'PUT', ...jsonBody({ cluster_id: selectedCluster.id, zone_id: zoneId }) });
+      watchRun(result.run_id); setZoneEdit(undefined); setZoneId(''); await queryClient.invalidateQueries();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to update host zone'); }
+    finally { setZoneBusy(false); }
+  };
   type HostItem = NodeRecord & { runtime?: HostRuntime; workload_count: number };
   const items: HostItem[] = nodes.map((node) => ({ ...node, runtime: runtime.get(node.id), workload_count: assignments.get(node.id) || 0 }));
   const columns: Array<EuiBasicTableColumn<HostItem>> = [
     { field: 'name', name: 'Host', render: (value: string, item: NodeRecord) => <div><strong>{value}</strong><small className="block-muted">{item.ssh_user}@{item.address}:{item.ssh_port}</small></div> },
     { field: 'runtime.os_name', name: 'Operating system', render: (value: string, item: HostItem) => <span>{item.runtime?.os_name || 'not observed'}</span> },
+    { field: 'zone_id', name: 'Zone', render: (value?: string | null) => value ? <EuiBadge color="hollow">{value}</EuiBadge> : <span className="block-muted">not assigned</span> },
     { field: 'runtime.reachable', name: 'Reachability', render: (value: boolean, item: NodeRecord & { runtime?: HostRuntime }) => <EuiHealth color={value ? 'success' : 'danger'}>{value ? 'reachable' : item.runtime?.last_error || 'unreachable'}</EuiHealth> },
     { field: 'ssh_auth_state', name: 'SSH access', render: (value: string, item: NodeRecord) => <div><EuiBadge color={value === 'controller_key' ? 'success' : value === 'pending' || item.legacy_known_hosts_disabled ? 'warning' : 'hollow'}>{value === 'controller_key' ? 'controller key' : value === 'candidate_ready' ? 'candidate ready' : value === 'legacy' ? item.legacy_known_hosts_disabled ? 'legacy record removed' : 'legacy key' : 'pending'}</EuiBadge><small className="block-muted">{item.ssh_key_id || item.candidate_key_id || ''}</small></div> },
     { field: 'runtime.initialized', name: 'Initialized', render: (value: boolean) => <EuiBadge color={value ? 'success' : 'default'}>{value ? 'initialized' : 'uninitialized'}</EuiBadge> },
@@ -148,6 +164,7 @@ export function HostsPage() {
       { name: 'Probe', description: 'Probe host over SSH', icon: 'inspect', type: 'icon' as const, onClick: probe },
       { name: 'Remove legacy known_hosts record', description: 'Stop using inherited legacy host-key trust for this host', icon: 'unlink', color: 'danger', type: 'icon' as const, available: (item: NodeRecord) => item.ssh_auth_state === 'legacy' && !item.legacy_known_hosts_disabled, onClick: (item: NodeRecord) => setConfirm({ action: 'removeLegacyKnownHosts', node: item }) },
       { name: 'Install controller key', description: 'Use a one-time password to install the controller SSH key', icon: 'key', type: 'icon' as const, onClick: (item: NodeRecord) => setKeyInstall(item) },
+      { name: 'Edit zone', description: 'Assign a zone defined by the selected cluster', icon: 'globe', type: 'icon' as const, available: () => Boolean(selectedCluster?.zoning?.zones.length), onClick: (item: NodeRecord) => { setZoneId(item.zone_id || selectedCluster?.zoning?.zones[0] || ''); setZoneEdit(item); } },
       { name: 'Initialize', description: 'Install prerequisites and enable Podman socket', icon: 'play', type: 'icon' as const, onClick: (item: NodeRecord) => setConfirm({ action: 'initialize', node: item }) },
       { name: 'De-initialize', description: 'Remove controller-owned host setup', icon: 'stop', type: 'icon' as const, available: (item: HostItem) => item.runtime?.initialized === true, onClick: (item: NodeRecord) => setConfirm({ action: 'deinitialize', node: item }) },
       { name: 'Reboot', description: 'Restart this host and wait for it to return', icon: 'refresh', color: 'danger', type: 'icon' as const, onClick: (item: NodeRecord) => setConfirm({ action: 'reboot', node: item }) },
@@ -159,7 +176,7 @@ export function HostsPage() {
     <div className="page-stack">
       <div className="page-heading"><div><EuiTitle><h1>Host Config</h1></EuiTitle><EuiText color="subdued">SSH inventory, initialization state, and the controller-only Podman socket channel.</EuiText></div><EuiButton fill iconType="plusInCircle" onClick={() => setEditing('new')}>Add host</EuiButton></div>
       {error && <EuiCallOut title="Host operation failed" color="danger" iconType="warning">{error}</EuiCallOut>}
-      {editing && <HostEditor node={editing === 'new' ? undefined : editing} onClose={() => setEditing(undefined)} onRun={watchRun} />}
+      {editing && <HostEditor node={editing === 'new' ? undefined : editing} cluster={selectedCluster} onClose={() => setEditing(undefined)} onRun={watchRun} />}
       <section className="section-band">
         <div className="section-heading"><div><EuiTitle size="s"><h2>Host inventory</h2></EuiTitle><EuiText color="subdued">The Podman API remains a rootful Unix socket and is forwarded through SSH only while monitored.</EuiText></div></div>
         <EuiBasicTable items={items} columns={columns} tableLayout="auto" />
@@ -181,6 +198,11 @@ export function HostsPage() {
         <EuiModalHeader><EuiModalHeaderTitle>Install controller key on {keyInstall.name}</EuiModalHeaderTitle></EuiModalHeader>
         <EuiModalBody><EuiText size="s"><p>The password is used once to add the current controller public key to <strong>{keyInstall.ssh_user}</strong>. It is not retained.</p></EuiText><EuiSpacer /><EuiFormRow label="Host password"><EuiFieldPassword data-autofocus value={bootstrapPassword} onChange={(event) => setBootstrapPassword(event.target.value)} autoComplete="new-password" onKeyDown={(event) => { if (event.key === 'Enter') installKey(); }} /></EuiFormRow></EuiModalBody>
         <EuiModalFooter><EuiButtonEmpty onClick={() => { setKeyInstall(undefined); setBootstrapPassword(''); }}>Cancel</EuiButtonEmpty><EuiButton fill onClick={installKey} isLoading={bootstrapBusy} disabled={!bootstrapPassword}>Install key</EuiButton></EuiModalFooter>
+      </EuiModal></EuiOverlayMask>}
+      {zoneEdit && selectedCluster && <EuiOverlayMask><EuiModal onClose={() => { setZoneEdit(undefined); setZoneId(''); }} initialFocus="[data-autofocus]">
+        <EuiModalHeader><EuiModalHeaderTitle>Edit zone for {zoneEdit.name}</EuiModalHeaderTitle></EuiModalHeader>
+        <EuiModalBody><EuiText size="s"><p>The host zone is a physical attribute shared by every cluster that uses this host. Active Elasticsearch workloads are reconciled and rolled back if readiness fails.</p></EuiText><EuiSpacer /><EuiFormRow label="Host zone"><EuiSelect data-autofocus value={zoneId} onChange={(event) => setZoneId(event.target.value)} options={(selectedCluster.zoning?.zones || []).map((zone) => ({ value: zone, text: zone }))} /></EuiFormRow></EuiModalBody>
+        <EuiModalFooter><EuiButtonEmpty onClick={() => { setZoneEdit(undefined); setZoneId(''); }}>Cancel</EuiButtonEmpty><EuiButton fill onClick={saveZone} isLoading={zoneBusy} disabled={!zoneId}>Save zone</EuiButton></EuiModalFooter>
       </EuiModal></EuiOverlayMask>}
     </div>
   );

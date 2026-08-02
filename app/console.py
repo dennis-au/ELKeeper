@@ -337,6 +337,7 @@ def node_breakdown(node_stats, allocation):
             "name": name,
             "node_type": elastic_node_type(roles),
             "roles": roles,
+            "zone": str(node.get("attributes", {}).get("zone") or ""),
             "shards": shard_counts.get(name, 0),
             "disk_total_bytes": total,
             "disk_available_bytes": available,
@@ -345,6 +346,24 @@ def node_breakdown(node_stats, allocation):
             "heap_max_bytes": jvm.get("heap_max_in_bytes", 0) or 0,
         })
     return sorted(breakdown, key=lambda item: (NODE_TYPE_ORDER[item["node_type"]], item["name"].lower()))
+
+
+def zone_breakdown(nodes):
+    zones = {}
+    for node in nodes:
+        zone = node.get("zone") or "unassigned"
+        aggregate = zones.setdefault(zone, {
+            "zone": zone, "nodes": 0, "shards": 0,
+            "disk_total_bytes": 0, "disk_available_bytes": 0, "disk_used_bytes": 0,
+            "heap_used_bytes": 0, "heap_max_bytes": 0,
+        })
+        aggregate["nodes"] += 1
+        for field in (
+            "shards", "disk_total_bytes", "disk_available_bytes", "disk_used_bytes",
+            "heap_used_bytes", "heap_max_bytes",
+        ):
+            aggregate[field] += int(node.get(field) or 0)
+    return sorted(zones.values(), key=lambda item: (item["zone"] == "unassigned", item["zone"]))
 
 
 class TelemetryManager:
@@ -419,6 +438,83 @@ class TelemetryManager:
             last = response
         raise RuntimeError(f"Podman API returned HTTP {last.status_code if last else 'error'}")
 
+    def _record_workload_runtime(self, node_id, containers):
+        by_name = {item["name"]: item for item in containers}
+        with core.db() as con:
+            assignments = con.execute(
+                "SELECT cluster_assignments.id, cluster_assignments.node_id, cluster_assignments.role, clusters.slug "
+                "FROM cluster_assignments JOIN clusters ON clusters.id=cluster_assignments.cluster_id "
+                "WHERE cluster_assignments.node_id=? AND cluster_assignments.state='active'",
+                (node_id,),
+            ).fetchall()
+            for assignment in assignments:
+                name = core.workload_name({"slug": assignment["slug"]}, assignment)
+                container = by_name.get(name)
+                image = container.get("image", "") if container else ""
+                digest = container.get("digest", "") if container else ""
+                version = core.image_version(image)
+                state = str(container.get("state", "")).lower() if container else ""
+                status = str(container.get("status", "")).lower() if container else ""
+                running = state == "running" or status.startswith("up ")
+                error = "" if running and version else (
+                    "Managed workload container not found" if not container else
+                    "Runtime image does not report a release tag" if not version else
+                    "Managed workload container is not running"
+                )
+                con.execute(
+                    "INSERT INTO workload_observations(assignment_id,image,digest,version,running,cached,observed_at,error) "
+                    "VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP,?) "
+                    "ON CONFLICT(assignment_id) DO UPDATE SET image=excluded.image,digest=excluded.digest,version=excluded.version,"
+                    "running=excluded.running,cached=excluded.cached,observed_at=excluded.observed_at,error=excluded.error",
+                    (assignment["id"], image, digest, version, int(running), int(bool(container)), error),
+                )
+
+    def _record_cluster_zoning(self, cluster, breakdown):
+        elastic_roles = {"master", "hot", "warm", "ml", "ingest", "coordinating"}
+        runtime_zones = {item["name"]: item.get("zone") or "" for item in breakdown}
+        members = {member["node_id"]: member for member in cluster["members"]}
+        observed = {}
+        drift = []
+        for assignment in cluster["assignments"]:
+            if assignment["role"] not in elastic_roles:
+                continue
+            runtime_zone = runtime_zones.get(core.workload_name(cluster, assignment), "")
+            observed[str(assignment["id"])] = runtime_zone
+            expected_zone = members.get(assignment["node_id"], {}).get("zone_id") or ""
+            if cluster["zoning"]["mode"] != "disabled" and runtime_zone != expected_zone:
+                drift.append(
+                    f"{assignment['role']} on {assignment['node_name']} expected {expected_zone or 'no zone'} "
+                    f"but reports {runtime_zone or 'no zone'}"
+                )
+        with core.db() as con:
+            current = con.execute(
+                "SELECT applied_mode,applied_zones_json FROM cluster_zoning_observations WHERE cluster_id=?",
+                (cluster["id"],),
+            ).fetchone()
+            applied_mode = current["applied_mode"] if current else "disabled"
+            applied_zones = json.loads(current["applied_zones_json"] or "[]") if current else []
+            desired = cluster["zoning"]
+            if applied_mode != desired["mode"] or applied_zones != desired["zones"]:
+                status = "pending"
+                last_error = "Desired zoning configuration has not been applied"
+            elif desired["mode"] == "disabled":
+                runtime_with_zone = [zone for zone in observed.values() if zone]
+                status = "drift" if runtime_with_zone else "disabled"
+                last_error = "Zone drift: runtime node attributes remain after zoning was disabled" if runtime_with_zone else ""
+            elif drift:
+                status = "drift"
+                last_error = "Zone drift: " + "; ".join(drift[:4])
+            else:
+                status = "applied"
+                last_error = ""
+            con.execute(
+                "INSERT INTO cluster_zoning_observations(cluster_id,applied_mode,applied_zones_json,observed_zones_json,status,observed_at,last_error) "
+                "VALUES (?,?,?,?,?,CURRENT_TIMESTAMP,?) "
+                "ON CONFLICT(cluster_id) DO UPDATE SET observed_zones_json=excluded.observed_zones_json,status=excluded.status,"
+                "observed_at=excluded.observed_at,last_error=excluded.last_error",
+                (cluster["id"], applied_mode, json.dumps(applied_zones), json.dumps(observed), status, last_error),
+            )
+
     async def _collect_host(self, node):
         observed = utc_now()
         tunnel = self.tunnels.get(node["id"])
@@ -466,6 +562,7 @@ class TelemetryManager:
                             managed.append({
                                 "id": item.get("Id") or item.get("ID"), "name": name,
                                 "image": item.get("Image") or item.get("ImageName") or "",
+                                "digest": item.get("ImageID") or item.get("ImageId") or "",
                                 "state": item.get("State") or item.get("Status") or "unknown",
                                 "status": item.get("Status") or "", "labels": item.get("Labels") or {}, **stats,
                             })
@@ -492,6 +589,8 @@ class TelemetryManager:
                 "ON CONFLICT(node_id) DO UPDATE SET initialized=excluded.initialized,reachable=excluded.reachable,podman_socket_active=excluded.podman_socket_active,os_name=excluded.os_name,podman_version=excluded.podman_version,observed_at=excluded.observed_at,last_error=excluded.last_error",
                 (node["id"], int(state["initialized"]), int(state["reachable"]), int(state["podman_socket_active"]), state["os_name"], state["podman_version"], observed, state["last_error"]),
             )
+        if state["podman_socket_active"]:
+            self._record_workload_runtime(node["id"], state["containers"])
         await self.publish("host_stats", state)
 
     async def _ensure_cluster_ca(self, cluster, master, node):
@@ -607,6 +706,7 @@ class TelemetryManager:
             fs_available = sum(item.get("fs", {}).get("total", {}).get("available_in_bytes", 0) for item in node_stats.values())
             heap_used = sum(item.get("jvm", {}).get("mem", {}).get("heap_used_in_bytes", 0) for item in node_stats.values())
             heap_max = sum(item.get("jvm", {}).get("mem", {}).get("heap_max_in_bytes", 0) for item in node_stats.values())
+            breakdown = node_breakdown(node_stats, allocation)
             state = {
                 "cluster_id": cluster_id, "status": health.get("status", "unknown"), "observed_at": observed, "last_error": "",
                 "nodes": health.get("number_of_nodes", 0), "data_nodes": health.get("number_of_data_nodes", 0),
@@ -617,9 +717,11 @@ class TelemetryManager:
                 "disk_total_bytes": fs_total, "disk_available_bytes": fs_available,
                 "heap_used_bytes": heap_used, "heap_max_bytes": heap_max,
                 "pending_tasks": len(pending.get("tasks", [])), "index_health": health.get("indices", {}),
-                "node_breakdown": node_breakdown(node_stats, allocation),
+                "node_breakdown": breakdown,
+                "zone_breakdown": zone_breakdown(breakdown),
                 "effective_settings": settings,
             }
+            self._record_cluster_zoning(cluster, breakdown)
         except Exception as error:
             if "CERTIFICATE_VERIFY_FAILED" in str(error):
                 invalidate_cluster_ca(cluster_id)
@@ -671,6 +773,9 @@ class TelemetryManager:
                 alerts.append({"severity": "warning", "source": "cluster", "source_id": cluster["id"], "message": f"{cluster['name']}: unassigned replica shards"})
             if metrics.get("last_error"):
                 alerts.append({"severity": "warning", "source": "cluster", "source_id": cluster["id"], "message": f"{cluster['name']}: {metrics['last_error']}"})
+            if cluster["zoning_status"]["status"] in {"drift", "failed"}:
+                detail = cluster["zoning_status"].get("last_error") or f"Zoning status is {cluster['zoning_status']['status']}"
+                alerts.append({"severity": "warning", "source": "cluster", "source_id": cluster["id"], "message": f"{cluster['name']}: {detail}"})
             monitoring = dict(cluster["log_monitoring"])
             companion_states = [assignment.get("filebeat", {}).get("state", "disabled") for assignment in cluster["assignments"]]
             if not monitoring["filebeat_enabled"]:

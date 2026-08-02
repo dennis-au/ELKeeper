@@ -8,7 +8,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, queries } from '../api';
 import { useConsole } from '../app-context';
 import { bytes, formatDateTime, formatTime, percent, timeAgo } from '../format';
-import type { ClusterMetrics, ClusterSummary, ContainerMetric, ControllerSettings, DashboardSnapshot, Health, LogMonitoring, NodeBreakdown, TopologyResponse } from '../types';
+import type { ClusterMetrics, ClusterSummary, ContainerMetric, ControllerSettings, DashboardSnapshot, Health, LogMonitoring, NodeBreakdown, TopologyResponse, ZoneBreakdown } from '../types';
 
 const healthColor: Record<Health, 'success' | 'warning' | 'danger' | 'subdued'> = {
   green: 'success', yellow: 'warning', red: 'danger', unknown: 'subdued', awaiting_data: 'subdued',
@@ -43,7 +43,8 @@ function monitoringColor(state: NonNullable<LogMonitoring['companion_state']>): 
 
 function kibanaLogsUrl(endpoint: string, slug: string) {
   const dataset = `elkeeper.${slug}`;
-  return `${endpoint}/app/discover#/?_a=(filters:!((meta:(alias:!n,disabled:!f,index:!n,key:data_stream.dataset,negate:!f,params:(query:'${dataset}'),type:phrase),query:(match_phrase:(data_stream.dataset:'${dataset}')))))`;
+  const dataViewId = `elkeeper-logs-${slug}`;
+  return `${endpoint}/app/discover#/?_a=(columns:!(),dataSource:(dataViewId:'${dataViewId}',type:dataView),filters:!((meta:(alias:!n,disabled:!f,index:'${dataViewId}',key:data_stream.dataset,negate:!f,params:(query:'${dataset}'),type:phrase),query:(match_phrase:(data_stream.dataset:'${dataset}')))),interval:auto,query:(language:kuery,query:''),sort:!())`;
 }
 
 function Metric({ title, value, description }: { title: string; value: string | number; description?: string }) {
@@ -106,6 +107,7 @@ export function DashboardPage() {
   const alerts = data.alerts.filter((alert) => alert.source === 'cluster' ? alert.source_id === selectedClusterId : memberIds.has(alert.source_id));
   const history = cluster?.history || [];
   const nodeBreakdown = metrics.node_breakdown || [];
+  const zoneBreakdown = metrics.zone_breakdown || [];
   const accessUrls = topology?.access_urls || [];
   const logMonitoring = cluster?.log_monitoring || selectedCluster?.log_monitoring;
   const logsState = monitoringState(logMonitoring);
@@ -135,10 +137,18 @@ export function DashboardPage() {
   const nodeColumns = [
     { field: 'name', name: 'Node' },
     { field: 'node_type', name: 'Type', render: (value: string) => <EuiBadge color="hollow">{value}</EuiBadge> },
+    { field: 'zone', name: 'Zone', render: (value: string) => value ? <EuiBadge color="hollow">{value}</EuiBadge> : 'not assigned' },
     { field: 'roles', name: 'Elasticsearch roles', render: (value: string[]) => value.join(', ') || 'coordinating' },
     { field: 'shards', name: 'Shards' },
     { field: 'disk_used_bytes', name: 'Disk used', render: (value: number, row: NodeBreakdown) => `${bytes(value)} / ${bytes(row.disk_total_bytes)} (${percent(value, row.disk_total_bytes)}%)` },
     { field: 'heap_used_bytes', name: 'JVM heap', render: (value: number, row: NodeBreakdown) => `${bytes(value)} / ${bytes(row.heap_max_bytes)}` },
+  ];
+  const zoneColumns = [
+    { field: 'zone', name: 'Availability zone', render: (value: string) => <EuiBadge color={value === 'unassigned' ? 'warning' : 'hollow'}>{value}</EuiBadge> },
+    { field: 'nodes', name: 'Nodes' },
+    { field: 'shards', name: 'Shards' },
+    { field: 'disk_used_bytes', name: 'Disk used', render: (value: number, row: ZoneBreakdown) => `${bytes(value)} / ${bytes(row.disk_total_bytes)} (${percent(value, row.disk_total_bytes)}%)` },
+    { field: 'heap_used_bytes', name: 'JVM heap', render: (value: number, row: ZoneBreakdown) => `${bytes(value)} / ${bytes(row.heap_max_bytes)}` },
   ];
   const accessColumns = [
     { field: 'label', name: 'Service' },
@@ -205,7 +215,7 @@ export function DashboardPage() {
               <div><EuiTitle size="xs"><h3>Node capacity and shard breakdown</h3></EuiTitle><EuiText size="s" color="subdued">Tier classification, allocated shards, disk, and JVM heap for each Elasticsearch node.</EuiText></div>
               <EuiButtonEmpty size="s" iconType={nodeDetailsOpen ? 'arrowUp' : 'arrowDown'} aria-expanded={nodeDetailsOpen} aria-controls="node-breakdown-table" aria-label={nodeDetailsOpen ? 'Hide node details' : 'Show node details'} onClick={() => setNodeDetailsOpen((open) => !open)}>{nodeDetailsOpen ? 'Hide details' : 'Details'}</EuiButtonEmpty>
             </div>
-            {nodeDetailsOpen && <div id="node-breakdown-table" className="node-breakdown__table"><EuiBasicTable items={nodeBreakdown} columns={nodeColumns} tableLayout="auto" /></div>}
+            {nodeDetailsOpen && <div id="node-breakdown-table" className="node-breakdown__table"><EuiBasicTable items={nodeBreakdown} columns={nodeColumns} tableLayout="auto" />{zoneBreakdown.length > 0 && <><EuiSpacer size="l" /><EuiTitle size="xs"><h3>Zone capacity and shard distribution</h3></EuiTitle><EuiSpacer size="s" /><EuiBasicTable items={zoneBreakdown} columns={zoneColumns} tableLayout="auto" /></>}</div>}
           </div>}</>}
         </section>
         <section className="section-band">

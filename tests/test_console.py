@@ -38,6 +38,7 @@ class ConsoleApiTests(unittest.TestCase):
             con.execute("DELETE FROM audit_events")
             con.execute("DELETE FROM controller_ssh_keys")
             con.execute("DELETE FROM host_runtime_observations")
+            con.execute("DELETE FROM cluster_zoning_observations")
             con.execute("DELETE FROM cluster_assignments")
             con.execute("DELETE FROM memberships")
             con.execute("DELETE FROM clusters")
@@ -361,11 +362,13 @@ class ConsoleApiTests(unittest.TestCase):
         breakdown = self.main.console.node_breakdown({
             "hot-id": {
                 "name": "hot-1", "roles": ["master", "data_hot"],
+                "attributes": {"zone": "zone-a"},
                 "fs": {"total": {"total_in_bytes": 1000, "available_in_bytes": 400}},
                 "jvm": {"mem": {"heap_used_in_bytes": 300, "heap_max_in_bytes": 600}},
             },
             "warm-id": {
                 "name": "warm-1", "roles": ["data_warm"],
+                "attributes": {"zone": "zone-b"},
                 "fs": {"total": {"total_in_bytes": 2000, "available_in_bytes": 1200}},
                 "jvm": {"mem": {"heap_used_in_bytes": 200, "heap_max_in_bytes": 800}},
             },
@@ -379,6 +382,50 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual([item["shards"] for item in breakdown], [7, 4, 0])
         self.assertEqual(breakdown[0]["disk_used_bytes"], 600)
         self.assertEqual(breakdown[1]["heap_max_bytes"], 800)
+        self.assertEqual([item["zone"] for item in breakdown], ["zone-a", "zone-b", ""])
+        zones = self.main.console.zone_breakdown(breakdown)
+        self.assertEqual([(item["zone"], item["nodes"], item["shards"]) for item in zones], [
+            ("zone-a", 1, 7), ("zone-b", 1, 4), ("unassigned", 1, 0),
+        ])
+
+    def test_runtime_zoning_observation_records_drift_and_dashboard_alert(self):
+        headers = self.login()
+        node_id = self.node(headers)
+        cluster_id = self.cluster(headers)
+        with self.main.db() as con:
+            con.execute("UPDATE nodes SET zone_id='zone-a' WHERE id=?", (node_id,))
+            con.execute(
+                "UPDATE clusters SET zoning_json=? WHERE id=?",
+                (json.dumps({"mode": "awareness", "zones": ["zone-a", "zone-b"]}), cluster_id),
+            )
+            con.execute(
+                "INSERT INTO memberships(cluster_id,node_id,network_mode,data_interface,data_address,user_interface,user_address) VALUES (?,?, 'shared','ens18','192.0.2.102','ens18','192.0.2.102')",
+                (cluster_id, node_id),
+            )
+            assignment_id = con.execute(
+                "INSERT INTO cluster_assignments(cluster_id,node_id,role,config_json,state) VALUES (?,?, 'master','{}','active')",
+                (cluster_id, node_id),
+            ).lastrowid
+            con.execute(
+                "INSERT INTO cluster_zoning_observations(cluster_id,applied_mode,applied_zones_json,status) VALUES (?,'awareness',?,'applied')",
+                (cluster_id, json.dumps(["zone-a", "zone-b"])),
+            )
+            cluster = self.main.cluster_record(con, cluster_id)
+
+        manager = self.main.console.TelemetryManager()
+        manager._record_cluster_zoning(cluster, [{
+            "id": "runtime-master", "name": f"ecp-lab-a-master-{node_id}", "zone": "zone-b",
+            "node_type": "Master", "roles": ["master"], "shards": 0,
+            "disk_total_bytes": 0, "disk_available_bytes": 0, "disk_used_bytes": 0,
+            "heap_used_bytes": 0, "heap_max_bytes": 0,
+        }])
+
+        with self.main.db() as con:
+            observation = dict(con.execute("SELECT * FROM cluster_zoning_observations WHERE cluster_id=?", (cluster_id,)).fetchone())
+        self.assertEqual(observation["status"], "drift")
+        self.assertEqual(json.loads(observation["observed_zones_json"]), {str(assignment_id): "zone-b"})
+        snapshot = manager.snapshot()
+        self.assertTrue(any("zone drift" in alert["message"].lower() for alert in snapshot["alerts"]))
 
     def test_host_telemetry_separates_ssh_reachability_from_podman_state(self):
         headers = self.login()
@@ -422,6 +469,37 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(state["last_error"], "Podman: socket unavailable")
         podman_tunnel.close.assert_awaited_once()
 
+    def test_host_telemetry_persists_actual_workload_image_version(self):
+        headers = self.login()
+        node_id = self.node(headers)
+        cluster_id = self.cluster(headers)
+        with self.main.db() as con:
+            assignment_id = con.execute(
+                "INSERT INTO cluster_assignments(cluster_id,node_id,role,config_json,image_version,state) VALUES (?,?,?,?,?,'active')",
+                (cluster_id, node_id, "master", "{}", "9.9.9"),
+            ).lastrowid
+
+        manager = self.main.console.TelemetryManager()
+        manager._record_workload_runtime(node_id, [{
+            "name": f"ecp-lab-a-master-{node_id}",
+            "image": "docker.elastic.co/elasticsearch/elasticsearch:8.19.1",
+            "digest": "sha256:runtime-image",
+            "state": "running",
+            "status": "Up 1 minute",
+        }])
+
+        with self.main.db() as con:
+            observation = dict(con.execute(
+                "SELECT image,digest,version,running,cached,error FROM workload_observations WHERE assignment_id=?",
+                (assignment_id,),
+            ).fetchone())
+        self.assertEqual(observation["version"], "8.19.1")
+        self.assertEqual(observation["image"], "docker.elastic.co/elasticsearch/elasticsearch:8.19.1")
+        self.assertEqual(observation["digest"], "sha256:runtime-image")
+        self.assertEqual(observation["running"], 1)
+        self.assertEqual(observation["cached"], 1)
+        self.assertEqual(observation["error"], "")
+
     def test_dashboard_stream_requires_a_scoped_token(self):
         headers = self.login()
         token = self.client.post("/api/dashboard/stream-token", headers=headers).json()["token"]
@@ -454,6 +532,7 @@ class ConsoleApiTests(unittest.TestCase):
         host_reboot = (playbooks / "host-reboot.yml").read_text()
         reconcile = (playbooks / "cluster-reconcile.yml").read_text()
         settings = (playbooks / "cluster-settings.yml").read_text()
+        zoning = (playbooks / "cluster-zoning-settings.yml").read_text()
         self.assertIn("podman.socket", host_init)
         self.assertIn("elastic-control-host-init", host_init)
         self.assertIn("SELINUX=disabled", host_init)
@@ -471,6 +550,10 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertIn("coordinating: \"[]\"", reconcile)
         self.assertIn("_cluster/settings", settings)
         self.assertIn("cluster.routing.allocation.disk.watermark.flood_stage", settings)
+        self.assertIn("ES_SETTING_NODE_ATTR_ZONE={{ membership.zone_id }}", reconcile)
+        self.assertIn("cluster.routing.allocation.awareness.attributes", zoning)
+        self.assertIn("cluster.routing.allocation.awareness.force.zone.values", zoning)
+        self.assertIn("Restore previous zoning settings", zoning)
 
 
 if __name__ == "__main__":

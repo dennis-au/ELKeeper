@@ -41,6 +41,7 @@ class ApiTests(unittest.TestCase):
             con.execute("DELETE FROM controller_settings")
             con.execute("DELETE FROM controller_ssh_keys")
             con.execute("DELETE FROM workload_change_batches")
+            con.execute("DELETE FROM cluster_zoning_observations")
             con.execute("UPDATE runs SET status='failed', finished_at=CURRENT_TIMESTAMP WHERE status IN ('queued','running','recovery_required')")
             con.execute("DELETE FROM cluster_assignments")
             con.execute("DELETE FROM memberships")
@@ -101,6 +102,43 @@ class ApiTests(unittest.TestCase):
         with patch.object(self.main, "registry_tags", return_value={"8.16.0"}):
             self.assertEqual(self.main.available_versions(assignments), ["8.16.0"])
 
+    def test_workload_version_recommendation_prefers_the_running_cluster_version(self):
+        assignments = [
+            {"role": "master", "observation": {"running": True, "version": "8.19.0"}, "image_version": "8.18.0"},
+            {"role": "hot", "observation": None, "image_version": "8.19.0"},
+        ]
+        self.assertEqual(self.main.recommended_workload_version(assignments, ["8.20.0", "8.19.0"]), "8.19.0")
+        self.assertEqual(self.main.recommended_workload_version(
+            [{"role": "master", "observation": None, "desired_version": "8.19.0"}],
+            ["8.20.0", "8.19.0"],
+        ), "8.19.0")
+        self.assertEqual(self.main.recommended_workload_version([], ["8.20.0", "8.19.0"]), "8.20.0")
+
+    def test_role_aware_versions_work_before_the_cluster_has_assignments(self):
+        headers = self.login()
+        cluster_id = self.cluster(headers)
+        with patch.object(self.main, "available_role_versions", return_value=["8.20.0", "8.19.0"]) as available:
+            result = self.client.get(f"/api/clusters/{cluster_id}/versions?role=kibana", headers=headers)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json()["recommended_version"], "8.20.0")
+        self.assertEqual(available.call_args.args[0], "kibana")
+
+    def test_role_version_discovery_scans_only_the_selected_workload_image(self):
+        assignments = [{"role": "master", "image_version": "8.19.0", "observation": None}]
+        with patch.object(self.main, "registry_listing_tags", return_value={"8.20.0", "8.19.0"}) as registry:
+            versions = self.main.available_role_versions("kibana", assignments)
+        self.assertEqual(versions, ["8.20.0", "8.19.0"])
+        self.assertEqual(registry.call_args.args[0], "kibana/kibana")
+
+    def test_role_version_discovery_keeps_the_current_version_beside_newer_releases(self):
+        assignments = [{"role": "master", "image_version": "8.19.0", "observation": None}]
+        releases = {f"9.4.{patch}" for patch in range(11)} | {"8.19.0", "8.18.0"}
+        with patch.object(self.main, "registry_listing_tags", return_value=releases):
+            versions = self.main.available_role_versions("master", assignments)
+        self.assertEqual(len(versions), self.main.REGISTRY_TAG_RESULT_LIMIT + 1)
+        self.assertIn("8.19.0", versions)
+        self.assertNotIn("8.18.0", versions)
+
     def test_log_monitoring_defaults_migrate_safely_and_start_a_tracked_reconcile(self):
         headers = self.login()
         cluster_id = self.cluster(headers)
@@ -139,8 +177,16 @@ class ApiTests(unittest.TestCase):
         self.assertIn("elkeeper-filebeat-30d", playbook)
         self.assertIn("io.elastic-control.role=filebeat", playbook)
         self.assertIn("labels.elkeeper_assignment_id", playbook)
+        self.assertIn("User=0", playbook)
+        self.assertIn('pipeline: "_none"', playbook)
+        self.assertIn("decode_json_fields", playbook)
+        self.assertIn("target: service", playbook)
+        self.assertIn("type: elasticsearch", playbook)
+        self.assertIn("/api/data_views/data_view", playbook)
+        self.assertIn("elkeeper-logs-{{ cluster.slug }}", playbook)
         self.assertIn("no_log: true", playbook)
         self.assertIn("mode: '0600'", playbook)
+        self.assertIn('monitoring.ui.logs.index: "logs-elkeeper.*"', workload_playbook)
         self.assertEqual(workload_playbook.count("LogDriver=k8s-file"), 5)
 
     def test_password_test_is_ephemeral_and_redacts_the_password(self):
@@ -407,6 +453,282 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(assignment["config"]["memory"], "6g")
         self.assertEqual(self.client.delete(f"/api/assignments/{assignment_id}?mode=detach", headers=headers).status_code, 200)
 
+    def test_cluster_zoning_catalog_and_host_zone_selection(self):
+        headers = self.login()
+        cluster = self.client.post("/api/clusters", headers=headers, json={
+            "name": "zoned-lab",
+            "zoning": {"mode": "awareness", "zones": ["zone-a", "zone-b", "zone-c"]},
+        })
+        self.assertEqual(cluster.status_code, 201)
+        cluster_id = cluster.json()["id"]
+        node_id = self.node(headers)
+
+        zone = self.client.put(f"/api/nodes/{node_id}/zone", headers=headers, json={
+            "cluster_id": cluster_id,
+            "zone_id": "zone-a",
+        })
+        self.assertEqual(zone.status_code, 200)
+        self.assertIn("run_id", zone.json())
+        self.assertEqual(self.client.get("/api/nodes", headers=headers).json()[0]["zone_id"], "zone-a")
+
+        self.assertEqual(self.membership(headers, cluster_id, node_id).status_code, 201)
+        record = self.client.get(f"/api/clusters/{cluster_id}", headers=headers).json()
+        self.assertEqual(record["zoning"], {"mode": "awareness", "zones": ["zone-a", "zone-b", "zone-c"]})
+        self.assertEqual(record["members"][0]["zone_id"], "zone-a")
+
+        other = self.client.post("/api/clusters", headers=headers, json={
+            "name": "other-zoned-lab",
+            "zoning": {"mode": "awareness", "zones": ["zone-b", "zone-c"]},
+        })
+        self.assertEqual(other.status_code, 201)
+        incompatible = self.membership(headers, other.json()["id"], node_id)
+        self.assertEqual(incompatible.status_code, 422)
+        self.assertIn("host zone", incompatible.json()["detail"].lower())
+
+    def test_zoning_catalog_validation_and_in_use_zone_removal(self):
+        headers = self.login()
+        too_few = self.client.post("/api/clusters", headers=headers, json={
+            "name": "single-zone",
+            "zoning": {"mode": "awareness", "zones": ["zone-a"]},
+        })
+        self.assertEqual(too_few.status_code, 422)
+        self.assertIn("at least two", too_few.text.lower())
+        duplicate = self.client.post("/api/clusters", headers=headers, json={
+            "name": "duplicate-zones",
+            "zoning": {"mode": "awareness", "zones": ["zone-a", "ZONE-A"]},
+        })
+        self.assertEqual(duplicate.status_code, 422)
+
+        cluster_id = self.client.post("/api/clusters", headers=headers, json={
+            "name": "catalog-lab",
+            "zoning": {"mode": "awareness", "zones": ["zone-a", "zone-b"]},
+        }).json()["id"]
+        node_id = self.node(headers)
+        self.assertEqual(self.client.put(f"/api/nodes/{node_id}/zone", headers=headers, json={
+            "cluster_id": cluster_id,
+            "zone_id": "zone-a",
+        }).status_code, 200)
+        self.assertEqual(self.membership(headers, cluster_id, node_id).status_code, 201)
+
+        removed = self.client.put(f"/api/clusters/{cluster_id}/zoning", headers=headers, json={
+            "mode": "awareness",
+            "zones": ["zone-b", "zone-c"],
+        })
+        self.assertEqual(removed.status_code, 409)
+        self.assertIn("zone-a", removed.json()["detail"])
+
+        disabled = self.client.put(f"/api/clusters/{cluster_id}/zoning", headers=headers, json={
+            "mode": "disabled",
+            "zones": [],
+        })
+        self.assertEqual(disabled.status_code, 200)
+
+    def test_zoning_disabled_cluster_does_not_block_a_shared_host_zone_change(self):
+        headers = self.login()
+        zoned_cluster = self.client.post("/api/clusters", headers=headers, json={
+            "name": "zone-owner",
+            "zoning": {"mode": "awareness", "zones": ["zone-a", "zone-b"]},
+        }).json()["id"]
+        disabled_cluster = self.cluster(headers, "zone-disabled")
+        node_id = self.node(headers, "shared-zone-node", "192.0.2.109")
+        self.assertEqual(self.membership(headers, disabled_cluster, node_id).status_code, 201)
+
+        result = self.client.put(f"/api/nodes/{node_id}/zone", headers=headers, json={
+            "cluster_id": zoned_cluster,
+            "zone_id": "zone-a",
+        })
+
+        self.assertEqual(result.status_code, 200)
+        node = next(item for item in self.client.get("/api/nodes", headers=headers).json() if item["id"] == node_id)
+        self.assertEqual(node["zone_id"], "zone-a")
+
+    def test_awareness_blocks_elasticsearch_placement_without_a_defined_host_zone(self):
+        headers = self.login()
+        cluster_id = self.client.post("/api/clusters", headers=headers, json={
+            "name": "placement-zones",
+            "zoning": {"mode": "awareness", "zones": ["zone-a", "zone-b"]},
+        }).json()["id"]
+        node_id = self.node(headers)
+        self.assertEqual(self.membership(headers, cluster_id, node_id).status_code, 422)
+
+        with self.main.db() as con:
+            con.execute(
+                "INSERT INTO memberships(cluster_id,node_id,network_mode,data_interface,data_address,user_interface,user_address) VALUES (?,?,?,?,?,?,?)",
+                (cluster_id, node_id, "dedicated", "ens19", "198.51.100.102", "ens18", "192.0.2.102"),
+            )
+        result = self.client.post(f"/api/clusters/{cluster_id}/workload-changes/apply", headers=headers, json={
+            "changes": [{
+                "client_id": "zoned-master", "kind": "create", "node_id": node_id, "role": "master",
+                "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/zones/master"},
+            }],
+        })
+        self.assertEqual(result.status_code, 422)
+        self.assertIn("zone", result.json()["detail"].lower())
+
+    def test_zoning_apply_rolls_data_before_master_and_records_observed_zones(self):
+        headers = self.login()
+        cluster_id = self.client.post("/api/clusters", headers=headers, json={
+            "name": "apply-zones",
+            "zoning": {"mode": "awareness", "zones": ["zone-a", "zone-b"]},
+        }).json()["id"]
+        first = self.node(headers, "zone-node-a", "192.0.2.111")
+        second = self.node(headers, "zone-node-b", "192.0.2.112")
+        for node_id, zone_id, user_address, data_address in (
+            (first, "zone-a", "192.0.2.111", "198.51.100.111"),
+            (second, "zone-b", "192.0.2.112", "198.51.100.112"),
+        ):
+            self.assertEqual(self.client.put(f"/api/nodes/{node_id}/zone", headers=headers, json={
+                "cluster_id": cluster_id, "zone_id": zone_id,
+            }).status_code, 200)
+            self.assertEqual(self.membership(headers, cluster_id, node_id, user_address, data_address).status_code, 201)
+        for node_id, role, path in (
+            (first, "master", "/srv/zones/master"),
+            (first, "hot", "/srv/zones/hot-a"),
+            (second, "hot", "/srv/zones/hot-b"),
+        ):
+            self.assertEqual(self.client.post(f"/api/clusters/{cluster_id}/assignments", headers=headers, json={
+                "node_id": node_id, "role": role,
+                "config": {"cpu": "2", "memory": "4g", "storage_path": path},
+            }).status_code, 201)
+
+        def stop_task(coroutine):
+            coroutine.close()
+            return None
+
+        with patch.object(self.main.asyncio, "create_task", side_effect=stop_task):
+            response = self.client.post(f"/api/clusters/{cluster_id}/zoning/apply", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        run_id = response.json()["run_id"]
+        invoked = []
+
+        async def reconcile(_run_id, _inventory, payload, _name, _suffix):
+            invoked.append((payload["assignment"]["role"], payload["membership"]["zone_id"]))
+            return True
+
+        async def settings(*_args):
+            return True
+
+        with patch.object(self.main, "execute_zoning_reconcile", side_effect=reconcile), patch.object(self.main, "execute_zoning_settings", side_effect=settings):
+            asyncio.run(self.main.run_zoning_apply(run_id, cluster_id, self.main.INVENTORIES / f"run-{run_id}.yaml"))
+
+        self.assertEqual(invoked, [("hot", "zone-a"), ("hot", "zone-b"), ("master", "zone-a")])
+        zoning = self.client.get(f"/api/clusters/{cluster_id}/zoning", headers=headers).json()
+        self.assertEqual(zoning["status"]["applied_mode"], "awareness")
+        self.assertEqual(set(zoning["status"]["observed_zones"].values()), {"zone-a", "zone-b"})
+        with self.main.db() as con:
+            self.assertEqual(con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()["status"], "succeeded")
+
+    def test_forced_awareness_apply_rejects_an_uncovered_zone(self):
+        headers = self.login()
+        cluster_id = self.client.post("/api/clusters", headers=headers, json={
+            "name": "forced-zones",
+            "zoning": {"mode": "forced_awareness", "zones": ["zone-a", "zone-b", "zone-c"]},
+        }).json()["id"]
+        for index, zone_id in enumerate(("zone-a", "zone-b"), start=1):
+            node_id = self.node(headers, f"forced-{index}", f"192.0.2.{120 + index}")
+            self.client.put(f"/api/nodes/{node_id}/zone", headers=headers, json={"cluster_id": cluster_id, "zone_id": zone_id})
+            self.membership(headers, cluster_id, node_id, f"192.0.2.{120 + index}", f"198.51.100.{120 + index}")
+            role = "master" if index == 1 else "hot"
+            self.client.post(f"/api/clusters/{cluster_id}/assignments", headers=headers, json={
+                "node_id": node_id, "role": role,
+                "config": {"cpu": "2", "memory": "4g", "storage_path": f"/srv/forced/{role}"},
+            })
+        result = self.client.post(f"/api/clusters/{cluster_id}/zoning/apply", headers=headers)
+        self.assertEqual(result.status_code, 422)
+        self.assertIn("zone-c", result.json()["detail"])
+
+    def test_disabling_zoning_reconciles_runtime_node_attributes_to_empty(self):
+        headers = self.login()
+        cluster_id = self.cluster(headers, "disable-zones")
+        node_id = self.node(headers, "disable-zone-node", "192.0.2.121")
+        self.client.post(f"/api/clusters/{cluster_id}/members", headers=headers, json={
+            "node_id": node_id, "network_mode": "shared", "data_interface": "ens18", "data_address": "192.0.2.121",
+            "user_interface": "ens18", "user_address": "192.0.2.121",
+        })
+        assignment_id = self.client.post(f"/api/clusters/{cluster_id}/assignments", headers=headers, json={
+            "node_id": node_id, "role": "master",
+            "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/disable-zones/master"},
+        }).json()["id"]
+        with self.main.db() as con:
+            con.execute("UPDATE nodes SET zone_id='zone-a' WHERE id=?", (node_id,))
+            con.execute(
+                "INSERT INTO cluster_zoning_observations(cluster_id,applied_mode,applied_zones_json,observed_zones_json,status) VALUES (?,'awareness',?,?,'applied')",
+                (cluster_id, json.dumps(["zone-a", "zone-b"]), json.dumps({str(assignment_id): "zone-a"})),
+            )
+            run_id = con.execute(
+                "INSERT INTO runs(kind,target,status,command_json,context_json) VALUES ('zoning-apply','disable-zones:zoning','running','[]','{}')"
+            ).lastrowid
+        observed = []
+
+        async def reconcile(_run_id, _inventory, payload, _name, _suffix):
+            observed.append(payload["membership"]["zone_id"])
+            return True
+
+        with patch.object(self.main, "execute_zoning_reconcile", side_effect=reconcile), patch.object(self.main, "execute_zoning_settings", return_value=True):
+            asyncio.run(self.main.run_zoning_apply(run_id, cluster_id, self.main.INVENTORIES / f"run-{run_id}.yaml"))
+        self.assertEqual(observed, [""])
+        status = self.client.get(f"/api/clusters/{cluster_id}/zoning", headers=headers).json()["status"]
+        self.assertEqual(status["applied_mode"], "disabled")
+        self.assertEqual(status["observed_zones"], {str(assignment_id): ""})
+
+    def test_active_host_zone_change_reconciles_and_restores_the_previous_zone_on_failure(self):
+        headers = self.login()
+        cluster_id = self.client.post("/api/clusters", headers=headers, json={
+            "name": "move-zone",
+            "zoning": {"mode": "awareness", "zones": ["zone-a", "zone-b", "zone-c"]},
+        }).json()["id"]
+        first = self.node(headers, "move-master", "192.0.2.131")
+        second = self.node(headers, "move-hot", "192.0.2.132")
+        for node_id, zone_id, user_address, data_address in (
+            (first, "zone-a", "192.0.2.131", "198.51.100.131"),
+            (second, "zone-b", "192.0.2.132", "198.51.100.132"),
+        ):
+            self.client.put(f"/api/nodes/{node_id}/zone", headers=headers, json={"cluster_id": cluster_id, "zone_id": zone_id})
+            self.membership(headers, cluster_id, node_id, user_address, data_address)
+        self.client.post(f"/api/clusters/{cluster_id}/assignments", headers=headers, json={
+            "node_id": first, "role": "master",
+            "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/move/master"},
+        })
+        self.client.post(f"/api/clusters/{cluster_id}/assignments", headers=headers, json={
+            "node_id": second, "role": "hot",
+            "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/move/hot"},
+        })
+
+        def stop_task(coroutine):
+            coroutine.close()
+            return None
+
+        with patch.object(self.main.asyncio, "create_task", side_effect=stop_task):
+            response = self.client.put(f"/api/nodes/{first}/zone", headers=headers, json={
+                "cluster_id": cluster_id, "zone_id": "zone-c",
+            })
+        self.assertEqual(response.status_code, 200)
+        run_id = response.json()["run_id"]
+        self.assertEqual(next(node for node in self.client.get("/api/nodes", headers=headers).json() if node["id"] == first)["zone_id"], "zone-c")
+        with self.main.db() as con:
+            assignment = con.execute(
+                "SELECT operation_run_id FROM cluster_assignments WHERE node_id=? AND role='master'",
+                (first,),
+            ).fetchone()
+            self.assertEqual(assignment["operation_run_id"], run_id)
+            self.assertIsNotNone(self.main.active_cluster_operation(con, "move-zone"))
+        invoked = []
+
+        async def reconcile(_run_id, _inventory, payload, _name, _suffix):
+            invoked.append(payload["membership"]["zone_id"])
+            return False
+
+        with patch.object(self.main, "execute_zoning_reconcile", side_effect=reconcile):
+            asyncio.run(self.main.run_host_zone_change(run_id, first, "zone-a", "zone-c", self.main.INVENTORIES / f"run-{run_id}.yaml"))
+        self.assertEqual(invoked, ["zone-c"])
+        self.assertEqual(next(node for node in self.client.get("/api/nodes", headers=headers).json() if node["id"] == first)["zone_id"], "zone-a")
+        with self.main.db() as con:
+            self.assertEqual(con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()["status"], "failed")
+            self.assertIsNone(con.execute(
+                "SELECT operation_run_id FROM cluster_assignments WHERE node_id=? AND role='master'",
+                (first,),
+            ).fetchone()["operation_run_id"])
+
     def test_workload_batch_keeps_new_roles_out_of_managed_workloads_until_it_succeeds(self):
         headers = self.login()
         node_id = self.node(headers)
@@ -421,6 +743,7 @@ class ApiTests(unittest.TestCase):
             result = self.client.post(f"/api/clusters/{cluster_id}/workload-changes/apply", headers=headers, json={
                 "changes": [{
                     "client_id": "new-master", "kind": "create", "node_id": node_id, "role": "master",
+                    "image_version": "8.20.0",
                     "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/batch/master"},
                 }],
             })
@@ -428,10 +751,25 @@ class ApiTests(unittest.TestCase):
         run_id = result.json()["run_id"]
         self.assertEqual(self.client.get(f"/api/clusters/{cluster_id}", headers=headers).json()["assignments"], [])
         with self.main.db() as con:
-            applying = con.execute("SELECT state,operation_run_id FROM cluster_assignments").fetchone()
+            applying = con.execute("SELECT state,operation_run_id,image_version FROM cluster_assignments").fetchone()
             plan = con.execute("SELECT plan_encrypted FROM workload_change_batches WHERE run_id=?", (run_id,)).fetchone()["plan_encrypted"]
         self.assertEqual((applying["state"], applying["operation_run_id"]), ("applying", run_id))
+        self.assertEqual(applying["image_version"], "8.20.0")
         self.assertNotIn("/srv/batch/master", plan)
+
+    def test_workload_batch_rejects_an_invalid_image_version(self):
+        headers = self.login()
+        node_id = self.node(headers)
+        cluster_id = self.cluster(headers)
+        self.assertEqual(self.membership(headers, cluster_id, node_id).status_code, 201)
+        result = self.client.post(f"/api/clusters/{cluster_id}/workload-changes/apply", headers=headers, json={
+            "changes": [{
+                "client_id": "new-master", "kind": "create", "node_id": node_id, "role": "master",
+                "image_version": "latest",
+                "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/batch/master"},
+            }],
+        })
+        self.assertEqual(result.status_code, 422)
 
     def test_workload_batch_promotes_all_roles_only_after_success(self):
         headers = self.login()

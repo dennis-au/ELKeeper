@@ -1,0 +1,78 @@
+---
+- name: Apply guarded Elasticsearch zoning settings
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    workload: "ecp-{{ cluster.slug }}-master-{{ bootstrap.node_id }}"
+    cert_root: "/etc/elastic-control/clusters/{{ cluster.slug }}/workloads/{{ workload }}/certs"
+  tasks:
+    - name: Validate zoning settings
+      ansible.builtin.assert:
+        that:
+          - zoning.mode in ['disabled', 'awareness', 'forced_awareness']
+          - zoning.mode == 'disabled' or zoning.zones | length >= 2
+          - zoning.zones | unique | length == zoning.zones | length
+          - zoning.zones | select('match', '^[a-z0-9][a-z0-9._-]{0,63}$') | list | length == zoning.zones | length
+
+    - name: Apply persistent zoning settings with rollback
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          auth=$(mktemp)
+          body=$(mktemp)
+          before=$(mktemp)
+          rollback=$(mktemp)
+          after=$(mktemp)
+          trap 'rm -f "$auth" "$body" "$before" "$rollback" "$after"' EXIT
+          chmod 0600 "$auth" "$body" "$before" "$rollback" "$after"
+          printf 'user = "elastic:%s"\n' {{ credentials.elastic_password | quote }} > "$auth"
+          endpoint=https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}/_cluster/settings
+          curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" "$endpoint?flat_settings=true" > "$before"
+          python3 - "$before" "$rollback" <<'PY'
+          import json, sys
+          source = json.load(open(sys.argv[1], encoding="utf-8")).get("persistent", {})
+          keys = (
+              "cluster.routing.allocation.awareness.attributes",
+              "cluster.routing.allocation.awareness.force.zone.values",
+          )
+          json.dump({"persistent": {key: source.get(key) for key in keys}}, open(sys.argv[2], "w", encoding="utf-8"))
+          PY
+          cat > "$body" <<'JSON'
+          {{ {
+            'persistent': {
+              'cluster.routing.allocation.awareness.attributes': ('zone' if zoning.mode != 'disabled' else None),
+              'cluster.routing.allocation.awareness.force.zone.values': ((zoning.zones | join(',')) if zoning.mode == 'forced_awareness' else None)
+            }
+          } | to_json }}
+          JSON
+          restore_settings() {
+            echo 'Restore previous zoning settings'
+            curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" \
+              -H 'Content-Type: application/json' -X PUT --data-binary @"$rollback" "$endpoint" >/dev/null || true
+          }
+          if ! curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" \
+            -H 'Content-Type: application/json' -X PUT --data-binary @"$body" "$endpoint" >/dev/null; then
+            restore_settings
+            exit 1
+          fi
+          curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" "$endpoint?flat_settings=true" > "$after"
+          if ! python3 - "$body" "$after" <<'PY'
+          import json, sys
+          expected = json.load(open(sys.argv[1], encoding="utf-8"))["persistent"]
+          actual = json.load(open(sys.argv[2], encoding="utf-8")).get("persistent", {})
+          for key, value in expected.items():
+              if value is None:
+                  if key in actual:
+                      raise SystemExit(f"{key} was not reset")
+              elif actual.get(key) != value:
+                  raise SystemExit(f"{key} did not match")
+          PY
+          then
+            restore_settings
+            exit 1
+          fi
+      args:
+        executable: /bin/bash
+      no_log: true
+      changed_when: true

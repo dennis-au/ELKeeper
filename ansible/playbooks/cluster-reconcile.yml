@@ -46,6 +46,7 @@
           - assignment.role != 'fleet-server' or assignment.ports.fleet | default(0) | int > 0
           - assignment.role != 'logstash' or assignment.ports.logstash_api | default(0) | int > 0
           - assignment.role != 'logstash' or assignment.config.pipeline | default('') | length > 0
+          - membership.zone_id | default('') == '' or membership.zone_id is match('^[a-z0-9][a-z0-9._-]{0,63}$')
         fail_msg: Invalid cluster workload request.
 
     - name: Validate data and user NIC bindings before changes
@@ -264,6 +265,9 @@
           ES_SETTING_CLUSTER_NAME={{ cluster.name }}
           ES_SETTING_NODE_NAME={{ workload }}
           ES_SETTING_NODE_ROLES={{ es_roles[assignment.role] }}
+          {% if membership.zone_id | default('') %}
+          ES_SETTING_NODE_ATTR_ZONE={{ membership.zone_id }}
+          {% endif %}
           ES_SETTING_HTTP_PORT={{ assignment.ports.elasticsearch_http }}
           ES_SETTING_HTTP_BIND__HOST={{ membership.user_address }}
           ES_SETTING_HTTP_PUBLISH__HOST={{ membership.user_address }}
@@ -365,6 +369,7 @@
           xpack.security.encryptionKey: {{ credentials.elastic_password }}
           xpack.encryptedSavedObjects.encryptionKey: {{ credentials.elastic_password }}
           xpack.reporting.encryptionKey: {{ credentials.elastic_password }}
+          monitoring.ui.logs.index: "logs-elkeeper.*"
       no_log: true
       when: desired_state == 'present' and assignment.role == 'kibana'
 

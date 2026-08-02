@@ -5,6 +5,7 @@ import calendar
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import hmac
+from html.parser import HTMLParser
 import ipaddress
 import json
 import os
@@ -93,6 +94,7 @@ CPU_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
 MEMORY_RE = re.compile(r"^[1-9][0-9]*(?:\.[0-9]+)?[kKmMgGtT]$")
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 NODE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+ZONE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 DEFAULT_STACK_VERSION = "8.19.0"
 DEFAULT_DISPLAY_TIMEZONE = os.getenv("APP_DISPLAY_TIMEZONE", "Asia/Hong_Kong")
 THEME_PALETTE = ("#0077CC", "#00A67E", "#D36014", "#A13DAD", "#B41F4A", "#5367C9", "#6B7D00", "#008C95")
@@ -102,6 +104,7 @@ REGISTRY_TAG_PAGE_SIZE = 100
 REGISTRY_TAG_PAGE_LIMIT = 20
 REGISTRY_TAG_RESULT_LIMIT = 10
 REGISTRY_REQUEST_TIMEOUT = 45
+REGISTRY_LISTING_TIMEOUT = 10
 REGISTRY_CACHE = {}
 ROLE_IMAGES = {
     "master": "elasticsearch/elasticsearch",
@@ -121,6 +124,7 @@ FILEBEAT_IMAGE = "beats/filebeat"
 FILEBEAT_RETENTION_DAYS = 30
 UPGRADE_ORDER = ("warm", "hot", "ml", "ingest", "coordinating", "master", "kibana", "fleet-server", "logstash", "elastic-agent")
 WORKLOAD_DEPLOY_ORDER = ("master", "hot", "warm", "ml", "ingest", "coordinating", "kibana", "fleet-server", "logstash", "elastic-agent")
+ZONING_RECONCILE_ORDER = ("hot", "warm", "ml", "ingest", "coordinating", "master")
 
 
 class Login(BaseModel):
@@ -134,6 +138,7 @@ class Node(BaseModel):
     ssh_port: int = Field(default=22, ge=1, le=65535)
     ssh_user: str = Field(default="root", pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
     enabled: bool = True
+    zone_id: str | None = None
 
     @field_validator("address")
     @classmethod
@@ -142,6 +147,16 @@ class Node(BaseModel):
             return str(ipaddress.ip_address(value.strip()))
         except ValueError as error:
             raise ValueError("SSH address must be an IPv4 or IPv6 address") from error
+
+    @field_validator("zone_id", mode="before")
+    @classmethod
+    def valid_zone_id(cls, value):
+        if value is None or not str(value).strip():
+            return None
+        zone_id = str(value).strip().lower()
+        if not ZONE_ID_RE.fullmatch(zone_id):
+            raise ValueError("Zone IDs may contain lowercase letters, numbers, dots, underscores, and hyphens")
+        return zone_id
 
 
 class ControllerPassword(BaseModel):
@@ -173,6 +188,7 @@ class NodeEnrollment(Node):
     auth_method: str = Field(default="controller_key", pattern=r"^(controller_key|password)$")
     password: str | None = Field(default=None, max_length=1024)
     install_controller_key: bool = True
+    zone_cluster_id: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def validate_credentials(self):
@@ -308,6 +324,41 @@ class NetworkDefaults(BaseModel):
     mode: str = Field(default="shared", pattern=r"^(dedicated|shared)$")
 
 
+class ZoningConfig(BaseModel):
+    mode: str = Field(default="disabled", pattern=r"^(disabled|awareness|forced_awareness)$")
+    zones: list[str] = Field(default_factory=list, max_length=16)
+
+    @field_validator("zones", mode="before")
+    @classmethod
+    def normalize_zones(cls, value):
+        if value is None:
+            return []
+        return [str(zone).strip().lower() for zone in value]
+
+    @model_validator(mode="after")
+    def valid_zones(self):
+        if any(not ZONE_ID_RE.fullmatch(zone) for zone in self.zones):
+            raise ValueError("Zone IDs may contain lowercase letters, numbers, dots, underscores, and hyphens")
+        if len(self.zones) != len(set(self.zones)):
+            raise ValueError("Zone IDs must be unique")
+        if self.mode != "disabled" and len(self.zones) < 2:
+            raise ValueError("Zone awareness requires at least two zones")
+        return self
+
+
+class HostZoneInput(BaseModel):
+    cluster_id: int = Field(ge=1)
+    zone_id: str
+
+    @field_validator("zone_id", mode="before")
+    @classmethod
+    def valid_zone_id(cls, value):
+        zone_id = str(value).strip().lower()
+        if not ZONE_ID_RE.fullmatch(zone_id):
+            raise ValueError("Choose a valid cluster-defined zone")
+        return zone_id
+
+
 class ElasticsearchSettings(BaseModel):
     allocation_enable: str = Field(default="all", pattern=r"^(all|primaries|new_primaries|none)$")
     rebalance_enable: str = Field(default="all", pattern=r"^(all|primaries|replicas|none)$")
@@ -336,6 +387,7 @@ class ClusterInput(BaseModel):
     desired_version: str = Field(default=DEFAULT_STACK_VERSION, pattern=r"^\d+\.\d+\.\d+$")
     network_defaults: NetworkDefaults = Field(default_factory=NetworkDefaults)
     elasticsearch_settings: ElasticsearchSettings = Field(default_factory=ElasticsearchSettings)
+    zoning: ZoningConfig = Field(default_factory=ZoningConfig)
 
     @model_validator(mode="before")
     @classmethod
@@ -383,6 +435,7 @@ class WorkloadChange(BaseModel):
     expected_revision: int | None = Field(default=None, ge=1)
     node_id: int | None = Field(default=None, ge=1)
     role: str | None = None
+    image_version: str | None = Field(default=None, pattern=r"^\d+\.\d+\.\d+$")
     config: dict | None = None
 
     @model_validator(mode="after")
@@ -397,6 +450,8 @@ class WorkloadChange(BaseModel):
                 raise ValueError("An existing workload change requires assignment_id and expected_revision")
             if self.node_id or self.role:
                 raise ValueError("An existing workload change may not include node_id or role")
+            if self.image_version is not None:
+                raise ValueError("An existing workload change may not include an image version")
             if self.kind == "resources" and self.config is None:
                 raise ValueError("A resource change requires config")
             if self.kind == "detach" and self.config is not None:
@@ -911,6 +966,41 @@ def registry_tags(repository, cursor):
     return tags
 
 
+class RegistryListingParser(HTMLParser):
+    def __init__(self, repository):
+        super().__init__()
+        self.prefix = f"/r/{repository}:"
+        self.tags = set()
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "a":
+            return
+        href = dict(attrs).get("href", "")
+        if href.startswith(self.prefix):
+            version = urllib.parse.unquote(href[len(self.prefix):])
+            if version_key(version):
+                self.tags.add(version)
+
+
+def registry_listing_tags(repository):
+    cache_key = ("listing", repository)
+    cached = REGISTRY_CACHE.get(cache_key)
+    if cached and cached[0] + REGISTRY_CACHE_SECONDS > time.time():
+        return cached[1]
+    url = f"https://www.docker.elastic.co/r/{repository}?limit=1000&offset=0&show_snapshots=false"
+    try:
+        request = urllib.request.Request(url, headers={"Accept": "text/html"})
+        with urllib.request.urlopen(request, timeout=REGISTRY_LISTING_TIMEOUT) as response:
+            parser = RegistryListingParser(repository)
+            parser.feed(response.read().decode())
+    except (OSError, UnicodeDecodeError, urllib.error.URLError, urllib.error.HTTPError) as error:
+        raise HTTPException(503, "Unable to retrieve Elastic image versions") from error
+    if not parser.tags:
+        raise HTTPException(503, f"Elastic registry returned no stable versions for {repository}")
+    REGISTRY_CACHE[cache_key] = (time.time(), parser.tags)
+    return parser.tags
+
+
 def cluster_repositories(assignments, filebeat_enabled=False):
     repositories = {ROLE_IMAGES[assignment["role"]] for assignment in assignments if assignment["role"] in ROLE_IMAGES}
     if any(assignment["role"] in METRICBEAT_ROLES for assignment in assignments):
@@ -920,17 +1010,41 @@ def cluster_repositories(assignments, filebeat_enabled=False):
     return repositories
 
 
-def available_versions(assignments, filebeat_enabled=False):
-    repositories = cluster_repositories(assignments, filebeat_enabled)
-    if not repositories:
-        return []
+def registry_version_cursor(assignments):
     known = [
         version_key((assignment.get("observation") or {}).get("version", "")) or version_key(assignment.get("image_version", "")) or version_key(assignment.get("desired_version", ""))
         for assignment in assignments
     ]
     known = [version for version in known if version]
     minimum = min(known) if known else version_key(DEFAULT_STACK_VERSION)
-    cursor = f"{minimum[0]}.{max(minimum[1] - 1, 0)}.999"
+    return f"{minimum[0]}.{max(minimum[1] - 1, 0)}.999"
+
+
+def available_role_versions(role, assignments):
+    repository = ROLE_IMAGES.get(role)
+    if not repository:
+        raise HTTPException(422, "Unknown workload role")
+    minimum = version_key(registry_version_cursor(assignments))
+    tags = registry_listing_tags(repository)
+    versions = sorted((tag for tag in tags if version_key(tag) > minimum), key=version_key, reverse=True)[:REGISTRY_TAG_RESULT_LIMIT]
+    configured = {
+        version
+        for assignment in assignments
+        for version in (
+            (assignment.get("observation") or {}).get("version", ""),
+            assignment.get("image_version", ""),
+            assignment.get("desired_version", ""),
+        )
+        if version_key(version) and version in tags and version_key(version) > minimum
+    }
+    return sorted(set(versions).union(configured), key=version_key, reverse=True)
+
+
+def available_versions(assignments, filebeat_enabled=False):
+    repositories = cluster_repositories(assignments, filebeat_enabled)
+    if not repositories:
+        return []
+    cursor = registry_version_cursor(assignments)
     with ThreadPoolExecutor(max_workers=min(4, len(repositories))) as executor:
         repository_tags = executor.map(lambda repository: registry_tags(repository, cursor), sorted(repositories))
         groups = list(repository_tags)
@@ -938,6 +1052,27 @@ def available_versions(assignments, filebeat_enabled=False):
     for tags in groups:
         common = tags if common is None else common.intersection(tags)
     return sorted(common or (), key=version_key, reverse=True)
+
+
+def recommended_workload_version(assignments, candidates):
+    running = [
+        (assignment.get("observation") or {}).get("version", "")
+        for assignment in assignments
+        if (assignment.get("observation") or {}).get("running")
+        and version_key((assignment.get("observation") or {}).get("version", ""))
+    ]
+    configured = [
+        assignment.get("image_version", "") or assignment.get("desired_version", "")
+        for assignment in assignments
+        if version_key(assignment.get("image_version", "") or assignment.get("desired_version", ""))
+    ]
+    current = running or configured
+    if current:
+        counts = {version: current.count(version) for version in set(current)}
+        selected = max(counts, key=lambda version: (counts[version], version_key(version)))
+        if not candidates or selected in candidates:
+            return selected
+    return candidates[0] if candidates else ""
 
 
 def observation_is_fresh(observation):
@@ -979,6 +1114,77 @@ def membership_ready(member):
     )
 
 
+def stored_zoning(value):
+    try:
+        return ZoningConfig.model_validate(json.loads(value or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ZoningConfig()
+
+
+def require_cluster_host_zone(cluster, member):
+    zoning = cluster["zoning"]
+    zone_id = member["zone_id"] if member and "zone_id" in member.keys() else None
+    if zoning["mode"] == "disabled":
+        return
+    if not zone_id:
+        raise HTTPException(422, "Select a cluster-defined host zone before adding or applying Elasticsearch workloads")
+    if zone_id not in zoning["zones"]:
+        raise HTTPException(422, f"Host zone {zone_id} is not defined by this cluster")
+
+
+def validate_zoning_catalog_update(con, cluster_id, zoning):
+    if zoning.mode == "disabled":
+        return
+    used = con.execute(
+        "SELECT DISTINCT nodes.zone_id FROM memberships JOIN nodes ON nodes.id=memberships.node_id "
+        "WHERE memberships.cluster_id=? AND nodes.zone_id IS NOT NULL ORDER BY nodes.zone_id",
+        (cluster_id,),
+    ).fetchall()
+    missing = [row["zone_id"] for row in used if row["zone_id"] not in zoning.zones]
+    if missing:
+        raise HTTPException(409, "Reassign hosts before removing in-use zones: " + ", ".join(missing))
+
+
+def validate_host_zone_change(con, node_id, cluster_id, zone_id):
+    selected = con.execute("SELECT zoning_json FROM clusters WHERE id=?", (cluster_id,)).fetchone()
+    if not selected:
+        raise HTTPException(404, "Cluster not found")
+    if zone_id not in stored_zoning(selected["zoning_json"]).zones:
+        raise HTTPException(422, f"Zone {zone_id} is not defined by the selected cluster")
+    memberships = con.execute(
+        "SELECT clusters.id,clusters.name,clusters.zoning_json FROM memberships JOIN clusters ON clusters.id=memberships.cluster_id "
+        "WHERE memberships.node_id=? ORDER BY clusters.name",
+        (node_id,),
+    ).fetchall()
+    incompatible = []
+    for row in memberships:
+        zoning = stored_zoning(row["zoning_json"])
+        if zoning.mode != "disabled" and zone_id not in zoning.zones:
+            incompatible.append(row["name"])
+    if incompatible:
+        raise HTTPException(409, "The selected zone is not defined by associated clusters: " + ", ".join(incompatible))
+    for membership in memberships:
+        if active_cluster_operation(con, membership["name"]):
+            raise HTTPException(409, f"Wait for the active {membership['name']} operation to finish")
+        zoning = stored_zoning(membership["zoning_json"])
+        if zoning.mode != "forced_awareness":
+            continue
+        rows = con.execute(
+            "SELECT cluster_assignments.node_id,cluster_assignments.role,nodes.zone_id FROM cluster_assignments "
+            "JOIN nodes ON nodes.id=cluster_assignments.node_id WHERE cluster_assignments.cluster_id=? "
+            "AND cluster_assignments.state='active' AND cluster_assignments.role IN ('hot','warm')",
+            (membership["id"],),
+        ).fetchall()
+        for role in ("hot", "warm"):
+            role_rows = [row for row in rows if row["role"] == role]
+            if not role_rows:
+                continue
+            zones = {zone_id if row["node_id"] == node_id else row["zone_id"] for row in role_rows}
+            missing = [zone for zone in zoning.zones if zone not in zones]
+            if missing:
+                raise HTTPException(422, f"Changing this host would leave {ROLE_SPECS[role]['label']} without forced zones: {', '.join(missing)}")
+
+
 def require_ready_membership(member):
     if not membership_ready(member):
         raise HTTPException(422, "Configure valid dedicated or shared data and user network bindings before applying or reconciling this workload")
@@ -1015,8 +1221,11 @@ def memory_mebibytes(value):
 
 
 def cluster_payload(con, row, desired_state="present", batch_assignment_ids=(), config_overrides=None):
+    cluster_details = cluster_record(con, row["cluster_id"])
     if desired_state != "purge":
         require_ready_membership(row)
+        if row["role"] in ELASTICSEARCH_ROLES:
+            require_cluster_host_zone(cluster_details, row)
     config_overrides = config_overrides or {}
     config = dict(config_overrides.get(row["id"], open_config(row["config_json"])))
     if row["role"] in {"master", "hot", "warm", "ml", "ingest", "coordinating"}:
@@ -1029,7 +1238,7 @@ def cluster_payload(con, row, desired_state="present", batch_assignment_ids=(), 
         state_params.extend(included_ids)
     master_rows = con.execute(
         "SELECT cluster_assignments.id, cluster_assignments.node_id, cluster_assignments.config_json, "
-        "nodes.name AS node_name, nodes.address AS node_address, memberships.network_mode, memberships.data_interface, memberships.data_address, memberships.user_interface, memberships.user_address "
+        "nodes.name AS node_name, nodes.address AS node_address, nodes.zone_id, memberships.network_mode, memberships.data_interface, memberships.data_address, memberships.user_interface, memberships.user_address "
         "FROM cluster_assignments JOIN nodes ON nodes.id=cluster_assignments.node_id "
         "JOIN memberships ON memberships.cluster_id=cluster_assignments.cluster_id AND memberships.node_id=cluster_assignments.node_id "
         "WHERE cluster_assignments.cluster_id=? AND cluster_assignments.role='master' AND (" + state_filter + ") ORDER BY cluster_assignments.id",
@@ -1042,7 +1251,7 @@ def cluster_payload(con, row, desired_state="present", batch_assignment_ids=(), 
     masters = [{
         "assignment_id": master["id"], "node_id": master["node_id"], "node_name": master["node_name"],
         "node_address": master["node_address"], "network_mode": master["network_mode"],
-        "data_address": master["data_address"], "user_address": master["user_address"],
+        "data_address": master["data_address"], "user_address": master["user_address"], "zone_id": master["zone_id"],
         "workload": f"ecp-{row['slug']}-master-{master['node_id']}", "ports": role_ports["master"],
     } for master in master_rows]
     if bootstrap:
@@ -1055,7 +1264,7 @@ def cluster_payload(con, row, desired_state="present", batch_assignment_ids=(), 
     services = {}
     for service_role in ("kibana", "fleet-server"):
         service = con.execute(
-            "SELECT cluster_assignments.id, cluster_assignments.node_id, nodes.name AS node_name, nodes.address AS node_address, memberships.network_mode, memberships.data_interface, memberships.data_address, memberships.user_interface, memberships.user_address "
+            "SELECT cluster_assignments.id, cluster_assignments.node_id, nodes.name AS node_name, nodes.address AS node_address, nodes.zone_id, memberships.network_mode, memberships.data_interface, memberships.data_address, memberships.user_interface, memberships.user_address "
             "FROM cluster_assignments JOIN nodes ON nodes.id=cluster_assignments.node_id "
             "JOIN memberships ON memberships.cluster_id=cluster_assignments.cluster_id AND memberships.node_id=cluster_assignments.node_id "
             "WHERE cluster_assignments.cluster_id=? AND cluster_assignments.role=? AND (" + state_filter + ") ORDER BY cluster_assignments.id LIMIT 1",
@@ -1066,7 +1275,7 @@ def cluster_payload(con, row, desired_state="present", batch_assignment_ids=(), 
                 require_ready_membership(service)
             services[service_role] = {
                 "assignment_id": service["id"], "node_id": service["node_id"], "node_name": service["node_name"],
-                "node_address": service["node_address"], "network_mode": service["network_mode"], "data_address": service["data_address"], "user_address": service["user_address"],
+                "node_address": service["node_address"], "network_mode": service["network_mode"], "data_address": service["data_address"], "user_address": service["user_address"], "zone_id": service["zone_id"],
                 "workload": f"ecp-{row['slug']}-{service_role}-{service['node_id']}", "ports": role_ports[service_role],
             }
     if desired_state != "purge" and row["role"] == "fleet-server" and "kibana" not in services:
@@ -1074,9 +1283,9 @@ def cluster_payload(con, row, desired_state="present", batch_assignment_ids=(), 
     if desired_state != "purge" and row["role"] == "elastic-agent" and "fleet-server" not in services:
         raise HTTPException(422, "Deploy Fleet Server before Elastic Agent")
     return {
-        "cluster": {"id": row["cluster_id"], "name": row["cluster_name"], "slug": row["slug"], "ports": json.loads(row["ports_json"]), "role_ports": role_ports},
+        "cluster": {"id": row["cluster_id"], "name": row["cluster_name"], "slug": row["slug"], "ports": json.loads(row["ports_json"]), "role_ports": role_ports, "zoning": cluster_details["zoning"]},
         "assignment": {"id": row["id"], "role": row["role"], "config": config, "image_version": row["image_version"] or DEFAULT_STACK_VERSION, "ports": role_ports[row["role"]]},
-        "membership": {"node_id": row["node_id"], "network_mode": row["network_mode"], "data_interface": row["data_interface"], "data_address": row["data_address"], "user_interface": row["user_interface"], "user_address": row["user_address"]},
+        "membership": {"node_id": row["node_id"], "network_mode": row["network_mode"], "data_interface": row["data_interface"], "data_address": row["data_address"], "user_interface": row["user_interface"], "user_address": row["user_address"], "zone_id": row["zone_id"]},
         "bootstrap": bootstrap_data,
         "masters": masters,
         "services": services,
@@ -1115,9 +1324,22 @@ def cluster_record(con, cluster_id):
     result["desired_version"] = result.get("desired_version") or DEFAULT_STACK_VERSION
     result["network_defaults"] = json.loads(result.pop("network_defaults_json", "{}") or "{}")
     result["elasticsearch_settings"] = json.loads(result.pop("elasticsearch_settings_json", "{}") or "{}")
+    result["zoning"] = stored_zoning(result.pop("zoning_json", "{}")).model_dump()
     result["log_monitoring"] = log_monitoring_config(result.pop("observability_json", "{}"))
+    zoning_observation = con.execute("SELECT * FROM cluster_zoning_observations WHERE cluster_id=?", (cluster_id,)).fetchone()
+    result["zoning_status"] = ({
+        **dict(zoning_observation),
+        "applied_zones": json.loads(zoning_observation["applied_zones_json"] or "[]"),
+        "observed_zones": json.loads(zoning_observation["observed_zones_json"] or "{}"),
+    } if zoning_observation else {
+        "applied_mode": "disabled", "applied_zones": [], "observed_zones": {},
+        "status": "pending" if result["zoning"]["mode"] != "disabled" else "disabled",
+        "last_run_id": None, "observed_at": None, "last_error": "",
+    })
+    result["zoning_status"].pop("applied_zones_json", None)
+    result["zoning_status"].pop("observed_zones_json", None)
     members = con.execute(
-        "SELECT memberships.cluster_id, memberships.node_id, memberships.network_mode, memberships.data_interface, memberships.data_address, memberships.user_interface, memberships.user_address, nodes.name, nodes.address, nodes.enabled "
+        "SELECT memberships.cluster_id, memberships.node_id, memberships.network_mode, memberships.data_interface, memberships.data_address, memberships.user_interface, memberships.user_address, nodes.name, nodes.address, nodes.enabled, nodes.zone_id "
         "FROM memberships JOIN nodes ON nodes.id=memberships.node_id WHERE memberships.cluster_id=? ORDER BY nodes.name",
         (cluster_id,),
     ).fetchall()
@@ -1144,7 +1366,7 @@ def cluster_record(con, cluster_id):
 def assignment_record(con, assignment_id):
     row = con.execute(
         "SELECT cluster_assignments.*, clusters.name AS cluster_name, clusters.slug, clusters.ports_json, clusters.role_ports_json, clusters.secrets_json, "
-        "nodes.name AS node_name, nodes.address AS node_address, memberships.network_mode, memberships.data_interface, memberships.data_address, memberships.user_interface, memberships.user_address "
+        "nodes.name AS node_name, nodes.address AS node_address, nodes.zone_id, memberships.network_mode, memberships.data_interface, memberships.data_address, memberships.user_interface, memberships.user_address "
         "FROM cluster_assignments JOIN clusters ON clusters.id=cluster_assignments.cluster_id "
         "JOIN nodes ON nodes.id=cluster_assignments.node_id "
         "JOIN memberships ON memberships.cluster_id=cluster_assignments.cluster_id AND memberships.node_id=cluster_assignments.node_id "
@@ -1208,7 +1430,7 @@ def init():
           ssh_port INTEGER NOT NULL, ssh_user TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
           ssh_host_key TEXT NOT NULL DEFAULT '', ssh_auth_state TEXT NOT NULL DEFAULT 'legacy',
           ssh_key_id TEXT NOT NULL DEFAULT '', candidate_key_id TEXT NOT NULL DEFAULT '',
-          legacy_known_hosts_disabled INTEGER NOT NULL DEFAULT 0
+          legacy_known_hosts_disabled INTEGER NOT NULL DEFAULT 0, zone_id TEXT
         );
         CREATE TABLE IF NOT EXISTS controller_ssh_keys (
           id INTEGER PRIMARY KEY,
@@ -1227,7 +1449,8 @@ def init():
         CREATE TABLE IF NOT EXISTS clusters (
           id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, slug TEXT UNIQUE NOT NULL,
           ports_json TEXT NOT NULL, role_ports_json TEXT NOT NULL DEFAULT '{}', secrets_json TEXT NOT NULL DEFAULT '{}',
-          observability_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+          observability_json TEXT NOT NULL DEFAULT '{}', zoning_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS memberships (
           cluster_id INTEGER NOT NULL REFERENCES clusters(id) ON DELETE CASCADE,
@@ -1281,6 +1504,16 @@ def init():
           observed_at TEXT,
           last_error TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS cluster_zoning_observations (
+          cluster_id INTEGER PRIMARY KEY REFERENCES clusters(id) ON DELETE CASCADE,
+          applied_mode TEXT NOT NULL DEFAULT 'disabled',
+          applied_zones_json TEXT NOT NULL DEFAULT '[]',
+          observed_zones_json TEXT NOT NULL DEFAULT '{}',
+          status TEXT NOT NULL DEFAULT 'pending',
+          last_run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+          observed_at TEXT,
+          last_error TEXT NOT NULL DEFAULT ''
+        );
         CREATE TABLE IF NOT EXISTS audit_events (
           id INTEGER PRIMARY KEY,
           username TEXT NOT NULL,
@@ -1304,6 +1537,7 @@ def init():
             "ssh_key_id": "TEXT NOT NULL DEFAULT ''",
             "candidate_key_id": "TEXT NOT NULL DEFAULT ''",
             "legacy_known_hosts_disabled": "INTEGER NOT NULL DEFAULT 0",
+            "zone_id": "TEXT",
         }.items():
             if column not in node_columns:
                 con.execute(f"ALTER TABLE nodes ADD COLUMN {column} {definition}")
@@ -1319,6 +1553,7 @@ def init():
             "network_defaults_json": "TEXT NOT NULL DEFAULT '{}'",
             "elasticsearch_settings_json": "TEXT NOT NULL DEFAULT '{}'",
             "observability_json": "TEXT NOT NULL DEFAULT '{}'",
+            "zoning_json": "TEXT NOT NULL DEFAULT '{}'",
         }
         for column, definition in cluster_additions.items():
             if column not in cluster_columns:
@@ -1499,6 +1734,15 @@ def test_ssh_password(node, password):
 def add_log(run_id, value):
     with db() as con:
         con.execute("UPDATE runs SET log=log || ? WHERE id=?", (value, run_id))
+
+
+def completed_run(kind, target, message, context=None):
+    with db() as con:
+        cursor = con.execute(
+            "INSERT INTO runs(kind,target,status,command_json,log,finished_at,context_json) VALUES (?,?, 'succeeded','[]',?,CURRENT_TIMESTAMP,?)",
+            (kind, target, message.rstrip() + "\n", json.dumps(context or {})),
+        )
+        return cursor.lastrowid
 
 
 def stream_command(command, on_line):
@@ -1886,14 +2130,18 @@ def workload_change_sort_key(change):
 
 def active_cluster_operation(con, cluster_name):
     return con.execute(
-        "SELECT 1 FROM runs WHERE status IN ('queued','running','recovery_required') AND target LIKE ?",
-        (cluster_name + ":%",),
+        "SELECT 1 FROM runs WHERE status IN ('queued','running','recovery_required') AND ("
+        "target=? OR substr(target,1,length(?) + 1)=? || ':' OR id IN ("
+        "SELECT cluster_assignments.operation_run_id FROM cluster_assignments "
+        "JOIN clusters ON clusters.id=cluster_assignments.cluster_id "
+        "WHERE clusters.name=? AND cluster_assignments.operation_run_id IS NOT NULL))",
+        (cluster_name, cluster_name, cluster_name, cluster_name),
     ).fetchone()
 
 
 def active_assignments_for_change_set(con, cluster_id):
     return con.execute(
-        "SELECT cluster_assignments.*, nodes.name AS node_name, nodes.enabled, memberships.network_mode, memberships.data_interface, memberships.data_address, memberships.user_interface, memberships.user_address "
+        "SELECT cluster_assignments.*, nodes.name AS node_name, nodes.enabled, nodes.zone_id, memberships.network_mode, memberships.data_interface, memberships.data_address, memberships.user_interface, memberships.user_address "
         "FROM cluster_assignments JOIN nodes ON nodes.id=cluster_assignments.node_id "
         "JOIN memberships ON memberships.cluster_id=cluster_assignments.cluster_id AND memberships.node_id=cluster_assignments.node_id "
         "WHERE cluster_assignments.cluster_id=? AND cluster_assignments.state='active' ORDER BY cluster_assignments.id",
@@ -1925,8 +2173,9 @@ def validate_workload_change_set(con, cluster_id, input):
         item = change.model_dump()
         if item["kind"] == "create":
             validate_config(item["role"], item["config"])
+            item["image_version"] = item["image_version"] or recommended_workload_version(active, []) or cluster["desired_version"] or DEFAULT_STACK_VERSION
             member = con.execute(
-                "SELECT nodes.name AS node_name,nodes.enabled,memberships.network_mode,memberships.data_interface,memberships.data_address,memberships.user_interface,memberships.user_address "
+                "SELECT nodes.name AS node_name,nodes.enabled,nodes.zone_id,memberships.network_mode,memberships.data_interface,memberships.data_address,memberships.user_interface,memberships.user_address "
                 "FROM memberships JOIN nodes ON nodes.id=memberships.node_id WHERE memberships.cluster_id=? AND memberships.node_id=?",
                 (cluster_id, item["node_id"]),
             ).fetchone()
@@ -1935,6 +2184,8 @@ def validate_workload_change_set(con, cluster_id, input):
             if not member["enabled"]:
                 raise HTTPException(422, "Enable the host before applying a role")
             require_ready_membership(member)
+            if item["role"] in ELASTICSEARCH_ROLES:
+                require_cluster_host_zone(cluster, member)
             conflict = conflict_message(con, cluster_id, item["node_id"], item["role"])
             if conflict:
                 raise HTTPException(409, conflict)
@@ -1959,6 +2210,8 @@ def validate_workload_change_set(con, cluster_id, input):
             if not row["enabled"]:
                 raise HTTPException(422, "Enable the host before applying a role")
             require_ready_membership(row)
+            if row["role"] in ELASTICSEARCH_ROLES:
+                require_cluster_host_zone(cluster, row)
             planned.append({**item, "node_id": row["node_id"], "node_name": row["node_name"], "role": row["role"], "config": next_config, "previous_config": open_config(row["config_json"])})
         else:
             planned.append({**item, "node_id": row["node_id"], "node_name": row["node_name"], "role": row["role"]})
@@ -2158,8 +2411,8 @@ def launch_workload_change_batch(cluster_id, input):
         for item in plan_changes:
             if item["kind"] == "create":
                 cursor = con.execute(
-                    "INSERT INTO cluster_assignments(cluster_id,node_id,role,config_json,state,operation_run_id) VALUES (?,?,?,?, 'applying',?)",
-                    (cluster_id, item["node_id"], item["role"], seal_config(json.dumps(item["config"])), run_id),
+                    "INSERT INTO cluster_assignments(cluster_id,node_id,role,config_json,image_version,state,operation_run_id) VALUES (?,?,?,?,?, 'applying',?)",
+                    (cluster_id, item["node_id"], item["role"], seal_config(json.dumps(item["config"])), item["image_version"], run_id),
                 )
                 item["assignment_id"] = cursor.lastrowid
             else:
@@ -2188,6 +2441,249 @@ def reconcile_command(inv, variables_path, name):
         "ansible-playbook", "-i", str(inv), str(PLAYBOOKS / "cluster-reconcile.yml"), "--limit", name,
         "--private-key", active_ssh_key_path(), "--extra-vars", "@" + str(variables_path),
     ]
+
+
+def zoning_settings_command(inv, variables_path, name):
+    return [
+        "ansible-playbook", "-i", str(inv), str(PLAYBOOKS / "cluster-zoning-settings.yml"), "--limit", name,
+        "--private-key", active_ssh_key_path(), "--extra-vars", "@" + str(variables_path),
+    ]
+
+
+def zoning_assignments(cluster):
+    return sorted(
+        [assignment for assignment in cluster["assignments"] if assignment["role"] in ELASTICSEARCH_ROLES],
+        key=lambda assignment: (ZONING_RECONCILE_ORDER.index(assignment["role"]), assignment["node_name"], assignment["id"]),
+    )
+
+
+def zoning_preflight(con, cluster_id):
+    cluster = cluster_record(con, cluster_id)
+    if active_cluster_operation(con, cluster["name"]):
+        raise HTTPException(409, "Wait for the active cluster operation to finish")
+    zoning = cluster["zoning"]
+    assignments = zoning_assignments(cluster)
+    if zoning["mode"] == "disabled":
+        if assignments and not any(assignment["role"] == "master" for assignment in assignments):
+            raise HTTPException(422, "Deploy a master or purge Elasticsearch workloads before disabling zoning")
+        return cluster, assignments
+    if len(zoning["zones"]) < 2:
+        raise HTTPException(422, "Allocation awareness requires at least two defined zones")
+    if not any(assignment["role"] == "master" for assignment in assignments):
+        raise HTTPException(422, "Deploy a master before applying cluster zoning")
+    data_assignments = [assignment for assignment in assignments if assignment["role"] in {"hot", "warm"}]
+    if not data_assignments:
+        raise HTTPException(422, "Deploy hot or warm data workloads before applying cluster zoning")
+    members = {member["node_id"]: member for member in cluster["members"]}
+    for assignment in assignments:
+        require_cluster_host_zone(cluster, members.get(assignment["node_id"]))
+    data_zones = {members[assignment["node_id"]]["zone_id"] for assignment in data_assignments}
+    if zoning["mode"] == "forced_awareness":
+        for role in ("hot", "warm"):
+            role_assignments = [assignment for assignment in data_assignments if assignment["role"] == role]
+            if not role_assignments:
+                continue
+            role_zones = {members[assignment["node_id"]]["zone_id"] for assignment in role_assignments}
+            missing = [zone for zone in zoning["zones"] if zone not in role_zones]
+            if missing:
+                raise HTTPException(422, f"{ROLE_SPECS[role]['label']} does not cover forced zones: {', '.join(missing)}")
+    if len(data_zones) < 2:
+        raise HTTPException(422, "Data workloads must span at least two defined zones")
+    return cluster, assignments
+
+
+async def execute_zoning_reconcile(run_id, inv, payload, name, suffix):
+    variables_path = VARIABLES / f"run-{run_id}-zoning-{suffix}.yaml"
+    variables_path.write_text(yaml.safe_dump(payload, sort_keys=True), encoding="utf-8")
+    os.chmod(variables_path, 0o600)
+    try:
+        return await execute_logged_command(run_id, reconcile_command(inv, variables_path, name))
+    finally:
+        variables_path.unlink(missing_ok=True)
+
+
+async def execute_zoning_settings(run_id, inv, payload, name):
+    variables_path = VARIABLES / f"run-{run_id}-zoning-settings.yaml"
+    variables_path.write_text(yaml.safe_dump(payload, sort_keys=True), encoding="utf-8")
+    os.chmod(variables_path, 0o600)
+    try:
+        return await execute_logged_command(run_id, zoning_settings_command(inv, variables_path, name))
+    finally:
+        variables_path.unlink(missing_ok=True)
+
+
+def zoning_settings_payload(con, cluster):
+    master = next((assignment for assignment in cluster["assignments"] if assignment["role"] == "master"), None)
+    if not master:
+        raise HTTPException(422, "Deploy a master before applying cluster zoning")
+    member = next(member for member in cluster["members"] if member["node_id"] == master["node_id"])
+    credentials = open_config(con.execute("SELECT secrets_json FROM clusters WHERE id=?", (cluster["id"],)).fetchone()["secrets_json"])
+    return {
+        "cluster": {"id": cluster["id"], "name": cluster["name"], "slug": cluster["slug"]},
+        "bootstrap": {
+            "node_name": master["node_name"], "node_id": master["node_id"], "user_address": member["user_address"],
+            "ports": cluster["role_ports"]["master"],
+        },
+        "credentials": credentials,
+        "zoning": cluster["zoning"],
+    }, master["node_name"]
+
+
+async def rollback_zoning_reconciles(run_id, inv, completed, previous_zones):
+    succeeded = True
+    for index, (assignment, payload) in enumerate(reversed(completed)):
+        rollback_payload = json.loads(json.dumps(payload))
+        rollback_payload["membership"]["zone_id"] = previous_zones.get(str(assignment["id"])) or ""
+        if not await execute_zoning_reconcile(run_id, inv, rollback_payload, assignment["node_name"], f"rollback-{index}"):
+            succeeded = False
+    return succeeded
+
+
+async def run_zoning_apply(run_id, cluster_id, inventory_path):
+    succeeded = False
+    completed = []
+    previous_zones = {}
+    error_message = "Zoning application failed"
+    try:
+        with db() as con:
+            cluster = cluster_record(con, cluster_id)
+            assignments = zoning_assignments(cluster)
+            observation = con.execute("SELECT * FROM cluster_zoning_observations WHERE cluster_id=?", (cluster_id,)).fetchone()
+            if observation:
+                previous_zones = json.loads(observation["observed_zones_json"] or "{}")
+            desired_zones = {
+                str(assignment["id"]): (
+                    next(member["zone_id"] for member in cluster["members"] if member["node_id"] == assignment["node_id"])
+                    if cluster["zoning"]["mode"] != "disabled" else ""
+                )
+                for assignment in assignments
+            }
+        for index, assignment in enumerate(assignments):
+            if previous_zones.get(str(assignment["id"]), "") == desired_zones[str(assignment["id"])]:
+                continue
+            with db() as con:
+                payload = cluster_payload(con, assignment_record(con, assignment["id"]))
+            payload["membership"]["zone_id"] = desired_zones[str(assignment["id"])]
+            if not await execute_zoning_reconcile(run_id, inventory_path, payload, assignment["node_name"], str(index)):
+                error_message = f"Zoning reconciliation failed for {assignment['role']} on {assignment['node_name']}"
+                if not await rollback_zoning_reconciles(run_id, inventory_path, completed, previous_zones):
+                    error_message += "; rollback was incomplete"
+                return
+            completed.append((assignment, payload))
+        with db() as con:
+            cluster = cluster_record(con, cluster_id)
+            settings_payload, master_name = zoning_settings_payload(con, cluster)
+        if not await execute_zoning_settings(run_id, inventory_path, settings_payload, master_name):
+            error_message = "Elasticsearch rejected the zoning settings"
+            if not await rollback_zoning_reconciles(run_id, inventory_path, completed, previous_zones):
+                error_message += "; workload rollback was incomplete"
+            return
+        with db() as con:
+            con.execute(
+                "INSERT INTO cluster_zoning_observations(cluster_id,applied_mode,applied_zones_json,observed_zones_json,status,last_run_id,observed_at,last_error) "
+                "VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP,'') ON CONFLICT(cluster_id) DO UPDATE SET "
+                "applied_mode=excluded.applied_mode,applied_zones_json=excluded.applied_zones_json,observed_zones_json=excluded.observed_zones_json,"
+                "status=excluded.status,last_run_id=excluded.last_run_id,observed_at=CURRENT_TIMESTAMP,last_error=''",
+                (cluster_id, cluster["zoning"]["mode"], json.dumps(cluster["zoning"]["zones"]), json.dumps(desired_zones), "disabled" if cluster["zoning"]["mode"] == "disabled" else "applied", run_id),
+            )
+        succeeded = True
+    except Exception as error:
+        error_message = str(error)
+        add_log(run_id, "Zoning runner error: " + error_message + "\n")
+    finally:
+        Path(inventory_path).unlink(missing_ok=True)
+        with db() as con:
+            if not succeeded:
+                con.execute(
+                    "INSERT INTO cluster_zoning_observations(cluster_id,status,last_run_id,observed_at,last_error) VALUES (?,'failed',?,CURRENT_TIMESTAMP,?) "
+                    "ON CONFLICT(cluster_id) DO UPDATE SET status='failed',last_run_id=excluded.last_run_id,observed_at=CURRENT_TIMESTAMP,last_error=excluded.last_error",
+                    (cluster_id, run_id, error_message[:500]),
+                )
+            con.execute("UPDATE runs SET status=?,finished_at=CURRENT_TIMESTAMP WHERE id=?", ("succeeded" if succeeded else "failed", run_id))
+
+
+def launch_zoning_apply(cluster_id):
+    disabled_without_master = False
+    with db() as con:
+        cluster, assignments = zoning_preflight(con, cluster_id)
+        if cluster["zoning"]["mode"] == "disabled" and not assignments:
+            con.execute(
+                "INSERT INTO cluster_zoning_observations(cluster_id,applied_mode,applied_zones_json,observed_zones_json,status,observed_at,last_error) "
+                "VALUES (?,'disabled','[]','{}','disabled',CURRENT_TIMESTAMP,'') ON CONFLICT(cluster_id) DO UPDATE SET "
+                "applied_mode='disabled',applied_zones_json='[]',status='disabled',observed_at=CURRENT_TIMESTAMP,last_error=''",
+                (cluster_id,),
+            )
+            disabled_without_master = True
+        else:
+            cursor = con.execute(
+                "INSERT INTO runs(kind,target,status,command_json,context_json) VALUES (?,?,'running','[]',?)",
+                ("zoning-apply", cluster["name"] + ":zoning", json.dumps({"cluster_id": cluster_id, "mode": cluster["zoning"]["mode"], "zones": cluster["zoning"]["zones"]})),
+            )
+            run_id = cursor.lastrowid
+    if disabled_without_master:
+        return completed_run("zoning-apply", cluster["name"] + ":zoning", "Zoning is disabled and no Elasticsearch master is assigned.")
+    inv = inventory(run_id)
+    asyncio.create_task(run_zoning_apply(run_id, cluster_id, inv))
+    return run_id
+
+
+async def run_host_zone_change(run_id, node_id, previous_zone, zone_id, inventory_path):
+    succeeded = False
+    completed = []
+    error_message = "Host zone reconciliation failed"
+    try:
+        with db() as con:
+            assignments = []
+            for row in con.execute(
+                "SELECT id FROM cluster_assignments WHERE node_id=? AND state='active' "
+                "AND role IN ('master','hot','warm','ml','ingest','coordinating')",
+                (node_id,),
+            ).fetchall():
+                assignment = cluster_record(con, assignment_record(con, row["id"])["cluster_id"])
+                if assignment["zoning"]["mode"] == "disabled":
+                    continue
+                record = next(item for item in assignment["assignments"] if item["id"] == row["id"])
+                assignments.append(record)
+            assignments.sort(key=lambda item: (item["cluster_id"], ZONING_RECONCILE_ORDER.index(item["role"]), item["node_name"], item["id"]))
+        for index, assignment in enumerate(assignments):
+            with db() as con:
+                payload = cluster_payload(con, assignment_record(con, assignment["id"]))
+            if not await execute_zoning_reconcile(run_id, inventory_path, payload, assignment["node_name"], f"host-{index}"):
+                error_message = f"Failed to apply zone {zone_id} to {assignment['role']} on {assignment['node_name']}"
+                previous = {str(item["id"]): previous_zone for item, _payload in completed}
+                if not await rollback_zoning_reconciles(run_id, inventory_path, completed, previous):
+                    error_message += "; rollback was incomplete"
+                return
+            completed.append((assignment, payload))
+        with db() as con:
+            for cluster_id in {assignment["cluster_id"] for assignment in assignments}:
+                observation = con.execute("SELECT observed_zones_json FROM cluster_zoning_observations WHERE cluster_id=?", (cluster_id,)).fetchone()
+                if not observation:
+                    continue
+                observed = json.loads(observation["observed_zones_json"] or "{}")
+                for assignment in assignments:
+                    if assignment["cluster_id"] == cluster_id:
+                        observed[str(assignment["id"])] = zone_id
+                con.execute(
+                    "UPDATE cluster_zoning_observations SET observed_zones_json=?,observed_at=CURRENT_TIMESTAMP,last_run_id=?,last_error='' WHERE cluster_id=?",
+                    (json.dumps(observed), run_id, cluster_id),
+                )
+        succeeded = True
+    except Exception as error:
+        error_message = str(error)
+        add_log(run_id, "Host zone runner error: " + error_message + "\n")
+    finally:
+        Path(inventory_path).unlink(missing_ok=True)
+        with db() as con:
+            if not succeeded:
+                con.execute("UPDATE nodes SET zone_id=? WHERE id=?", (previous_zone, node_id))
+            con.execute(
+                "UPDATE cluster_assignments SET operation_run_id=NULL WHERE node_id=? AND operation_run_id=?",
+                (node_id, run_id),
+            )
+            con.execute("UPDATE runs SET status=?,finished_at=CURRENT_TIMESTAMP WHERE id=?", ("succeeded" if succeeded else "failed", run_id))
+            if not succeeded:
+                con.execute("UPDATE runs SET log=log || ? WHERE id=?", (error_message.rstrip() + "\n", run_id))
 
 
 def filebeat_reconcile_command(inv, variables_path, name):
@@ -2489,9 +2985,13 @@ async def enroll_node(input: NodeEnrollment, request: Request, username: Annotat
     temporary_name = requested_name or f"pending-{secrets.token_hex(8)}"
     try:
         with db() as con:
+            if input.zone_id:
+                if not input.zone_cluster_id:
+                    raise HTTPException(422, "Select the cluster that defines this host zone")
+                validate_host_zone_change(con, -1, input.zone_cluster_id, input.zone_id)
             cursor = con.execute(
-                "INSERT INTO nodes(name,address,ssh_port,ssh_user,enabled,ssh_host_key,ssh_auth_state) VALUES (?,?,?,?,?,?, 'pending')",
-                (temporary_name, input.address, input.ssh_port, input.ssh_user, 0, host_key),
+                "INSERT INTO nodes(name,address,ssh_port,ssh_user,enabled,ssh_host_key,ssh_auth_state,zone_id) VALUES (?,?,?,?,?,?, 'pending',?)",
+                (temporary_name, input.address, input.ssh_port, input.ssh_user, 0, host_key, input.zone_id),
             )
             node_id = cursor.lastrowid
             node = dict(con.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone())
@@ -2517,8 +3017,8 @@ async def create_node(input: Node, _: Annotated[str, Depends(user)]):
     try:
         with db() as con:
             cursor = con.execute(
-                "INSERT INTO nodes(name,address,ssh_port,ssh_user,enabled) VALUES (?,?,?,?,?)",
-                (input.name, input.address, input.ssh_port, input.ssh_user, input.enabled),
+                "INSERT INTO nodes(name,address,ssh_port,ssh_user,enabled,zone_id) VALUES (?,?,?,?,?,?)",
+                (input.name, input.address, input.ssh_port, input.ssh_user, input.enabled, input.zone_id),
             )
         return {"id": cursor.lastrowid}
     except sqlite3.IntegrityError:
@@ -2558,6 +3058,56 @@ async def update_node(node_id: int, input: NodeUpdate, username: Annotated[str, 
                 ),
             )
     return {"updated": True}
+
+
+@app.put("/api/nodes/{node_id}/zone")
+async def update_node_zone(node_id: int, input: HostZoneInput, username: Annotated[str, Depends(user)]):
+    assignment_ids = []
+    unchanged = False
+    with db() as con:
+        node = con.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
+        if not node:
+            raise HTTPException(404, "Node not found")
+        validate_host_zone_change(con, node_id, input.cluster_id, input.zone_id)
+        previous = node["zone_id"]
+        if previous == input.zone_id:
+            unchanged = True
+        else:
+            assignment_ids = [row["id"] for row in con.execute(
+                "SELECT id FROM cluster_assignments WHERE node_id=? AND state='active' AND role IN ('master','hot','warm','ml','ingest','coordinating') ORDER BY id",
+                (node_id,),
+            ).fetchall()]
+            con.execute("UPDATE nodes SET zone_id=? WHERE id=?", (input.zone_id, node_id))
+            con.execute(
+                "INSERT INTO audit_events(username,action,item_id,detail) VALUES (?,?,?,?)",
+                (username, "host_zone_updated", str(node_id), f"{previous or 'unassigned'} -> {input.zone_id}"),
+            )
+            if assignment_ids:
+                cursor = con.execute(
+                    "INSERT INTO runs(kind,target,status,command_json,context_json) VALUES (?,?,'running','[]',?)",
+                    ("host-zone-change", node["name"] + ":zone", json.dumps({"node_id": node_id, "previous_zone": previous, "zone_id": input.zone_id, "assignment_ids": assignment_ids})),
+                )
+                run_id = cursor.lastrowid
+                placeholders = ",".join("?" * len(assignment_ids))
+                locked = con.execute(
+                    f"UPDATE cluster_assignments SET operation_run_id=? WHERE id IN ({placeholders}) AND operation_run_id IS NULL",
+                    [run_id, *assignment_ids],
+                )
+                if locked.rowcount != len(assignment_ids):
+                    raise HTTPException(409, "A workload on this host is already part of an active operation")
+            else:
+                run_id = None
+    if unchanged:
+        return {"updated": True, "run_id": completed_run("host-zone-change", node["name"] + ":zone", f"Host already uses {input.zone_id}.")}
+    if assignment_ids:
+        inv = inventory(run_id)
+        asyncio.create_task(run_host_zone_change(run_id, node_id, previous, input.zone_id, inv))
+    else:
+        run_id = completed_run(
+            "host-zone-change", node["name"] + ":zone", f"Host zone set to {input.zone_id}.",
+            {"node_id": node_id, "previous_zone": previous, "zone_id": input.zone_id},
+        )
+    return {"updated": True, "run_id": run_id}
 
 
 @app.post("/api/nodes/{node_id}/legacy-known-hosts/remove")
@@ -2651,7 +3201,7 @@ async def create_cluster(input: ClusterInput, _: Annotated[str, Depends(user)]):
         with db() as con:
             color = (input.theme_color or next_theme_color(con)).upper()
             cursor = con.execute(
-                "INSERT INTO clusters(name,slug,ports_json,role_ports_json,secrets_json,observability_json,theme_color,desired_version,network_defaults_json,elasticsearch_settings_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO clusters(name,slug,ports_json,role_ports_json,secrets_json,observability_json,theme_color,desired_version,network_defaults_json,elasticsearch_settings_json,zoning_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     input.name, slug, input.ports.model_dump_json(),
                     json.dumps(input.role_ports.model_dump(by_alias=True), sort_keys=True),
@@ -2662,7 +3212,7 @@ async def create_cluster(input: ClusterInput, _: Annotated[str, Depends(user)]):
                         "filebeat_password": secrets.token_hex(24),
                     })),
                     json.dumps(log_monitoring_config("", default_enabled=True), sort_keys=True),
-                    color, input.desired_version, input.network_defaults.model_dump_json(), input.elasticsearch_settings.model_dump_json(),
+                    color, input.desired_version, input.network_defaults.model_dump_json(), input.elasticsearch_settings.model_dump_json(), input.zoning.model_dump_json(),
                 ),
             )
         return {"id": cursor.lastrowid}
@@ -2685,11 +3235,12 @@ async def update_cluster(cluster_id: int, input: ClusterInput, _: Annotated[str,
             conflict = profile_conflict(con, cluster_id, input.role_ports.model_dump(by_alias=True))
             if conflict:
                 raise HTTPException(409, conflict)
+            validate_zoning_catalog_update(con, cluster_id, input.zoning)
             cursor = con.execute(
-                "UPDATE clusters SET name=?,slug=?,ports_json=?,role_ports_json=?,theme_color=?,desired_version=?,network_defaults_json=?,elasticsearch_settings_json=? WHERE id=?",
+                "UPDATE clusters SET name=?,slug=?,ports_json=?,role_ports_json=?,theme_color=?,desired_version=?,network_defaults_json=?,elasticsearch_settings_json=?,zoning_json=? WHERE id=?",
                 (
                     input.name, slug, input.ports.model_dump_json(), json.dumps(input.role_ports.model_dump(by_alias=True), sort_keys=True), (input.theme_color or next_theme_color(con)).upper(),
-                    input.desired_version, input.network_defaults.model_dump_json(), input.elasticsearch_settings.model_dump_json(), cluster_id,
+                    input.desired_version, input.network_defaults.model_dump_json(), input.elasticsearch_settings.model_dump_json(), input.zoning.model_dump_json(), cluster_id,
                 ),
             )
             if not cursor.rowcount:
@@ -2697,6 +3248,39 @@ async def update_cluster(cluster_id: int, input: ClusterInput, _: Annotated[str,
         return {"updated": True}
     except sqlite3.IntegrityError:
         raise HTTPException(409, "Cluster name already exists")
+
+
+@app.get("/api/clusters/{cluster_id}/zoning")
+async def get_cluster_zoning(cluster_id: int, _: Annotated[str, Depends(user)]):
+    with db() as con:
+        cluster = cluster_record(con, cluster_id)
+    return {
+        "cluster_id": cluster_id,
+        "zoning": cluster["zoning"],
+        "status": cluster["zoning_status"],
+    }
+
+
+@app.put("/api/clusters/{cluster_id}/zoning")
+async def update_cluster_zoning(cluster_id: int, zoning: ZoningConfig, username: Annotated[str, Depends(user)]):
+    with db() as con:
+        cluster = cluster_record(con, cluster_id)
+        validate_zoning_catalog_update(con, cluster_id, zoning)
+        con.execute("UPDATE clusters SET zoning_json=? WHERE id=?", (zoning.model_dump_json(), cluster_id))
+        con.execute(
+            "INSERT INTO audit_events(username,action,cluster_id,item_id,detail) VALUES (?,?,?,?,?)",
+            (username, "cluster_zoning_updated", cluster_id, str(cluster_id), zoning.mode + ":" + ",".join(zoning.zones)),
+        )
+    run_id = completed_run(
+        "zoning-config", cluster["name"] + ":zoning", "Stored desired cluster zoning configuration.",
+        {"cluster_id": cluster_id, "mode": zoning.mode, "zones": zoning.zones},
+    )
+    return {"updated": True, "run_id": run_id, "apply_required": zoning.model_dump() != cluster["zoning"]}
+
+
+@app.post("/api/clusters/{cluster_id}/zoning/apply")
+async def apply_cluster_zoning(cluster_id: int, _: Annotated[str, Depends(user)]):
+    return {"run_id": launch_zoning_apply(cluster_id)}
 
 
 @app.get("/api/clusters/{cluster_id}/log-monitoring")
@@ -2718,15 +3302,20 @@ async def update_cluster_log_monitoring(cluster_id: int, input: LogMonitoringInp
 
 
 @app.get("/api/clusters/{cluster_id}/versions")
-async def get_cluster_versions(cluster_id: int, _: Annotated[str, Depends(user)]):
+async def get_cluster_versions(cluster_id: int, _: Annotated[str, Depends(user)], role: str | None = None):
+    if role is not None and role not in ROLE_SPECS:
+        raise HTTPException(422, "Unknown workload role")
     with db() as con:
         details = version_details(con, cluster_id, include_candidates=False)
+        cluster = cluster_record(con, cluster_id)
     try:
-        with db() as con:
-            cluster = cluster_record(con, cluster_id)
-        details["available_versions"] = await asyncio.to_thread(available_versions, details["assignments"], cluster["log_monitoring"]["filebeat_enabled"])
+        if role:
+            details["available_versions"] = await asyncio.to_thread(available_role_versions, role, details["assignments"])
+        else:
+            details["available_versions"] = await asyncio.to_thread(available_versions, details["assignments"], cluster["log_monitoring"]["filebeat_enabled"])
     except HTTPException as error:
         details["registry_error"] = error.detail
+    details["recommended_version"] = recommended_workload_version(details["assignments"], details["available_versions"]) or cluster["desired_version"] or DEFAULT_STACK_VERSION
     return details
 
 
@@ -2883,6 +3472,7 @@ async def cluster_topology(cluster_id: int, _: Annotated[str, Depends(user)]):
         lines += [
             "", "+" + "=" * width + "+",
             topology_outer_line(f" HOST: {member['name']}", width),
+            topology_outer_line(f" Zone    : {member['zone_id'] or 'not assigned'}", width),
             topology_outer_line(f" Network : {member['network_mode'] or 'dedicated'}", width),
             topology_outer_line(f" User NIC: {member['user_interface'] or 'not configured'}  {member['user_address'] or 'not configured'}", width),
             topology_outer_line(f" Data NIC: {member['data_interface'] or 'not configured'}  {member['data_address'] or 'not configured'}", width),
@@ -2931,12 +3521,13 @@ async def delete_cluster(cluster_id: int, _: Annotated[str, Depends(user)]):
 async def add_member(cluster_id: int, input: MembershipInput, _: Annotated[str, Depends(user)]):
     validate_membership_network(input)
     with db() as con:
-        cluster_record(con, cluster_id)
-        node = con.execute("SELECT enabled FROM nodes WHERE id=?", (input.node_id,)).fetchone()
+        cluster = cluster_record(con, cluster_id)
+        node = con.execute("SELECT enabled,zone_id FROM nodes WHERE id=?", (input.node_id,)).fetchone()
         if not node:
             raise HTTPException(404, "Node not found")
         if not node["enabled"]:
             raise HTTPException(422, "Enable the node before adding it to a cluster")
+        require_cluster_host_zone(cluster, node)
         try:
             columns = {row["name"] for row in con.execute("PRAGMA table_info(memberships)")}
             if "advertised_address" in columns:
@@ -2960,7 +3551,11 @@ async def update_member(cluster_id: int, node_id: int, input: MembershipInput, _
         raise HTTPException(422, "Membership node does not match the request path")
     validate_membership_network(input)
     with db() as con:
-        cluster_record(con, cluster_id)
+        cluster = cluster_record(con, cluster_id)
+        node = con.execute("SELECT zone_id FROM nodes WHERE id=?", (node_id,)).fetchone()
+        if not node:
+            raise HTTPException(404, "Node not found")
+        require_cluster_host_zone(cluster, node)
         cursor = con.execute("UPDATE memberships SET network_mode=?,data_interface=?,data_address=?,user_interface=?,user_address=? WHERE cluster_id=? AND node_id=?", (input.network_mode, input.data_interface, input.data_address, input.user_interface, input.user_address, cluster_id, node_id))
         if not cursor.rowcount:
             raise HTTPException(404, "Cluster membership not found")

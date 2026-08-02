@@ -8,7 +8,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, jsonBody, queries } from '../api';
 import { useConsole } from '../app-context';
 import { bytes, roleLabel } from '../format';
-import type { Assignment, Membership, NodeRecord, RunRecord, StorageMountResponse, TopologyResponse } from '../types';
+import type { Assignment, Membership, NodeRecord, RunRecord, StorageMountResponse, TopologyResponse, VersionResponse } from '../types';
 
 type ModalState =
   | { type: 'resources'; assignment: Assignment }
@@ -16,9 +16,25 @@ type ModalState =
   | { type: 'network'; member: Membership };
 
 type PendingChange =
-  | { clientId: string; kind: 'create'; nodeId: number; nodeName: string; role: string; config: Record<string, string> }
+  | { clientId: string; kind: 'create'; nodeId: number; nodeName: string; role: string; imageVersion: string; config: Record<string, string> }
   | { clientId: string; kind: 'resources'; assignmentId: number; expectedRevision: number; nodeId: number; nodeName: string; role: string; config: Record<string, string>; previousConfig: Record<string, string> }
   | { clientId: string; kind: 'detach'; assignmentId: number; expectedRevision: number; nodeId: number; nodeName: string; role: string };
+
+export const managedWorkloadColumns = [
+  { id: 'role', display: 'Role', initialWidth: 170 },
+  { id: 'version', display: 'Image version', initialWidth: 140 },
+  { id: 'host', display: 'Host', initialWidth: 150 },
+  { id: 'state', display: 'Runtime', initialWidth: 140 },
+  { id: 'resources', display: 'Resources', initialWidth: 180 },
+  { id: 'storage', display: 'Storage', initialWidth: 260 },
+  { id: 'endpoint', display: 'Endpoint', initialWidth: 240 },
+  { id: 'actions', display: 'Actions', initialWidth: 260 },
+];
+
+export function workloadImageVersion(assignment: Assignment) {
+  if (assignment.observation?.running && assignment.observation.version) return assignment.observation.version;
+  return assignment.observation?.version || 'not observed';
+}
 
 function clientChangeId() {
   return globalThis.crypto?.randomUUID?.() || `change-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -33,6 +49,7 @@ function assignmentFormFromPendingChange(change: Extract<PendingChange, { kind: 
   return {
     node_id: change.nodeId,
     role: change.role,
+    image_version: change.imageVersion,
     cpu: String(cpu),
     memory: String(memory),
     storage_path: String(storage_path),
@@ -42,7 +59,7 @@ function assignmentFormFromPendingChange(change: Extract<PendingChange, { kind: 
 }
 
 function pendingChangeSummary(item: PendingChange) {
-  if (item.kind === 'create') return `Host: ${item.nodeName} · placement: ${roleLabel(item.role)} · ${item.config.cpu} CPU / ${item.config.memory} / ${item.config.storage_path}`;
+  if (item.kind === 'create') return `Host: ${item.nodeName} · placement: ${roleLabel(item.role)} · image ${item.imageVersion} · ${item.config.cpu} CPU / ${item.config.memory} / ${item.config.storage_path}`;
   if (item.kind === 'detach') return `Host: ${item.nodeName} · placement released after the reversible changes succeed`;
   const changes = [
     item.previousConfig.cpu !== item.config.cpu && `CPU ${item.previousConfig.cpu} → ${item.config.cpu}`,
@@ -168,18 +185,33 @@ export function RolesPage() {
   const { data: health } = useQuery({ queryKey: ['health'], queryFn: () => api<{ roles: Array<{ id: string; label: string }> }>('/api/health') });
   const { data: topology } = useQuery({ queryKey: ['topology', selectedCluster?.id], enabled: Boolean(selectedCluster), queryFn: () => api<TopologyResponse>(`/api/clusters/${selectedCluster!.id}/topology`) });
   const [member, setMember] = useState({ node_id: 0, network_mode: 'shared', user_interface: 'ens18', user_address: '', data_interface: 'ens18', data_address: '' });
-  const [assignment, setAssignment] = useState({ node_id: 0, role: 'master', cpu: '2', memory: '4g', storage_path: '', pipeline: 'input { beats { port => 5044 } }\noutput { stdout { codec => rubydebug } }', advanced: '{}' });
+  const [assignment, setAssignment] = useState({ node_id: 0, role: 'master', image_version: '', cpu: '2', memory: '4g', storage_path: '', pipeline: 'input { beats { port => 5044 } }\noutput { stdout { codec => rubydebug } }', advanced: '{}' });
   const [pendingChanges, setPendingChanges] = useState<PendingChange[]>([]);
   const [applyingRunId, setApplyingRunId] = useState<number>();
   const [modal, setModal] = useState<ModalState>();
   const [error, setError] = useState('');
-  const [visibleColumns, setVisibleColumns] = useState(['role', 'host', 'state', 'resources', 'storage', 'endpoint', 'actions']);
+  const [visibleColumns, setVisibleColumns] = useState(() => managedWorkloadColumns.map((column) => column.id));
   const [editingChangeId, setEditingChangeId] = useState<string>();
   const [pendingNavigation, setPendingNavigation] = useState<(() => void)>();
   const roles = health?.roles || [];
+  const versionsQuery = useQuery({
+    queryKey: ['versions', selectedCluster?.id, 'role', assignment.role],
+    enabled: Boolean(selectedCluster && assignment.role),
+    queryFn: () => api<VersionResponse>(`/api/clusters/${selectedCluster!.id}/versions?role=${encodeURIComponent(assignment.role)}`),
+  });
+  const imageVersions = useMemo(() => {
+    const recommended = versionsQuery.data?.recommended_version || selectedCluster?.desired_version || '';
+    return Array.from(new Set([...(versionsQuery.data?.available_versions || []), recommended].filter(Boolean)));
+  }, [selectedCluster?.desired_version, versionsQuery.data]);
   const availableNodes = nodes.filter((node) => node.enabled && !selectedCluster?.members.some((item) => item.node_id === node.id));
   const refresh = async (runId?: number) => { if (runId) watchRun(runId); await queryClient.invalidateQueries(); };
   const { data: runs = [] } = useQuery({ queryKey: ['runs'], queryFn: queries.runs, enabled: Boolean(applyingRunId), refetchInterval: applyingRunId ? 2000 : false });
+
+  useEffect(() => {
+    if (!versionsQuery.data || editingChangeId) return;
+    const recommended = versionsQuery.data.recommended_version || imageVersions[0] || '';
+    setAssignment((current) => current.image_version === recommended ? current : { ...current, image_version: recommended });
+  }, [editingChangeId, imageVersions, versionsQuery.data]);
 
   useEffect(() => {
     const run = runs.find((item: RunRecord) => item.id === applyingRunId);
@@ -243,6 +275,7 @@ export function RolesPage() {
       }
       const change: Extract<PendingChange, { kind: 'create' }> = {
         clientId: clientChangeId(), kind: 'create', nodeId: node.node_id, nodeName: node.name, role: assignment.role,
+        imageVersion: assignment.image_version,
         config: { ...advanced, cpu: assignment.cpu, memory: assignment.memory, storage_path: assignment.storage_path, ...(assignment.role === 'logstash' ? { pipeline: assignment.pipeline } : {}) },
       };
       setPendingChanges((current) => editingChangeId
@@ -286,7 +319,7 @@ export function RolesPage() {
       const result = await api<{ run_id: number }>(`/api/clusters/${selectedCluster.id}/workload-changes/apply`, {
         method: 'POST',
         ...jsonBody({ changes: pendingChanges.map((item) => item.kind === 'create'
-          ? { client_id: item.clientId, kind: item.kind, node_id: item.nodeId, role: item.role, config: item.config }
+          ? { client_id: item.clientId, kind: item.kind, node_id: item.nodeId, role: item.role, image_version: item.imageVersion, config: item.config }
           : item.kind === 'resources'
             ? { client_id: item.clientId, kind: item.kind, assignment_id: item.assignmentId, expected_revision: item.expectedRevision, config: item.config }
             : { client_id: item.clientId, kind: item.kind, assignment_id: item.assignmentId, expected_revision: item.expectedRevision }) }),
@@ -296,19 +329,16 @@ export function RolesPage() {
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to apply pending workload changes'); }
   };
   const rows = selectedCluster?.assignments || [];
-  const columns = [
-    { id: 'role', display: 'Role', initialWidth: 170 }, { id: 'host', display: 'Host', initialWidth: 150 },
-    { id: 'state', display: 'Runtime', initialWidth: 140 }, { id: 'resources', display: 'Resources', initialWidth: 180 },
-    { id: 'storage', display: 'Storage', initialWidth: 260 }, { id: 'endpoint', display: 'Endpoint', initialWidth: 240 },
-    { id: 'actions', display: 'Actions', initialWidth: 260 },
-  ];
+  const stageReady = Boolean(assignment.node_id && assignment.image_version && assignment.storage_path && !versionsQuery.isLoading && !applyingRunId);
+  const stageStatus = !assignment.node_id ? 'Host required' : !assignment.image_version || versionsQuery.isLoading ? 'Version required' : !assignment.storage_path ? 'Storage required' : 'Ready to stage';
   const access = new Map((topology?.access_urls || []).map((item) => [item.assignment_id, item.url]));
   const renderCellValue = ({ rowIndex, columnId }: { rowIndex: number; columnId: string }) => {
     const item = rows[rowIndex];
     if (!item) return null;
     if (columnId === 'role') return <strong>{roleLabel(item.role)}</strong>;
+    if (columnId === 'version') return <span className="image-version-value" title={item.observation?.image}>{workloadImageVersion(item)}</span>;
     if (columnId === 'host') return item.node_name;
-    if (columnId === 'state') return <EuiBadge color={item.observation?.running ? 'success' : 'default'}>{item.observation?.running ? `running ${item.observation.version}` : item.state}</EuiBadge>;
+    if (columnId === 'state') return <EuiBadge color={item.observation?.running ? 'success' : 'default'}>{item.observation?.running ? 'running' : item.state}</EuiBadge>;
     if (columnId === 'resources') return `${item.config.cpu} CPU · ${item.config.memory}`;
     if (columnId === 'storage') return <span title={item.config.storage_path}>{item.config.storage_path}</span>;
     if (columnId === 'endpoint') return access.get(item.id) || 'Outbound/no listener';
@@ -343,28 +373,52 @@ export function RolesPage() {
         {member.network_mode === 'dedicated' && <><EuiFormRow label="System/data NIC"><EuiFieldText value={member.data_interface} onChange={(event) => setMember({ ...member, data_interface: event.target.value })} /></EuiFormRow><EuiFormRow label="System/data IPv4"><EuiFieldText value={member.data_address} onChange={(event) => setMember({ ...member, data_address: event.target.value })} /></EuiFormRow></>}
         <div className="form-submit"><EuiButton type="submit" fill disabled={!member.node_id}>Add host to cluster</EuiButton></div>
       </form>
-      <div className="membership-list">{selectedCluster.members.map((item) => <div key={item.node_id}><span><strong>{item.name}</strong><small>{item.network_mode} · user {item.user_interface} {item.user_address} · data {item.data_interface} {item.data_address}</small></span><EuiBadge color={item.network_ready ? 'success' : 'warning'}>{item.network_ready ? 'ready' : 'incomplete'}</EuiBadge><EuiButtonEmpty size="s" onClick={() => setModal({ type: 'network', member: item })}>Edit network</EuiButtonEmpty><EuiButtonEmpty size="s" color="danger" onClick={() => removeMember(item)}>Remove</EuiButtonEmpty></div>)}</div>
+      <div className="membership-list">{selectedCluster.members.map((item) => <div key={item.node_id}><span><strong>{item.name}</strong><small>zone {item.zone_id || 'not assigned'} · {item.network_mode} · user {item.user_interface} {item.user_address} · data {item.data_interface} {item.data_address}</small></span><EuiBadge color={item.network_ready ? 'success' : 'warning'}>{item.network_ready ? 'ready' : 'incomplete'}</EuiBadge><EuiButtonEmpty size="s" onClick={() => setModal({ type: 'network', member: item })}>Edit network</EuiButtonEmpty><EuiButtonEmpty size="s" color="danger" onClick={() => removeMember(item)}>Remove</EuiButtonEmpty></div>)}</div>
     </section>
     <section className="section-band">
       <div className="section-heading"><div><EuiTitle size="s"><h2>Cluster → roles → hosts</h2></EuiTitle><EuiText color="subdued">Solid cells are managed workloads; outlined cells are pending changes.</EuiText></div></div>
-      <div className="role-matrix"><div className="role-matrix__header">Host</div>{roles.map((role) => <div className="role-matrix__header" key={role.id}>{role.label}</div>)}{matrix.flatMap(({ host, assigned, creating, detaching }) => [<div className="role-matrix__host" key={`${host.node_id}-host`}>{host.name}</div>, ...roles.map((role) => {
+      <div className="role-matrix"><div className="role-matrix__header">Host</div>{roles.map((role) => <div className="role-matrix__header" key={role.id}>{role.label}</div>)}{matrix.flatMap(({ host, assigned, creating, detaching }) => [<div className="role-matrix__host" key={`${host.node_id}-host`}><strong>{host.name}</strong><small className="block-muted">{host.zone_id || 'no zone'}</small></div>, ...roles.map((role) => {
         const isCreating = creating.has(role.id);
         const isAssigned = assigned.has(role.id);
         const isDetaching = detaching.has(role.id);
         return <div key={`${host.node_id}-${role.id}`} className={`role-cell ${isAssigned ? 'is-assigned' : ''} ${isCreating ? 'is-pending' : ''} ${isDetaching ? 'is-pending-removal' : ''}`}>{isCreating ? `${role.label} pending` : isDetaching ? `${role.label} detach` : isAssigned ? role.label : '—'}</div>;
       })])}</div>
     </section>
-    <section className="section-band">
-      <div className="section-heading"><EuiTitle size="s"><h2>{editingChangeId ? 'Edit staged workload' : 'Stage workload'}</h2></EuiTitle></div>
-      <form className="form-grid role-form" onSubmit={addAssignment}>
-        <EuiFormRow label="Host"><EuiSelect value={assignment.node_id} onChange={(event) => setAssignment({ ...assignment, node_id: Number(event.target.value), storage_path: '' })} options={[{ value: 0, text: 'Select cluster host' }, ...selectedCluster.members.map((item) => ({ value: item.node_id, text: item.name }))]} /></EuiFormRow>
-        <EuiFormRow label="Role"><EuiSelect value={assignment.role} onChange={(event) => setAssignment({ ...assignment, role: event.target.value, storage_path: '' })} options={roles.map((role) => ({ value: role.id, text: role.label }))} /></EuiFormRow>
-        <EuiFormRow label="CPU"><EuiFieldText value={assignment.cpu} onChange={(event) => setAssignment({ ...assignment, cpu: event.target.value })} /></EuiFormRow>
-        <EuiFormRow label="Memory"><EuiFieldText value={assignment.memory} onChange={(event) => setAssignment({ ...assignment, memory: event.target.value })} /></EuiFormRow>
-        <StoragePathPicker nodeId={assignment.node_id} clusterSlug={selectedCluster.slug} role={assignment.role} value={assignment.storage_path} onChange={(storage_path) => setAssignment({ ...assignment, storage_path })} />
-        {assignment.role === 'logstash' && <EuiFormRow label="Pipeline"><EuiTextArea value={assignment.pipeline} onChange={(event) => setAssignment({ ...assignment, pipeline: event.target.value })} /></EuiFormRow>}
-        <EuiFormRow label="Advanced JSON"><EuiTextArea value={assignment.advanced} onChange={(event) => setAssignment({ ...assignment, advanced: event.target.value })} /></EuiFormRow>
-        <div className="form-submit"><EuiButton type="submit" fill disabled={Boolean(applyingRunId) || !assignment.node_id || !assignment.storage_path}>{editingChangeId ? 'Update pending change' : 'Add to pending changes'}</EuiButton>{editingChangeId && <EuiButtonEmpty onClick={() => setEditingChangeId(undefined)}>Cancel edit</EuiButtonEmpty>}</div>
+    <section className="section-band workload-stage-band">
+      <div className="section-heading"><div><EuiTitle size="s"><h2>{editingChangeId ? 'Edit staged workload' : 'Stage workload'}</h2></EuiTitle><EuiText color="subdued">Prepare one workload placement before adding it to the pending change set.</EuiText></div>{editingChangeId && <EuiBadge color="warning">Editing pending change</EuiBadge>}</div>
+      <form className="workload-stage-form" onSubmit={addAssignment}>
+        <div className="workload-stage-top-grid">
+          <div className="workload-stage-group workload-stage-group--placement">
+            <EuiTitle size="xxs"><h3>Placement</h3></EuiTitle>
+            <div className="workload-stage-grid workload-stage-grid--placement">
+              <EuiFormRow label="Host"><EuiSelect value={assignment.node_id} onChange={(event) => setAssignment({ ...assignment, node_id: Number(event.target.value), storage_path: '' })} options={[{ value: 0, text: 'Select cluster host' }, ...selectedCluster.members.map((item) => ({ value: item.node_id, text: item.name }))]} /></EuiFormRow>
+              <EuiFormRow label="Role"><EuiSelect value={assignment.role} onChange={(event) => setAssignment({ ...assignment, role: event.target.value, image_version: '', storage_path: '' })} options={roles.map((role) => ({ value: role.id, text: role.label }))} /></EuiFormRow>
+              <EuiFormRow label="Image version" helpText={versionsQuery.data?.registry_error || 'Current cluster version is selected when available.'}><EuiSelect isLoading={versionsQuery.isLoading} value={assignment.image_version} onChange={(event) => setAssignment({ ...assignment, image_version: event.target.value })} options={imageVersions.length ? imageVersions.map((version) => ({ value: version, text: version })) : [{ value: '', text: versionsQuery.isLoading ? 'Loading versions' : 'No versions available' }]} /></EuiFormRow>
+            </div>
+          </div>
+          <div className="workload-stage-group workload-stage-group--resources">
+            <EuiTitle size="xxs"><h3>Resources</h3></EuiTitle>
+            <div className="workload-stage-grid workload-stage-grid--resources">
+              <EuiFormRow label="CPU cores"><EuiFieldText value={assignment.cpu} onChange={(event) => setAssignment({ ...assignment, cpu: event.target.value })} /></EuiFormRow>
+              <EuiFormRow label="Memory"><EuiFieldText value={assignment.memory} onChange={(event) => setAssignment({ ...assignment, memory: event.target.value })} /></EuiFormRow>
+            </div>
+          </div>
+        </div>
+        <div className="workload-stage-detail-grid">
+          <div className="workload-stage-group workload-stage-group--storage">
+            <EuiTitle size="xxs"><h3>Storage</h3></EuiTitle>
+            <StoragePathPicker nodeId={assignment.node_id} clusterSlug={selectedCluster.slug} role={assignment.role} value={assignment.storage_path} onChange={(storage_path) => setAssignment({ ...assignment, storage_path })} />
+          </div>
+          <div className="workload-stage-group workload-stage-group--advanced">
+            <EuiTitle size="xxs"><h3>Advanced configuration</h3></EuiTitle>
+            {assignment.role === 'logstash' && <EuiFormRow label="Pipeline"><EuiTextArea value={assignment.pipeline} onChange={(event) => setAssignment({ ...assignment, pipeline: event.target.value })} /></EuiFormRow>}
+            <EuiFormRow label="Advanced JSON"><EuiTextArea value={assignment.advanced} onChange={(event) => setAssignment({ ...assignment, advanced: event.target.value })} /></EuiFormRow>
+          </div>
+        </div>
+        <div className="workload-stage-footer">
+          <div className="workload-stage-status" aria-live="polite"><EuiBadge color={stageReady ? 'success' : 'hollow'}>{stageStatus}</EuiBadge></div>
+          <div className="workload-stage-actions">{editingChangeId && <EuiButtonEmpty iconType="cross" onClick={() => setEditingChangeId(undefined)}>Cancel edit</EuiButtonEmpty>}<EuiButton type="submit" fill iconType={editingChangeId ? 'check' : 'plusInCircle'} disabled={!stageReady}>{editingChangeId ? 'Update pending change' : 'Add to pending changes'}</EuiButton></div>
+        </div>
       </form>
     </section>
     {pendingChanges.length > 0 && <section className="section-band pending-changes-band">
@@ -373,7 +427,7 @@ export function RolesPage() {
     </section>}
     <section className="section-band data-grid-band">
       <div className="section-heading"><div><EuiTitle size="s"><h2>Managed workloads</h2></EuiTitle><EuiText color="subdued">Only workloads from a successful change set are managed here.</EuiText></div></div>
-      <EuiDataGrid aria-label="Managed workloads" columns={columns} columnVisibility={{ visibleColumns, setVisibleColumns }} rowCount={rows.length} renderCellValue={renderCellValue} gridStyle={{ border: 'horizontal', rowHover: 'highlight' }} toolbarVisibility={{ showColumnSelector: true, showFullScreenSelector: false, showDisplaySelector: false }} />
+      <EuiDataGrid aria-label="Managed workloads" columns={managedWorkloadColumns} columnVisibility={{ visibleColumns, setVisibleColumns }} rowCount={rows.length} renderCellValue={renderCellValue} gridStyle={{ border: 'horizontal', rowHover: 'highlight' }} toolbarVisibility={{ showColumnSelector: true, showFullScreenSelector: false, showDisplaySelector: false }} />
     </section>
     <section className="section-band">
       <div className="section-heading"><div><EuiTitle size="s"><h2>Terminal topology</h2></EuiTitle><EuiText color="subdued">Configured access URLs and role boxes use user/data NIC bindings.</EuiText></div></div>
