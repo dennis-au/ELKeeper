@@ -1,0 +1,51 @@
+---
+- name: Apply validated Elasticsearch cluster settings
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    workload: "ecp-{{ cluster.slug }}-master-{{ bootstrap.node_id }}"
+    cert_root: "/etc/elastic-control/clusters/{{ cluster.slug }}/workloads/{{ workload }}/certs"
+  tasks:
+    - name: Validate structured cluster settings
+      ansible.builtin.assert:
+        that:
+          - settings.allocation_enable in ['all', 'primaries', 'new_primaries', 'none']
+          - settings.rebalance_enable in ['all', 'primaries', 'replicas', 'none']
+          - settings.disk_watermark_low is match('^[1-9][0-9]?%$')
+          - settings.disk_watermark_high is match('^[1-9][0-9]?%$')
+          - settings.disk_watermark_flood_stage is match('^[1-9][0-9]?%$')
+          - settings.recovery_max_bytes_per_sec is match('^[1-9][0-9]*(kb|mb|gb)$')
+
+    - name: Apply persistent cluster settings over verified HTTPS
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          auth=$(mktemp)
+          body=$(mktemp)
+          before=$(mktemp)
+          trap 'rm -f "$auth" "$body" "$before"' EXIT
+          chmod 0600 "$auth" "$body" "$before"
+          printf 'user = "elastic:%s"\n' {{ credentials.elastic_password | quote }} > "$auth"
+          endpoint=https://{{ bootstrap.user_address }}:{{ cluster.ports.elasticsearch_http }}/_cluster/settings
+          curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" "$endpoint?flat_settings=true" > "$before"
+          cat > "$body" <<'JSON'
+          {{ {
+            'persistent': {
+              'cluster.routing.allocation.enable': settings.allocation_enable,
+              'cluster.routing.rebalance.enable': settings.rebalance_enable,
+              'cluster.routing.allocation.disk.watermark.low': settings.disk_watermark_low,
+              'cluster.routing.allocation.disk.watermark.high': settings.disk_watermark_high,
+              'cluster.routing.allocation.disk.watermark.flood_stage': settings.disk_watermark_flood_stage,
+              'indices.recovery.max_bytes_per_sec': settings.recovery_max_bytes_per_sec
+            }
+          } | to_json }}
+          JSON
+          curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" \
+            -H 'Content-Type: application/json' -X PUT --data-binary @"$body" "$endpoint" >/dev/null
+          curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" \
+            "$endpoint?flat_settings=true" | grep -F {{ settings.allocation_enable | quote }} >/dev/null
+      args:
+        executable: /bin/bash
+      no_log: true
+      changed_when: true

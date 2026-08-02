@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Elastic Control Plane</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <link rel="stylesheet" href="/assets/dialog.css">
+</head>
+<body>
+  <main id="login-view" class="login-shell">
+    <form id="login-form" class="login-form">
+      <p class="eyebrow">Elastic Control Plane</p>
+      <h1>Sign in</h1>
+      <label>Username<input id="username" autocomplete="username" required></label>
+      <label>Password<input id="password" type="password" autocomplete="current-password" required></label>
+      <p id="login-error" class="error"></p>
+      <button>Sign in</button>
+    </form>
+  </main>
+  <main id="control-view" hidden>
+    <header class="topbar">
+      <div><p class="eyebrow">Elastic Control Plane</p><h1>Clusters</h1></div>
+      <div class="top-actions"><span id="health">Loading</span><button id="refresh" type="button" class="plain">Refresh</button><button id="logout" type="button" class="plain">Sign out</button></div>
+    </header>
+    <section class="workspace">
+      <aside class="clusters-panel" aria-label="Clusters">
+        <div class="panel-heading"><div><p class="eyebrow">Inventory</p><h2>Clusters</h2></div><button id="new-cluster" type="button">Add</button></div>
+        <form id="cluster-form" hidden>
+          <input id="cluster-id" type="hidden">
+          <label>Cluster name<input id="cluster-name" required maxlength="64" placeholder="elastic-lab"></label>
+          <fieldset><legend>Port profile</legend>
+            <label>ES HTTP<input id="port-es-http" type="number" min="1" max="65535" value="9200" required></label>
+            <label>ES transport<input id="port-es-transport" type="number" min="1" max="65535" value="9300" required></label>
+            <label>Kibana<input id="port-kibana" type="number" min="1" max="65535" value="5601" required></label>
+            <label>Fleet<input id="port-fleet" type="number" min="1" max="65535" value="8220" required></label>
+            <label>Logstash API<input id="port-logstash" type="number" min="1" max="65535" value="9600" required></label>
+          </fieldset>
+          <div class="form-actions"><button>Save cluster</button><button id="cancel-cluster" type="button" class="plain">Cancel</button></div>
+          <p id="cluster-error" class="error"></p>
+        </form>
+        <div id="cluster-list" class="cluster-list"></div>
+      </aside>
+      <section class="cluster-main">
+        <div id="no-cluster" class="empty">Select or create a cluster to configure its hosts and workloads.</div>
+        <div id="cluster-detail" hidden>
+          <div class="detail-heading">
+            <div><p class="eyebrow" id="cluster-slug"></p><h2 id="cluster-title"></h2></div>
+            <div class="heading-actions"><button id="show-topology" type="button" class="plain">Terminal topology</button><button id="edit-cluster" type="button" class="plain">Edit</button><button id="delete-cluster" type="button" class="danger">Delete</button></div>
+          </div>
+          <section class="access-band" aria-labelledby="access-heading">
+            <div class="section-heading"><div><h3 id="access-heading">Configured access</h3><p>URLs are configuration targets. Status is shown in runs.</p></div></div>
+            <div id="access-list" class="access-list"></div>
+          </section>
+          <section class="band" aria-labelledby="versions-heading">
+            <div class="section-heading"><div><h3 id="versions-heading">Component versions</h3><p>Registry versions are selectable. Download only does not restart workloads.</p></div><div class="heading-actions"><button id="refresh-versions" type="button" class="plain">Refresh detection</button><button id="download-version" type="button" class="plain">Download only</button><button id="upgrade-version" type="button">Upgrade cluster</button></div></div>
+            <label>Available version<select id="target-version" aria-label="Available version"></select></label>
+            <p id="versions-error" class="error"></p>
+            <div id="version-list" class="assignment-list"></div>
+          </section>
+          <section id="topology-panel" class="band topology-band" hidden>
+            <div class="section-heading"><h3>Terminal topology</h3><button id="hide-topology" type="button" class="plain">Hide</button></div>
+            <pre id="topology-output"></pre>
+          </section>
+          <section class="band">
+            <div class="section-heading"><h3>Cluster hosts</h3></div>
+            <form id="member-form" class="inline-form">
+              <label>Host<select id="member-node" required></select></label>
+              <label>Traffic mode<select id="member-network-mode" required><option value="dedicated">Separate system and user NICs</option><option value="shared">Same NIC for system and user traffic</option></select></label>
+              <label>System/data NIC<input id="member-data-interface" required maxlength="64" placeholder="ens19"></label>
+              <label>System/data IPv4<input id="member-data-address" required placeholder="198.51.100.102"></label>
+              <label>User-facing NIC<input id="member-user-interface" required maxlength="64" placeholder="ens18"></label>
+              <label>User-facing IPv4<input id="member-user-address" required placeholder="192.0.2.102"></label>
+              <p id="member-network-hint" class="form-hint" aria-live="polite"></p>
+              <button>Add host</button>
+            </form>
+            <div id="member-list" class="member-list"></div>
+          </section>
+          <section class="band">
+            <div class="section-heading"><h3>Assign workload</h3></div>
+            <form id="assignment-form" class="assignment-form">
+              <label>Host<select id="assignment-node" required></select></label>
+              <label>Role<select id="assignment-role" required></select></label>
+              <label>CPU<input id="assignment-cpu" value="2" required></label>
+              <label>Memory<input id="assignment-memory" value="4g" required></label>
+              <label class="wide">Storage path<input id="assignment-storage" placeholder="/srv/elastic/cluster/workload" required></label>
+              <label id="pipeline-field" class="wide" hidden>Pipeline<textarea id="assignment-pipeline" spellcheck="false"></textarea></label>
+              <label class="wide">Advanced JSON<textarea id="assignment-advanced" spellcheck="false">{}</textarea></label>
+              <p id="assignment-error" class="error wide"></p>
+              <button class="wide">Assign workload</button>
+            </form>
+          </section>
+          <section class="band">
+            <div class="section-heading"><h3>Managed workloads</h3></div>
+            <div id="assignment-list" class="assignment-list"></div>
+          </section>
+        </div>
+        <details id="operations-drawer" class="operations-drawer">
+          <summary><span>Operations</span><small>Hosts and recent runs</small></summary>
+          <div class="operations-content">
+            <section class="operations-section">
+              <div class="section-heading"><h3>Host inventory</h3><button id="add-host" type="button">Add host</button></div>
+              <form id="host-form" class="host-form" hidden>
+                <input id="host-id" type="hidden">
+                <label>Name<input id="host-name" required maxlength="128"></label>
+                <label>Address<input id="host-address" required maxlength="255"></label>
+                <label>SSH user<input id="host-user" value="root" required maxlength="32"></label>
+                <label>SSH port<input id="host-port" type="number" min="1" max="65535" value="22" required></label>
+                <label class="check"><input id="host-enabled" type="checkbox" checked> Enabled</label>
+                <div class="form-actions"><button>Save host</button><button id="cancel-host" type="button" class="plain">Cancel</button></div>
+                <p id="host-error" class="error"></p>
+              </form>
+              <div id="node-list" class="node-list"></div>
+            </section>
+            <section class="operations-section runs-section">
+              <div class="log-heading"><h3>Recent runs</h3><small id="run-label">Select a run</small></div>
+              <div id="run-list"></div>
+              <pre id="run-log">No run selected.</pre>
+            </section>
+          </div>
+        </details>
+      </section>
+    </section>
+  </main>
+  <template id="assignment-template">
+    <article class="assignment-row">
+      <div class="assignment-summary"><strong class="assignment-role"></strong><span class="assignment-host"></span><span class="assignment-config"></span><span class="assignment-access"></span></div>
+      <div class="assignment-actions"><button class="apply" type="button">Apply</button><button class="resources plain" type="button">Resources</button><button class="detach plain" type="button">Detach</button><button class="purge danger" type="button">Purge</button></div>
+    </article>
+  </template>
+  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+  <dialog id="action-dialog" aria-labelledby="dialog-title">
+    <form id="dialog-form" novalidate>
+      <h2 id="dialog-title"></h2>
+      <div id="dialog-body" class="dialog-body"></div>
+      <p id="dialog-error" class="error" aria-live="polite"></p>
+      <div class="dialog-actions"><button id="dialog-submit" type="submit"></button><button id="dialog-cancel" type="button" class="plain">Cancel</button></div>
+    </form>
+  </dialog>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

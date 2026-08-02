@@ -1,0 +1,262 @@
+---
+- name: Reconcile an ELKeeper Filebeat workload companion
+  hosts: all
+  become: true
+  vars:
+    workload: "ecp-{{ cluster.slug }}-{{ assignment.role }}-{{ membership.node_id }}"
+    cluster_root: "/etc/elastic-control/clusters/{{ cluster.slug }}"
+    workload_root: "{{ cluster_root }}/workloads/{{ workload }}"
+    cert_root: "{{ workload_root }}/certs"
+    filebeat_workload: "{{ workload }}-filebeat"
+    filebeat_root: "{{ workload_root }}/filebeat"
+    filebeat_unit_file: "/etc/containers/systemd/{{ filebeat_workload }}.container"
+    filebeat_enabled: "{{ log_monitoring.filebeat_enabled | bool }}"
+  tasks:
+    - name: Validate the Filebeat companion request
+      ansible.builtin.assert:
+        that:
+          - assignment.role in ['master', 'hot', 'warm', 'ml', 'ingest', 'coordinating', 'kibana', 'fleet-server', 'logstash', 'elastic-agent']
+          - log_monitoring.retention_days | int == 30
+        fail_msg: Invalid Filebeat companion request.
+
+    - name: Discover the exact managed container log path
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          if ! podman container exists {{ workload | quote }}; then exit 3; fi
+          log_path=$(podman inspect --format '{{ '{{' }}.HostConfig.LogConfig.Path{{ '}}' }}' {{ workload | quote }})
+          case "$log_path" in
+            /var/lib/containers/storage/*) ;;
+            *) exit 4 ;;
+          esac
+          test -f "$log_path"
+          printf '%s' "$log_path"
+        executable: /bin/bash
+      register: filebeat_log_path
+      changed_when: false
+      failed_when: false
+      when: filebeat_enabled | bool
+
+    - name: Stop and remove the scoped Filebeat companion when disabled or pending
+      ansible.builtin.shell:
+        cmd: |
+          systemctl disable --now {{ filebeat_workload | quote }}.service 2>/dev/null || true
+          rm -f {{ filebeat_unit_file | quote }}
+          systemctl daemon-reload
+          podman rm -f {{ filebeat_workload | quote }} 2>/dev/null || true
+          rm -rf -- {{ filebeat_root | quote }}
+        executable: /bin/bash
+      changed_when: false
+      when: not (filebeat_enabled | bool) or (filebeat_log_path.rc | default(3)) != 0
+
+    - name: Report a disabled Filebeat companion
+      ansible.builtin.debug:
+        msg: "ECP_FILEBEAT={{ assignment.id }}|disabled"
+      when: not (filebeat_enabled | bool)
+
+    - name: Check Elasticsearch security readiness before configuring Filebeat
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          auth=$(mktemp)
+          trap 'rm -f "$auth"' EXIT
+          chmod 0600 "$auth"
+          printf 'user = "elastic:%s"\n' "$ECP_ELASTIC_PASSWORD" > "$auth"
+          curl --fail --silent --show-error --max-time 10 --cacert {{ cert_root | quote }}/ca.crt --config "$auth" \
+            'https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}/_cluster/health/.security-*?wait_for_status=yellow&wait_for_active_shards=1&timeout=5s' \
+            | python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("active_primary_shards", 0) >= 1 else 1)'
+        executable: /bin/bash
+      environment:
+        ECP_ELASTIC_PASSWORD: "{{ credentials.elastic_password }}"
+      no_log: true
+      register: filebeat_security_ready
+      changed_when: false
+      failed_when: false
+      when:
+        - filebeat_enabled | bool
+        - (filebeat_log_path.rc | default(3)) == 0
+        - bootstrap is not none
+
+    - name: Report a pending Filebeat companion
+      ansible.builtin.debug:
+        msg: "ECP_FILEBEAT={{ assignment.id }}|pending"
+      when:
+        - filebeat_enabled | bool
+        - (filebeat_log_path.rc | default(3)) != 0 or (filebeat_security_ready.rc | default(1)) != 0
+
+    - name: Configure the least-privileged Filebeat writer and log data stream
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          auth=$(mktemp)
+          payload=$(mktemp)
+          trap 'rm -f "$auth" "$payload"' EXIT
+          chmod 0600 "$auth" "$payload"
+          printf 'user = "elastic:%s"\n' "$ECP_ELASTIC_PASSWORD" > "$auth"
+          endpoint=https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}
+          cat > "$payload" <<'JSON'
+          {"cluster":["monitor"],"indices":[{"names":["logs-elkeeper.{{ cluster.slug }}-*"],"privileges":["auto_configure","create_doc","view_index_metadata"]}]}
+          JSON
+          curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" -H 'Content-Type: application/json' -X PUT "$endpoint/_security/role/{{ filebeat_role }}" --data-binary @"$payload" >/dev/null
+          python3 - <<'PY' > "$payload"
+          import json, os
+          print(json.dumps({"password": os.environ["ECP_FILEBEAT_PASSWORD"], "roles": ["{{ filebeat_role }}"], "full_name": "ELKeeper Filebeat writer"}))
+          PY
+          curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" -H 'Content-Type: application/json' -X PUT "$endpoint/_security/user/{{ filebeat_username }}" --data-binary @"$payload" >/dev/null
+          cat > "$payload" <<'JSON'
+          {"policy":{"phases":{"hot":{"actions":{}},"delete":{"min_age":"30d","actions":{"delete":{}}}}}}
+          JSON
+          curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" -H 'Content-Type: application/json' -X PUT "$endpoint/_ilm/policy/elkeeper-filebeat-30d" --data-binary @"$payload" >/dev/null
+          cat > "$payload" <<'JSON'
+          {"index_patterns":["logs-elkeeper.*"],"data_stream":{},"template":{"settings":{"index.lifecycle.name":"elkeeper-filebeat-30d"},"mappings":{"dynamic":true}}}
+          JSON
+          curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" -H 'Content-Type: application/json' -X PUT "$endpoint/_index_template/logs-elkeeper-template" --data-binary @"$payload" >/dev/null
+        executable: /bin/bash
+      environment:
+        ECP_ELASTIC_PASSWORD: "{{ credentials.elastic_password }}"
+        ECP_FILEBEAT_PASSWORD: "{{ credentials.filebeat_password }}"
+      no_log: true
+      when:
+        - filebeat_enabled | bool
+        - (filebeat_log_path.rc | default(3)) == 0
+        - (filebeat_security_ready.rc | default(1)) == 0
+
+    - name: Create Filebeat companion directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0750'
+      loop:
+        - "{{ filebeat_root }}"
+        - "{{ filebeat_root }}/data"
+      when:
+        - filebeat_enabled | bool
+        - (filebeat_log_path.rc | default(3)) == 0
+        - (filebeat_security_ready.rc | default(1)) == 0
+
+    - name: Render Filebeat configuration for the managed workload log stream
+      ansible.builtin.copy:
+        dest: "{{ filebeat_root }}/filebeat.yml"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          filebeat.inputs:
+            - type: filestream
+              id: elkeeper-{{ assignment.id }}
+              paths: ["/var/log/elkeeper/workload.log"]
+              parsers:
+                - container: ~
+              fields_under_root: true
+              fields:
+                data_stream.type: logs
+                data_stream.dataset: elkeeper.{{ cluster.slug }}
+                data_stream.namespace: default
+                labels.elkeeper_cluster_id: "{{ cluster.id }}"
+                labels.elkeeper_cluster: "{{ cluster.slug }}"
+                labels.elkeeper_assignment_id: "{{ assignment.id }}"
+                labels.elkeeper_host: "{{ inventory_hostname }}"
+                labels.elkeeper_role: "{{ assignment.role }}"
+                labels.elkeeper_workload: "{{ workload }}"
+          setup.ilm.enabled: false
+          setup.template.enabled: false
+          output.elasticsearch:
+            hosts: ["https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}"]
+            username: {{ filebeat_username }}
+            password: ${ECP_FILEBEAT_PASSWORD}
+            index: "logs-elkeeper.{{ cluster.slug }}-default"
+            ssl.certificate_authorities: ["/usr/share/filebeat/certs/ca.crt"]
+      no_log: true
+      when:
+        - filebeat_enabled | bool
+        - (filebeat_log_path.rc | default(3)) == 0
+        - (filebeat_security_ready.rc | default(1)) == 0
+
+    - name: Render Filebeat environment
+      ansible.builtin.copy:
+        dest: "{{ filebeat_root }}/filebeat.env"
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          ECP_FILEBEAT_PASSWORD={{ credentials.filebeat_password }}
+      no_log: true
+      when:
+        - filebeat_enabled | bool
+        - (filebeat_log_path.rc | default(3)) == 0
+        - (filebeat_security_ready.rc | default(1)) == 0
+
+    - name: Render Filebeat Quadlet
+      ansible.builtin.copy:
+        dest: "{{ filebeat_unit_file }}"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=ELKeeper {{ cluster.name }} {{ assignment.role }} Filebeat companion
+          After={{ workload }}.service
+          Requires={{ workload }}.service
+          [Container]
+          Image={{ filebeat_image }}
+          ContainerName={{ filebeat_workload }}
+          Label=io.elastic-control.managed=true
+          Label=io.elastic-control.cluster-id={{ cluster.id }}
+          Label=io.elastic-control.cluster-slug={{ cluster.slug }}
+          Label=io.elastic-control.assignment-id={{ assignment.id }}
+          Label=io.elastic-control.role=filebeat
+          Label=io.elastic-control.monitors={{ assignment.role }}
+          Label=io.elastic-control.node-id={{ membership.node_id }}
+          Network=host
+          EnvironmentFile={{ filebeat_root }}/filebeat.env
+          Volume={{ filebeat_root }}/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro,Z
+          Volume={{ filebeat_root }}/data:/usr/share/filebeat/data:Z
+          Volume={{ cert_root }}:/usr/share/filebeat/certs:ro,Z
+          Volume={{ filebeat_log_path.stdout | trim }}:/var/log/elkeeper/workload.log:ro,Z
+          [Service]
+          Restart=always
+          TimeoutStartSec=180
+          [Install]
+          WantedBy=multi-user.target
+      when:
+        - filebeat_enabled | bool
+        - (filebeat_log_path.rc | default(3)) == 0
+        - (filebeat_security_ready.rc | default(1)) == 0
+
+    - name: Reload Quadlet definitions for the Filebeat companion
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when:
+        - filebeat_enabled | bool
+        - (filebeat_log_path.rc | default(3)) == 0
+        - (filebeat_security_ready.rc | default(1)) == 0
+
+    - name: Start the requested Filebeat companion
+      ansible.builtin.systemd:
+        name: "{{ filebeat_workload }}.service"
+        enabled: true
+        state: restarted
+      when:
+        - filebeat_enabled | bool
+        - (filebeat_log_path.rc | default(3)) == 0
+        - (filebeat_security_ready.rc | default(1)) == 0
+
+    - name: Verify the Filebeat companion is running
+      ansible.builtin.command: "podman inspect --format {{ '{{' }}.State.Running{{ '}}' }} {{ filebeat_workload }}"
+      register: filebeat_running
+      changed_when: false
+      failed_when: filebeat_running.stdout | trim != 'true'
+      when:
+        - filebeat_enabled | bool
+        - (filebeat_log_path.rc | default(3)) == 0
+        - (filebeat_security_ready.rc | default(1)) == 0
+
+    - name: Report a running Filebeat companion
+      ansible.builtin.debug:
+        msg: "ECP_FILEBEAT={{ assignment.id }}|running"
+      when:
+        - filebeat_enabled | bool
+        - (filebeat_log_path.rc | default(3)) == 0
+        - (filebeat_security_ready.rc | default(1)) == 0

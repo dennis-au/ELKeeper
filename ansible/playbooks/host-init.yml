@@ -1,0 +1,113 @@
+---
+- name: Initialize managed Elastic hosts
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    elastic_config_dir: /etc/elastic-stack
+    elastic_data_dir: /var/lib/elastic-stack
+    elastic_quadlet_dir: /etc/containers/systemd
+    firewalld_mode: "{{ elastic_firewalld_mode | default('disabled') }}"
+  tasks:
+    - name: Validate host initialization options
+      ansible.builtin.assert:
+        that:
+          - firewalld_mode in ['disabled', 'unchanged']
+          - elastic_config_dir.startswith('/')
+          - elastic_data_dir.startswith('/')
+          - elastic_quadlet_dir.startswith('/')
+
+    - name: Detect SELinux configuration
+      ansible.builtin.stat:
+        path: /etc/selinux/config
+      register: selinux_config
+
+    - name: Check current SELinux mode
+      ansible.builtin.command: getenforce
+      register: selinux_mode
+      changed_when: false
+      failed_when: false
+      when: selinux_config.stat.exists
+
+    - name: Disable SELinux at the next maintenance reboot
+      ansible.builtin.lineinfile:
+        path: /etc/selinux/config
+        regexp: '^SELINUX='
+        line: SELINUX=disabled
+      when: selinux_config.stat.exists
+
+    - name: Put enforcing SELinux in permissive mode immediately
+      ansible.builtin.command: setenforce 0
+      when:
+        - selinux_config.stat.exists
+        - selinux_mode.rc == 0
+        - selinux_mode.stdout | trim == 'Enforcing'
+
+    - name: Verify SELinux is non-enforcing
+      ansible.builtin.command: getenforce
+      register: selinux_non_enforcing
+      changed_when: false
+      failed_when: selinux_non_enforcing.rc != 0 or selinux_non_enforcing.stdout | trim not in ['Permissive', 'Disabled']
+      when: selinux_config.stat.exists
+
+    - name: Install required host packages
+      ansible.builtin.package:
+        name:
+          - podman
+          - curl
+          - unzip
+          - openssl
+          - python3
+        state: present
+
+    - name: Create managed Elastic Stack directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ elastic_config_dir }}", mode: "0750" }
+        - { path: "{{ elastic_config_dir }}/certs", mode: "0750" }
+        - { path: "{{ elastic_config_dir }}/topology", mode: "0750" }
+        - { path: "{{ elastic_data_dir }}", mode: "0750" }
+        - { path: "{{ elastic_quadlet_dir }}", mode: "0755" }
+
+    - name: Record controller-owned host initialization
+      ansible.builtin.copy:
+        dest: /etc/elastic-control-host-init
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          managed_by=elastic-control
+          podman_socket=/run/podman/podman.sock
+          selinux=permissive-now,disabled-next-boot
+
+    - name: Enable the rootful Podman API socket
+      ansible.builtin.systemd:
+        name: podman.socket
+        enabled: true
+        state: started
+
+    - name: Verify the rootful Podman API socket
+      ansible.builtin.wait_for:
+        path: /run/podman/podman.sock
+        state: present
+        timeout: 15
+
+    - name: Set Elasticsearch virtual memory limit
+      ansible.posix.sysctl:
+        name: vm.max_map_count
+        value: "1048576"
+        state: present
+        sysctl_file: /etc/sysctl.d/99-elasticsearch.conf
+        reload: true
+
+    - name: Disable firewalld for this lab deployment
+      ansible.builtin.systemd:
+        name: firewalld.service
+        enabled: false
+        state: stopped
+      when: firewalld_mode == 'disabled'

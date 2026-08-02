@@ -1,0 +1,29 @@
+services:
+  elastic-control:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: ${CONTROL_IMAGE:-elastic-control-plane:latest}
+    container_name: ${CONTROL_CONTAINER_NAME:-elastic-control-plane}
+    restart: unless-stopped
+    ports:
+      - "${APP_BIND:-0.0.0.0}:${APP_PORT:-8080}:8080"
+    environment:
+      APP_DATA_DIR: /var/lib/elastic-control
+      APP_RUNTIME_DIR: /run/elastic-control
+      APP_CONFIG_DIR: /config
+      APP_SECRET_KEY: ${APP_SECRET_KEY}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      SSH_KEY_PATH: /run/secrets/managed_nodes_ssh_key
+      SSH_KNOWN_HOSTS_PATH: /run/secrets/managed_nodes_known_hosts
+      ANSIBLE_FORKS: ${ANSIBLE_FORKS:-10}
+      FIREWALLD_MODE: ${FIREWALLD_MODE:-disabled}
+    volumes:
+      - ${HOST_APP_DATA_DIR:-./data}:/var/lib/elastic-control:Z
+      - ${HOST_APP_CONFIG_DIR:-./config}:/config:Z
+      - ${HOST_PLAYBOOK_DIR:-./playbooks}:/opt/elastic-control/custom-playbooks:Z
+      - ${SSH_KEY_FILE:?Set SSH_KEY_FILE in .env}:/run/secrets/managed_nodes_ssh_key:ro,Z
+      - ${SSH_KNOWN_HOSTS_FILE:?Set SSH_KNOWN_HOSTS_FILE in .env}:/run/secrets/managed_nodes_known_hosts:ro,Z
+    security_opt:
+      - no-new-privileges:true

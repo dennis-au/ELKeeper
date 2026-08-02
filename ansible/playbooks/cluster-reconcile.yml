@@ -1,0 +1,949 @@
+---
+- name: Reconcile a cluster-qualified Elastic workload
+  hosts: all
+  become: true
+  vars:
+    desired_state: "{{ desired_state | default('present') }}"
+    cluster_root: "/etc/elastic-control/clusters/{{ cluster.slug }}"
+    ca_root: "{{ cluster_root }}/ca"
+    issued_root: "{{ cluster_root }}/issued"
+    workload: "ecp-{{ cluster.slug }}-{{ assignment.role }}-{{ membership.node_id }}"
+    workload_root: "{{ cluster_root }}/workloads/{{ workload }}"
+    cert_root: "{{ workload_root }}/certs"
+    config_root: "{{ workload_root }}/config"
+    unit_file: "/etc/containers/systemd/{{ workload }}.container"
+    metricbeat_workload: "{{ workload }}-metricbeat"
+    metricbeat_root: "{{ workload_root }}/metricbeat"
+    metricbeat_unit_file: "/etc/containers/systemd/{{ metricbeat_workload }}.container"
+    filebeat_workload: "{{ workload }}-filebeat"
+    filebeat_unit_file: "/etc/containers/systemd/{{ filebeat_workload }}.container"
+    marker: "{{ assignment.config.storage_path }}/.elastic-control-managed-{{ cluster.slug }}-{{ assignment.role }}-{{ membership.node_id }}"
+    issued_cert_root: "{{ issued_root }}/{{ workload }}"
+    es_roles:
+      master: "master,remote_cluster_client"
+      hot: "data_hot,data_content,remote_cluster_client"
+      warm: "data_warm,data_content,remote_cluster_client"
+      ml: "ml,remote_cluster_client"
+      ingest: "ingest,remote_cluster_client"
+      coordinating: "[]"
+    elasticsearch_roles: [master, hot, warm, ml, ingest, coordinating]
+    elasticsearch_data_roles: [hot, warm]
+    metricbeat_roles: [master, hot, warm, ml, ingest, coordinating, kibana, logstash]
+  tasks:
+    - name: Validate the cluster-qualified request
+      ansible.builtin.assert:
+        that:
+          - assignment.role in ['master', 'hot', 'warm', 'ml', 'ingest', 'coordinating', 'kibana', 'fleet-server', 'logstash', 'elastic-agent']
+          - desired_state in ['present', 'purge']
+          - assignment.config.cpu is match('^[0-9]+([.][0-9]+)?$')
+          - assignment.config.memory is match('^[1-9][0-9]*([.][0-9]+)?[kKmMgGtT]$')
+          - assignment.config.storage_path.startswith('/')
+          - not assignment.config.storage_path.startswith('/etc/')
+          - not assignment.config.storage_path.startswith('/usr/')
+          - assignment.role not in elasticsearch_roles or assignment.ports.elasticsearch_http | default(0) | int > 0
+          - assignment.role not in elasticsearch_roles or assignment.ports.elasticsearch_transport | default(0) | int > 0
+          - assignment.role != 'kibana' or assignment.ports.kibana | default(0) | int > 0
+          - assignment.role != 'fleet-server' or assignment.ports.fleet | default(0) | int > 0
+          - assignment.role != 'logstash' or assignment.ports.logstash_api | default(0) | int > 0
+          - assignment.role != 'logstash' or assignment.config.pipeline | default('') | length > 0
+        fail_msg: Invalid cluster workload request.
+
+    - name: Validate data and user NIC bindings before changes
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          data_interface={{ membership.data_interface | quote }}
+          data_address={{ membership.data_address | quote }}
+          user_interface={{ membership.user_interface | quote }}
+          user_address={{ membership.user_address | quote }}
+          network_mode={{ membership.network_mode | default('dedicated') | quote }}
+          case "$network_mode" in
+            dedicated) test "$data_interface" != "$user_interface"; test "$data_address" != "$user_address" ;;
+            shared) test "$data_interface" = "$user_interface"; test "$data_address" = "$user_address" ;;
+            *) exit 1 ;;
+          esac
+          validate_binding() {
+            local interface="$1" address="$2"
+            test -d "/sys/class/net/$interface"
+            ip -o -4 addr show dev "$interface" | awk '{print $4}' | cut -d/ -f1 | grep -Fx "$address" >/dev/null
+          }
+          validate_binding "$data_interface" "$data_address"
+          validate_binding "$user_interface" "$user_address"
+        executable: /bin/bash
+      changed_when: false
+      when: desired_state == 'present'
+
+    - name: Install workload dependencies
+      ansible.builtin.package:
+        name: [podman, curl, openssl]
+        state: present
+      when: desired_state == 'present'
+
+    - name: Disable firewalld under the lab policy
+      ansible.builtin.systemd:
+        name: firewalld.service
+        enabled: false
+        state: stopped
+      failed_when: false
+      when: desired_state == 'present'
+
+    - name: Create workload directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0750'
+      loop:
+        - "{{ cluster_root }}"
+        - "{{ workload_root }}"
+        - "{{ config_root }}"
+        - "{{ cert_root }}"
+        - "{{ metricbeat_root }}"
+        - "{{ metricbeat_root }}/data"
+      when: desired_state == 'present'
+
+    - name: Grant Elastic containers access to workload certificates
+      ansible.builtin.file:
+        path: "{{ cert_root }}"
+        state: directory
+        owner: '1000'
+        group: '0'
+        mode: '0750'
+      when: desired_state == 'present'
+
+    - name: Grant Metricbeat access to its persistent state directory
+      ansible.builtin.file:
+        path: "{{ metricbeat_root }}/data"
+        state: directory
+        owner: '1000'
+        group: '0'
+        mode: '0750'
+      when: desired_state == 'present' and assignment.role in metricbeat_roles
+
+    - name: Reject an unmanaged nonempty data path
+      ansible.builtin.shell:
+        cmd: >-
+          test ! -e {{ assignment.config.storage_path | quote }} ||
+          test -f {{ marker | quote }} ||
+          test -z "$(find {{ assignment.config.storage_path | quote }} -mindepth 1 -maxdepth 1 -print -quit)"
+        executable: /bin/bash
+      changed_when: false
+      when: desired_state == 'present'
+
+    - name: Create managed data path
+      ansible.builtin.file:
+        path: "{{ assignment.config.storage_path }}"
+        state: directory
+        owner: "{{ '1000' if assignment.role in elasticsearch_roles + ['kibana', 'logstash', 'fleet-server', 'elastic-agent'] else '0' }}"
+        group: '0'
+        mode: '0750'
+      when: desired_state == 'present'
+
+    - name: Create managed data marker
+      ansible.builtin.file:
+        path: "{{ marker }}"
+        state: touch
+        owner: root
+        group: root
+        mode: '0600'
+      when: desired_state == 'present'
+
+    - name: Create the cluster certificate authority on the bootstrap master
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          umask 077
+          mkdir -p {{ ca_root | quote }} {{ issued_root | quote }}
+          if [[ ! -s {{ ca_root | quote }}/ca.key ]]; then
+            openssl genrsa -out {{ ca_root | quote }}/ca.key 4096
+            openssl req -x509 -new -key {{ ca_root | quote }}/ca.key -sha256 -days 3650 \
+              -subj '/CN={{ cluster.slug }} Elastic Control CA' \
+              -addext 'basicConstraints=critical,CA:TRUE' \
+              -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+              -out {{ ca_root | quote }}/ca.crt
+            chmod 0600 {{ ca_root | quote }}/ca.key
+          fi
+        executable: /bin/bash
+      delegate_to: "{{ bootstrap.node_name }}"
+      no_log: true
+      when: desired_state == 'present'
+
+    - name: Issue the workload certificate on the bootstrap master
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          umask 077
+          out={{ issued_cert_root | quote }}
+          mkdir -p "$out"
+          if [[ ! -s "$out/node.key" || ! -s "$out/node.crt" ]] || \
+             ! openssl x509 -in "$out/node.crt" -noout -ext subjectAltName | grep -F "IP Address:{{ membership.data_address }}" >/dev/null || \
+             ! openssl x509 -in "$out/node.crt" -noout -ext subjectAltName | grep -F "IP Address:{{ membership.user_address }}" >/dev/null; then
+            cat > "$out/node.ext" <<EOF
+          subjectAltName=IP:{{ membership.data_address }},IP:{{ membership.user_address }},IP:127.0.0.1,DNS:{{ inventory_hostname }}
+          extendedKeyUsage=serverAuth,clientAuth
+          EOF
+            openssl req -new -newkey rsa:4096 -nodes -keyout "$out/node.key" \
+              -subj '/CN={{ workload }}' -out "$out/node.csr"
+            openssl x509 -req -in "$out/node.csr" -CA {{ ca_root | quote }}/ca.crt \
+              -CAkey {{ ca_root | quote }}/ca.key -CAcreateserial -out "$out/node.crt" \
+              -days 825 -sha256 -extfile "$out/node.ext"
+            rm -f "$out/node.csr" "$out/node.ext"
+            chmod 0600 "$out/node.key"
+          fi
+        executable: /bin/bash
+      delegate_to: "{{ bootstrap.node_name }}"
+      no_log: true
+      when: desired_state == 'present'
+
+    - name: Read the bootstrap-issued certificate materials
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      delegate_to: "{{ bootstrap.node_name }}"
+      no_log: true
+      register: certificate_blobs
+      loop:
+        - "{{ ca_root }}/ca.crt"
+        - "{{ issued_cert_root }}/node.crt"
+        - "{{ issued_cert_root }}/node.key"
+      when: desired_state == 'present'
+
+    - name: Install workload certificate materials
+      ansible.builtin.copy:
+        dest: "{{ item.dest }}"
+        content: "{{ item.content | b64decode }}"
+        owner: "{{ '1000' if item.dest.endswith('node.key') else 'root' }}"
+        group: root
+        mode: "{{ item.mode }}"
+      no_log: true
+      loop:
+        - { dest: "{{ cert_root }}/ca.crt", content: "{{ certificate_blobs.results[0].content }}", mode: '0644' }
+        - { dest: "{{ cert_root }}/node.crt", content: "{{ certificate_blobs.results[1].content }}", mode: '0644' }
+        - { dest: "{{ cert_root }}/node.key", content: "{{ certificate_blobs.results[2].content }}", mode: '0600' }
+      when: desired_state == 'present'
+
+    - name: Verify bootstrap coordinator is reachable before joining or serving
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          code=$(curl --silent --show-error --max-time 5 --cacert {{ cert_root | quote }}/ca.crt \
+            -o /dev/null -w '%{http_code}' https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}/ || true)
+          [[ "$code" == 200 || "$code" == 401 ]]
+        executable: /bin/bash
+      no_log: true
+      changed_when: false
+      when:
+        - desired_state == 'present'
+        - assignment.role != 'master'
+
+    - name: Back up existing workload unit
+      ansible.builtin.copy:
+        src: "{{ unit_file }}"
+        dest: "{{ unit_file }}.elastic-control-backup"
+        remote_src: true
+        mode: preserve
+      failed_when: false
+      when: desired_state == 'present'
+
+    - name: Back up existing workload configuration
+      ansible.builtin.copy:
+        src: "{{ config_root }}"
+        dest: "{{ config_root }}.elastic-control-backup"
+        remote_src: true
+        mode: preserve
+      failed_when: false
+      when: desired_state == 'present'
+
+    - name: Render Elasticsearch environment
+      ansible.builtin.copy:
+        dest: "{{ config_root }}/elasticsearch.env"
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          ES_SETTING_CLUSTER_NAME={{ cluster.name }}
+          ES_SETTING_NODE_NAME={{ workload }}
+          ES_SETTING_NODE_ROLES={{ es_roles[assignment.role] }}
+          ES_SETTING_HTTP_PORT={{ assignment.ports.elasticsearch_http }}
+          ES_SETTING_HTTP_BIND__HOST={{ membership.user_address }}
+          ES_SETTING_HTTP_PUBLISH__HOST={{ membership.user_address }}
+          ES_SETTING_TRANSPORT_PORT={{ assignment.ports.elasticsearch_transport }}
+          ES_SETTING_TRANSPORT_BIND__HOST={{ membership.data_address }}
+          ES_SETTING_TRANSPORT_PUBLISH__HOST={{ membership.data_address }}
+          ES_SETTING_XPACK_SECURITY_ENABLED=true
+          ES_SETTING_XPACK_SECURITY_HTTP_SSL_ENABLED=true
+          ES_SETTING_XPACK_SECURITY_HTTP_SSL_KEY=/usr/share/elasticsearch/config/certs/node.key
+          ES_SETTING_XPACK_SECURITY_HTTP_SSL_CERTIFICATE=/usr/share/elasticsearch/config/certs/node.crt
+          ES_SETTING_XPACK_SECURITY_HTTP_SSL_CERTIFICATE__AUTHORITIES=/usr/share/elasticsearch/config/certs/ca.crt
+          ES_SETTING_XPACK_SECURITY_TRANSPORT_SSL_ENABLED=true
+          ES_SETTING_XPACK_SECURITY_TRANSPORT_SSL_VERIFICATION__MODE=certificate
+          ES_SETTING_XPACK_SECURITY_TRANSPORT_SSL_KEY=/usr/share/elasticsearch/config/certs/node.key
+          ES_SETTING_XPACK_SECURITY_TRANSPORT_SSL_CERTIFICATE=/usr/share/elasticsearch/config/certs/node.crt
+          ES_SETTING_XPACK_SECURITY_TRANSPORT_SSL_CERTIFICATE__AUTHORITIES=/usr/share/elasticsearch/config/certs/ca.crt
+          ES_SETTING_PATH_DATA=/usr/share/elasticsearch/data
+          ES_JAVA_OPTS=-Xms{{ assignment.config.jvm_heap }} -Xmx{{ assignment.config.jvm_heap }}
+          ELASTIC_PASSWORD={{ credentials.elastic_password }}
+      no_log: true
+      when:
+        - desired_state == 'present'
+        - assignment.role in elasticsearch_roles
+
+    - name: Configure Elasticsearch discovery seed hosts
+      ansible.builtin.lineinfile:
+        path: "{{ config_root }}/elasticsearch.env"
+        regexp: '^ES_SETTING_DISCOVERY_SEED__HOSTS='
+        insertafter: '^ES_SETTING_TRANSPORT_PUBLISH__HOST='
+        line: "ES_SETTING_DISCOVERY_SEED__HOSTS={% for master in masters %}{{ master.data_address }}:{{ master.ports.elasticsearch_transport }}{% if not loop.last %},{% endif %}{% endfor %}"
+      no_log: true
+      when:
+        - desired_state == 'present'
+        - assignment.role in elasticsearch_roles
+
+    - name: Configure initial master election only on the bootstrap master
+      ansible.builtin.lineinfile:
+        path: "{{ config_root }}/elasticsearch.env"
+        regexp: '^ES_SETTING_CLUSTER_INITIAL__MASTER__NODES='
+        insertafter: '^ES_SETTING_DISCOVERY_SEED__HOSTS='
+        line: "ES_SETTING_CLUSTER_INITIAL__MASTER__NODES={{ bootstrap.workload }}"
+      no_log: true
+      when:
+        - desired_state == 'present'
+        - assignment.role == 'master'
+        - assignment.id == bootstrap.assignment_id
+
+    - name: Render Elasticsearch Quadlet
+      ansible.builtin.copy:
+        dest: "{{ unit_file }}"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Elastic Control {{ cluster.name }} {{ assignment.role }}
+          [Container]
+          Image=docker.elastic.co/elasticsearch/elasticsearch:{{ assignment.image_version }}
+          ContainerName={{ workload }}
+          Label=io.elastic-control.managed=true
+          Label=io.elastic-control.cluster-id={{ cluster.id }}
+          Label=io.elastic-control.cluster-slug={{ cluster.slug }}
+          Label=io.elastic-control.assignment-id={{ assignment.id }}
+          Label=io.elastic-control.role={{ assignment.role }}
+          Label=io.elastic-control.node-id={{ membership.node_id }}
+          Network=host
+          LogDriver=k8s-file
+          EnvironmentFile={{ config_root }}/elasticsearch.env
+          Volume={{ assignment.config.storage_path }}:/usr/share/elasticsearch/data:Z
+          Volume={{ cert_root }}:/usr/share/elasticsearch/config/certs:ro,Z
+          PodmanArgs=--cpus={{ assignment.config.cpu }} --memory={{ assignment.config.memory }}
+          [Service]
+          Restart=always
+          TimeoutStartSec=900
+          [Install]
+          WantedBy=multi-user.target
+      when:
+        - desired_state == 'present'
+        - assignment.role in elasticsearch_roles
+
+    - name: Render Kibana configuration
+      ansible.builtin.copy:
+        dest: "{{ config_root }}/kibana.yml"
+        owner: '1000'
+        group: '0'
+        mode: '0600'
+        content: |
+          server.name: {{ workload }}
+          server.host: {{ membership.user_address }}
+          server.port: {{ assignment.ports.kibana }}
+          server.ssl.enabled: true
+          server.ssl.certificate: /usr/share/kibana/config/certs/node.crt
+          server.ssl.key: /usr/share/kibana/config/certs/node.key
+          elasticsearch.hosts: ["https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}"]
+          elasticsearch.username: kibana_system
+          elasticsearch.password: {{ credentials.kibana_password }}
+          elasticsearch.ssl.certificateAuthorities: ["/usr/share/kibana/config/certs/ca.crt"]
+          xpack.fleet.agents.elasticsearch.hosts: ["https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}"]
+          xpack.security.encryptionKey: {{ credentials.elastic_password }}
+          xpack.encryptedSavedObjects.encryptionKey: {{ credentials.elastic_password }}
+          xpack.reporting.encryptionKey: {{ credentials.elastic_password }}
+      no_log: true
+      when: desired_state == 'present' and assignment.role == 'kibana'
+
+    - name: Render Kibana Quadlet
+      ansible.builtin.copy:
+        dest: "{{ unit_file }}"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Elastic Control {{ cluster.name }} Kibana
+          [Container]
+          Image=docker.elastic.co/kibana/kibana:{{ assignment.image_version }}
+          ContainerName={{ workload }}
+          Label=io.elastic-control.managed=true
+          Label=io.elastic-control.cluster-id={{ cluster.id }}
+          Label=io.elastic-control.cluster-slug={{ cluster.slug }}
+          Label=io.elastic-control.assignment-id={{ assignment.id }}
+          Label=io.elastic-control.role={{ assignment.role }}
+          Label=io.elastic-control.node-id={{ membership.node_id }}
+          Network=host
+          LogDriver=k8s-file
+          Volume={{ config_root }}/kibana.yml:/usr/share/kibana/config/kibana.yml:ro,Z
+          Volume={{ cert_root }}:/usr/share/kibana/config/certs:ro,Z
+          Volume={{ assignment.config.storage_path }}:/usr/share/kibana/data:Z
+          PodmanArgs=--cpus={{ assignment.config.cpu }} --memory={{ assignment.config.memory }}
+          [Service]
+          Restart=always
+          TimeoutStartSec=900
+          [Install]
+          WantedBy=multi-user.target
+      when: desired_state == 'present' and assignment.role == 'kibana'
+
+    - name: Render Logstash configuration
+      ansible.builtin.copy:
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+        content: "{{ item.content }}"
+      loop:
+        - dest: "{{ config_root }}/logstash.yml"
+          mode: '0644'
+          content: |
+            api.http.host: {{ membership.user_address }}
+            api.http.port: {{ assignment.ports.logstash_api }}
+            path.data: /usr/share/logstash/data
+        - dest: "{{ config_root }}/pipeline.conf"
+          mode: '0644'
+          content: "{{ assignment.config.pipeline }}"
+        - dest: "{{ config_root }}/logstash.env"
+          mode: '0600'
+          content: |
+            ECP_ELASTICSEARCH_URL=https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}
+            ECP_ELASTICSEARCH_CA=/usr/share/logstash/config/certs/ca.crt
+            ECP_ELASTICSEARCH_USERNAME=elastic
+            ECP_ELASTICSEARCH_PASSWORD={{ credentials.elastic_password }}
+      no_log: true
+      when: desired_state == 'present' and assignment.role == 'logstash'
+
+    - name: Render Logstash Quadlet
+      ansible.builtin.copy:
+        dest: "{{ unit_file }}"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Elastic Control {{ cluster.name }} Logstash
+          [Container]
+          Image=docker.elastic.co/logstash/logstash:{{ assignment.image_version }}
+          ContainerName={{ workload }}
+          Label=io.elastic-control.managed=true
+          Label=io.elastic-control.cluster-id={{ cluster.id }}
+          Label=io.elastic-control.cluster-slug={{ cluster.slug }}
+          Label=io.elastic-control.assignment-id={{ assignment.id }}
+          Label=io.elastic-control.role={{ assignment.role }}
+          Label=io.elastic-control.node-id={{ membership.node_id }}
+          Network=host
+          LogDriver=k8s-file
+          EnvironmentFile={{ config_root }}/logstash.env
+          Volume={{ config_root }}/logstash.yml:/usr/share/logstash/config/logstash.yml:ro,Z
+          Volume={{ config_root }}/pipeline.conf:/usr/share/logstash/pipeline/logstash.conf:ro,Z
+          Volume={{ cert_root }}:/usr/share/logstash/config/certs:ro,Z
+          Volume={{ assignment.config.storage_path }}:/usr/share/logstash/data:Z
+          PodmanArgs=--cpus={{ assignment.config.cpu }} --memory={{ assignment.config.memory }}
+          [Service]
+          Restart=always
+          TimeoutStartSec=900
+          [Install]
+          WantedBy=multi-user.target
+      when: desired_state == 'present' and assignment.role == 'logstash'
+
+    - name: Create Fleet policy and service token
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          cd {{ config_root | quote }}
+          auth=$(mktemp)
+          trap 'rm -f "$auth"' EXIT
+          chmod 0600 "$auth"
+          printf 'user = "elastic:%s"\n' "$ECP_ELASTIC_PASSWORD" > "$auth"
+          base=https://{{ services['kibana'].user_address }}:{{ services['kibana'].ports.kibana }}
+          curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" -H 'kbn-xsrf: elastic-control' -X POST "$base/api/fleet/setup" >/dev/null || true
+          if [[ ! -s fleet-policy-id ]]; then
+            curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" -H 'kbn-xsrf: elastic-control' -H 'Content-Type: application/json' -X POST "$base/api/fleet/agent_policies" -d '{"name":"{{ workload }}","namespace":"default","has_fleet_server":true,"monitoring_enabled":["logs","metrics"]}' > fleet-policy.json
+            python3 -c 'import json; print(json.load(open("fleet-policy.json"))["item"]["id"])' > fleet-policy-id
+            rm -f fleet-policy.json
+          fi
+          if [[ ! -s fleet-service-token ]]; then
+            curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" -H 'Content-Type: application/json' -X POST https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}/_security/service/elastic/fleet-server/credential/token/{{ workload }} > fleet-token.json
+            python3 -c 'import json; print(json.load(open("fleet-token.json"))["token"]["value"])' > fleet-service-token
+            rm -f fleet-token.json
+            chmod 0600 fleet-service-token
+          fi
+        executable: /bin/bash
+      environment:
+        ECP_ELASTIC_PASSWORD: "{{ credentials.elastic_password }}"
+      no_log: true
+      when: desired_state == 'present' and assignment.role == 'fleet-server'
+
+    - name: Render Fleet Server environment
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          umask 077
+          cat > {{ config_root | quote }}/fleet.env <<EOF
+          FLEET_SERVER_ENABLE=1
+          FLEET_URL=https://{{ membership.user_address }}:{{ assignment.ports.fleet }}
+          FLEET_CA=/usr/share/elastic-agent/certs/ca.crt
+          FLEET_SERVER_ELASTICSEARCH_HOST=https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}
+          FLEET_SERVER_HOST={{ membership.user_address }}
+          FLEET_SERVER_ELASTICSEARCH_CA=/usr/share/elastic-agent/certs/ca.crt
+          FLEET_SERVER_SERVICE_TOKEN=$(cat {{ config_root | quote }}/fleet-service-token)
+          FLEET_SERVER_POLICY_ID=$(cat {{ config_root | quote }}/fleet-policy-id)
+          FLEET_SERVER_PORT={{ assignment.ports.fleet }}
+          FLEET_SERVER_CERT=/usr/share/elastic-agent/certs/node.crt
+          FLEET_SERVER_CERT_KEY=/usr/share/elastic-agent/certs/node.key
+          EOF
+          chmod 0600 {{ config_root | quote }}/fleet.env
+        executable: /bin/bash
+      no_log: true
+      when: desired_state == 'present' and assignment.role == 'fleet-server'
+
+    - name: Render Fleet Server Quadlet
+      ansible.builtin.copy:
+        dest: "{{ unit_file }}"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Elastic Control {{ cluster.name }} Fleet Server
+          [Container]
+          Image=docker.elastic.co/beats/elastic-agent:{{ assignment.image_version }}
+          ContainerName={{ workload }}
+          Label=io.elastic-control.managed=true
+          Label=io.elastic-control.cluster-id={{ cluster.id }}
+          Label=io.elastic-control.cluster-slug={{ cluster.slug }}
+          Label=io.elastic-control.assignment-id={{ assignment.id }}
+          Label=io.elastic-control.role={{ assignment.role }}
+          Label=io.elastic-control.node-id={{ membership.node_id }}
+          Network=host
+          LogDriver=k8s-file
+          EnvironmentFile={{ config_root }}/fleet.env
+          Volume={{ cert_root }}:/usr/share/elastic-agent/certs:ro,Z
+          Volume={{ assignment.config.storage_path }}:/usr/share/elastic-agent/state:Z
+          PodmanArgs=--cpus={{ assignment.config.cpu }} --memory={{ assignment.config.memory }}
+          [Service]
+          Restart=always
+          TimeoutStartSec=900
+          [Install]
+          WantedBy=multi-user.target
+      when: desired_state == 'present' and assignment.role == 'fleet-server'
+
+    - name: Create Elastic Agent enrollment token
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          cd {{ config_root | quote }}
+          auth=$(mktemp)
+          trap 'rm -f "$auth"' EXIT
+          chmod 0600 "$auth"
+          printf 'user = "elastic:%s"\n' "$ECP_ELASTIC_PASSWORD" > "$auth"
+          base=https://{{ services['kibana'].user_address }}:{{ services['kibana'].ports.kibana }}
+          if [[ ! -s agent-policy-id ]]; then
+            curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" -H 'kbn-xsrf: elastic-control' -H 'Content-Type: application/json' -X POST "$base/api/fleet/agent_policies" -d '{"name":"{{ workload }}","namespace":"default","monitoring_enabled":["logs","metrics"]}' > agent-policy.json
+            python3 -c 'import json; print(json.load(open("agent-policy.json"))["item"]["id"])' > agent-policy-id
+            rm -f agent-policy.json
+          fi
+          policy_id=$(cat agent-policy-id)
+          payload=$(python3 -c 'import json,sys; print(json.dumps({"policy_id": sys.argv[1]}))' "$policy_id")
+          curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" -H 'kbn-xsrf: elastic-control' -H 'Content-Type: application/json' -X POST "$base/api/fleet/enrollment_api_keys" -d "$payload" > agent-token.json
+          python3 -c 'import json; print(json.load(open("agent-token.json"))["item"]["api_key"])' > agent-enrollment-token
+          rm -f agent-token.json
+          chmod 0600 agent-enrollment-token
+        executable: /bin/bash
+      environment:
+        ECP_ELASTIC_PASSWORD: "{{ credentials.elastic_password }}"
+      no_log: true
+      when: desired_state == 'present' and assignment.role == 'elastic-agent'
+
+    - name: Render Elastic Agent environment
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          umask 077
+          cat > {{ config_root | quote }}/agent.env <<EOF
+          FLEET_ENROLL=1
+          FLEET_URL=https://{{ services['fleet-server'].user_address }}:{{ services['fleet-server'].ports.fleet }}
+          FLEET_CA=/usr/share/elastic-agent/certs/ca.crt
+          FLEET_ENROLLMENT_TOKEN=$(cat {{ config_root | quote }}/agent-enrollment-token)
+          EOF
+          chmod 0600 {{ config_root | quote }}/agent.env
+        executable: /bin/bash
+      no_log: true
+      when: desired_state == 'present' and assignment.role == 'elastic-agent'
+
+    - name: Render Elastic Agent Quadlet
+      ansible.builtin.copy:
+        dest: "{{ unit_file }}"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Elastic Control {{ cluster.name }} Elastic Agent
+          [Container]
+          Image=docker.elastic.co/beats/elastic-agent:{{ assignment.image_version }}
+          ContainerName={{ workload }}
+          Label=io.elastic-control.managed=true
+          Label=io.elastic-control.cluster-id={{ cluster.id }}
+          Label=io.elastic-control.cluster-slug={{ cluster.slug }}
+          Label=io.elastic-control.assignment-id={{ assignment.id }}
+          Label=io.elastic-control.role={{ assignment.role }}
+          Label=io.elastic-control.node-id={{ membership.node_id }}
+          Network=host
+          LogDriver=k8s-file
+          EnvironmentFile={{ config_root }}/agent.env
+          Volume={{ cert_root }}:/usr/share/elastic-agent/certs:ro,Z
+          Volume={{ assignment.config.storage_path }}:/usr/share/elastic-agent/state:Z
+          PodmanArgs=--cpus={{ assignment.config.cpu }} --memory={{ assignment.config.memory }}
+          [Service]
+          Restart=always
+          TimeoutStartSec=900
+          [Install]
+          WantedBy=multi-user.target
+      when: desired_state == 'present' and assignment.role == 'elastic-agent'
+
+    - name: Reload Quadlet definitions
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: desired_state == 'present'
+
+    - name: Start only the requested workload
+      ansible.builtin.systemd:
+        name: "{{ workload }}.service"
+        enabled: true
+        state: restarted
+      when: desired_state == 'present'
+
+    - name: Wait for Elasticsearch HTTPS readiness
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          for attempt in $(seq 1 120); do
+            code=$(curl --silent --show-error --max-time 3 --cacert {{ cert_root | quote }}/ca.crt \
+              -o /dev/null -w '%{http_code}' https://{{ membership.user_address }}:{{ assignment.ports.elasticsearch_http }}/ || true)
+            if [[ "$code" == 200 || "$code" == 401 ]]; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+        executable: /bin/bash
+      no_log: true
+      changed_when: false
+      when: desired_state == 'present' and assignment.role in elasticsearch_roles
+
+    - name: Wait for Elasticsearch security index readiness after starting a data role
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          auth=$(mktemp)
+          trap 'rm -f "$auth"' EXIT
+          chmod 0600 "$auth"
+          printf 'user = "elastic:%s"\n' "$ECP_ELASTIC_PASSWORD" > "$auth"
+          for attempt in $(seq 1 120); do
+            payload=$(curl --fail --silent --show-error --max-time 5 --cacert {{ cert_root }}/ca.crt \
+              --config "$auth" 'https://{{ membership.user_address }}:{{ assignment.ports.elasticsearch_http }}/_cluster/health/.security-*?wait_for_status=yellow&wait_for_active_shards=1&timeout=3s' || true)
+            if python3 -c 'import json,sys; payload=json.load(sys.stdin); raise SystemExit(0 if payload["active_primary_shards"] >= 1 else 1)' <<< "$payload"; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+        executable: /bin/bash
+      environment:
+        ECP_ELASTIC_PASSWORD: "{{ credentials.elastic_password }}"
+      no_log: true
+      changed_when: false
+      when: desired_state == 'present' and assignment.role in elasticsearch_data_roles
+
+    - name: Verify Elasticsearch cluster UUID and node membership
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          auth=$(mktemp)
+          trap 'rm -f "$auth"' EXIT
+          chmod 0600 "$auth"
+          printf 'user = "elastic:%s"\n' "$ECP_ELASTIC_PASSWORD" > "$auth"
+          local_uuid=$(curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" https://{{ membership.user_address }}:{{ assignment.ports.elasticsearch_http }}/ | python3 -c 'import json,sys; print(json.load(sys.stdin)["cluster_uuid"])')
+          bootstrap_uuid=$(curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}/ | python3 -c 'import json,sys; print(json.load(sys.stdin)["cluster_uuid"])')
+          test "$local_uuid" = "$bootstrap_uuid"
+          curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}/_cat/nodes?h=name | grep -Fx {{ workload | quote }}
+        executable: /bin/bash
+      environment:
+        ECP_ELASTIC_PASSWORD: "{{ credentials.elastic_password }}"
+      no_log: true
+      changed_when: false
+      when: desired_state == 'present' and assignment.role in elasticsearch_data_roles
+
+    - name: Synchronize the Metricbeat monitoring service credential
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          elastic_auth=$(mktemp)
+          monitoring_auth=$(mktemp)
+          body=$(mktemp)
+          trap 'rm -f "$elastic_auth" "$monitoring_auth" "$body"' EXIT
+          chmod 0600 "$elastic_auth" "$monitoring_auth" "$body"
+          printf 'user = "elastic:%s"\n' "$ECP_ELASTIC_PASSWORD" > "$elastic_auth"
+          printf 'user = "remote_monitoring_user:%s"\n' "$ECP_MONITORING_PASSWORD" > "$monitoring_auth"
+          python3 -c 'import json,os; print(json.dumps({"password": os.environ["ECP_MONITORING_PASSWORD"]}))' > "$body"
+          endpoint=https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}
+          curl --fail --silent --show-error --max-time 15 --cacert {{ cert_root | quote }}/ca.crt \
+            --config "$elastic_auth" -H 'Content-Type: application/json' -X POST \
+            "$endpoint/_security/user/remote_monitoring_user/_password" --data-binary "@$body" >/dev/null
+          curl --fail --silent --show-error --max-time 10 --cacert {{ cert_root | quote }}/ca.crt \
+            --config "$monitoring_auth" "$endpoint/_security/_authenticate" >/dev/null
+        executable: /bin/bash
+      environment:
+        ECP_ELASTIC_PASSWORD: "{{ credentials.elastic_password }}"
+        ECP_MONITORING_PASSWORD: "{{ credentials.monitoring_password }}"
+      no_log: true
+      register: metricbeat_credential_sync
+      failed_when: assignment.role in elasticsearch_data_roles and metricbeat_credential_sync.rc != 0
+      when: desired_state == 'present' and assignment.role in metricbeat_roles
+
+    - name: Synchronize and verify the controller-managed Kibana service credential
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          elastic_auth=$(mktemp)
+          kibana_auth=$(mktemp)
+          body=$(mktemp)
+          trap 'rm -f "$elastic_auth" "$kibana_auth" "$body"' EXIT
+          chmod 0600 "$elastic_auth" "$kibana_auth" "$body"
+          printf 'user = "elastic:%s"\n' "$ECP_ELASTIC_PASSWORD" > "$elastic_auth"
+          printf 'user = "kibana_system:%s"\n' "$ECP_KIBANA_PASSWORD" > "$kibana_auth"
+          python3 -c 'import json,os; print(json.dumps({"password": os.environ["ECP_KIBANA_PASSWORD"]}))' > "$body"
+          endpoint=https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}
+          curl --fail --silent --show-error --max-time 15 --cacert {{ cert_root | quote }}/ca.crt \
+            --config "$elastic_auth" -H 'Content-Type: application/json' -X POST \
+            "$endpoint/_security/user/kibana_system/_password" --data-binary "@$body" >/dev/null
+          curl --fail --silent --show-error --max-time 10 --cacert {{ cert_root | quote }}/ca.crt \
+            --config "$kibana_auth" "$endpoint/_security/_authenticate" >/dev/null
+        executable: /bin/bash
+      environment:
+        ECP_ELASTIC_PASSWORD: "{{ credentials.elastic_password }}"
+        ECP_KIBANA_PASSWORD: "{{ credentials.kibana_password }}"
+      no_log: true
+      when:
+        - desired_state == 'present'
+        - assignment.role == 'kibana'
+
+    - name: Wait for Kibana HTTPS readiness
+      ansible.builtin.shell:
+        cmd: |
+          for attempt in $(seq 1 180); do
+            code=$(curl --silent --show-error --max-time 3 --cacert {{ cert_root | quote }}/ca.crt -o /dev/null -w '%{http_code}' https://{{ membership.user_address }}:{{ assignment.ports.kibana }}/api/status || true)
+            if [[ "$code" == 200 || "$code" == 302 ]]; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+        executable: /bin/bash
+      changed_when: false
+      when: desired_state == 'present' and assignment.role == 'kibana'
+
+    - name: Verify Fleet Server HTTPS readiness
+      ansible.builtin.shell:
+        cmd: |
+          for attempt in $(seq 1 120); do
+            code=$(curl --silent --show-error --max-time 3 --cacert {{ cert_root | quote }}/ca.crt -o /dev/null -w '%{http_code}' https://{{ membership.user_address }}:{{ assignment.ports.fleet }}/api/status || true)
+            if [[ "$code" == 200 || "$code" == 401 ]]; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+        executable: /bin/bash
+      changed_when: false
+      when: desired_state == 'present' and assignment.role == 'fleet-server'
+
+    - name: Verify Logstash API readiness
+      ansible.builtin.shell:
+        cmd: |
+          for attempt in $(seq 1 90); do
+            curl --silent --show-error --max-time 3 http://{{ membership.user_address }}:{{ assignment.ports.logstash_api }}/ >/dev/null && exit 0
+            sleep 2
+          done
+          exit 1
+        executable: /bin/bash
+      changed_when: false
+      when: desired_state == 'present' and assignment.role == 'logstash'
+
+    - name: Verify Elastic Agent is running
+      ansible.builtin.command: "podman inspect --format {{ '{{' }}.State.Running{{ '}}' }} {{ workload }}"
+      register: agent_running
+      changed_when: false
+      failed_when: agent_running.stdout | trim != 'true'
+      when: desired_state == 'present' and assignment.role == 'elastic-agent'
+
+    - name: Render Metricbeat configuration for stack monitoring
+      ansible.builtin.copy:
+        dest: "{{ metricbeat_root }}/metricbeat.yml"
+        owner: root
+        group: root
+        # The file holds endpoint and module settings only. Keep the password in
+        # the separate root-only environment file so Metricbeat can run non-root.
+        mode: '0644'
+        content: |
+          metricbeat.config.modules:
+            path: ${path.config}/modules.d/*.yml
+            reload.enabled: false
+          output.elasticsearch:
+            hosts: ["https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}"]
+            username: remote_monitoring_user
+            password: ${ECP_METRICBEAT_PASSWORD}
+            ssl.certificate_authorities: ["/usr/share/metricbeat/certs/ca.crt"]
+          {% if assignment.role in elasticsearch_roles %}
+          metricbeat.modules:
+            - module: elasticsearch
+              xpack.enabled: true
+              period: 10s
+              hosts: ["https://{{ membership.user_address }}:{{ assignment.ports.elasticsearch_http }}"]
+              username: remote_monitoring_user
+              password: ${ECP_METRICBEAT_PASSWORD}
+              ssl.certificate_authorities: ["/usr/share/metricbeat/certs/ca.crt"]
+          {% elif assignment.role == 'kibana' %}
+          metricbeat.modules:
+            - module: kibana
+              xpack.enabled: true
+              period: 10s
+              hosts: ["https://{{ membership.user_address }}:{{ assignment.ports.kibana }}"]
+              username: remote_monitoring_user
+              password: ${ECP_METRICBEAT_PASSWORD}
+              ssl.certificate_authorities: ["/usr/share/metricbeat/certs/ca.crt"]
+          {% else %}
+          metricbeat.modules:
+            - module: logstash
+              xpack.enabled: true
+              period: 10s
+              hosts: ["http://{{ membership.user_address }}:{{ assignment.ports.logstash_api }}"]
+          {% endif %}
+      no_log: true
+      when: desired_state == 'present' and assignment.role in metricbeat_roles
+
+    - name: Render Metricbeat environment
+      ansible.builtin.copy:
+        dest: "{{ metricbeat_root }}/metricbeat.env"
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          ECP_METRICBEAT_PASSWORD={{ credentials.monitoring_password }}
+      no_log: true
+      when: desired_state == 'present' and assignment.role in metricbeat_roles
+
+    - name: Render Metricbeat Quadlet
+      ansible.builtin.copy:
+        dest: "{{ metricbeat_unit_file }}"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Elastic Control {{ cluster.name }} {{ assignment.role }} Metricbeat
+          After={{ workload }}.service
+          Requires={{ workload }}.service
+          [Container]
+          Image=docker.elastic.co/beats/metricbeat:{{ assignment.image_version }}
+          ContainerName={{ metricbeat_workload }}
+          Label=io.elastic-control.managed=true
+          Label=io.elastic-control.cluster-id={{ cluster.id }}
+          Label=io.elastic-control.cluster-slug={{ cluster.slug }}
+          Label=io.elastic-control.assignment-id={{ assignment.id }}
+          Label=io.elastic-control.role=metricbeat
+          Label=io.elastic-control.monitors={{ assignment.role }}
+          Label=io.elastic-control.node-id={{ membership.node_id }}
+          Network=host
+          EnvironmentFile={{ metricbeat_root }}/metricbeat.env
+          Volume={{ metricbeat_root }}/metricbeat.yml:/usr/share/metricbeat/metricbeat.yml:ro,Z
+          Volume={{ metricbeat_root }}/data:/usr/share/metricbeat/data:Z
+          Volume={{ cert_root }}:/usr/share/metricbeat/certs:ro,Z
+          [Service]
+          Restart=always
+          TimeoutStartSec=180
+          [Install]
+          WantedBy=multi-user.target
+      when: desired_state == 'present' and assignment.role in metricbeat_roles
+
+    - name: Reload Quadlet definitions for the Metricbeat companion
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: desired_state == 'present' and assignment.role in metricbeat_roles
+
+    - name: Start the requested workload Metricbeat companion
+      ansible.builtin.systemd:
+        name: "{{ metricbeat_workload }}.service"
+        enabled: true
+        state: restarted
+      when: desired_state == 'present' and assignment.role in metricbeat_roles
+
+    - name: Verify the Metricbeat companion is running
+      ansible.builtin.command: "podman inspect --format {{ '{{' }}.State.Running{{ '}}' }} {{ metricbeat_workload }}"
+      register: metricbeat_running
+      changed_when: false
+      failed_when: metricbeat_running.stdout | trim != 'true'
+      when: desired_state == 'present' and assignment.role in metricbeat_roles
+
+    - name: Remove successful rollback backups
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ unit_file }}.elastic-control-backup"
+        - "{{ config_root }}.elastic-control-backup"
+      when: desired_state == 'present'
+
+    - name: Stop and remove the scoped workload
+      ansible.builtin.shell:
+        cmd: |
+          systemctl disable --now {{ filebeat_workload | quote }}.service 2>/dev/null || true
+          systemctl disable --now {{ metricbeat_workload | quote }}.service 2>/dev/null || true
+          systemctl disable --now {{ workload | quote }}.service 2>/dev/null || true
+          rm -f {{ filebeat_unit_file | quote }} {{ metricbeat_unit_file | quote }} {{ unit_file | quote }} {{ unit_file | quote }}.elastic-control-backup
+          systemctl daemon-reload
+          podman rm -f {{ filebeat_workload | quote }} 2>/dev/null || true
+          podman rm -f {{ metricbeat_workload | quote }} 2>/dev/null || true
+          podman rm -f {{ workload | quote }} 2>/dev/null || true
+        executable: /bin/bash
+      when: desired_state == 'purge'
+
+    - name: Remove only marker-protected workload data
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          if [[ -f {{ marker | quote }} ]]; then rm -rf -- {{ assignment.config.storage_path | quote }}; fi
+          rm -rf -- {{ workload_root | quote }}
+          rmdir {{ cluster_root | quote }}/workloads 2>/dev/null || true
+        executable: /bin/bash
+      when: desired_state == 'purge'
+
+    - name: Remove bootstrap issued certificate for this workload
+      ansible.builtin.file:
+        path: "{{ issued_cert_root }}"
+        state: absent
+      delegate_to: "{{ bootstrap.node_name }}"
+      when: desired_state == 'purge'
+
+    - name: Remove the cluster CA only with the initial master workload
+      ansible.builtin.file:
+        path: "{{ ca_root }}"
+        state: absent
+      when:
+        - desired_state == 'purge'
+        - assignment.id == bootstrap.assignment_id
+
+    - name: Remove empty cluster directories after a scoped purge
+      ansible.builtin.shell:
+        cmd: |
+          rmdir -- {{ issued_root | quote }} {{ cluster_root | quote }}/workloads {{ cluster_root | quote }} 2>/dev/null || true
+          rmdir -- /etc/elastic-control/clusters /etc/elastic-control 2>/dev/null || true
+        executable: /bin/bash
+      changed_when: false
+      when: desired_state == 'purge'

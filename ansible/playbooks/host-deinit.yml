@@ -1,0 +1,53 @@
+---
+- name: Safely de-initialize an Elastic Control host
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Refuse de-initialization while managed workloads exist
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          test -f /etc/elastic-control-host-init
+          test -z "$(podman ps -aq --filter name=ecp-)"
+          test -z "$(find /etc/containers/systemd -maxdepth 1 -type f -name 'ecp-*.container' -print -quit)"
+          test ! -d /etc/elastic-control/clusters || test -z "$(find /etc/elastic-control/clusters -mindepth 1 -print -quit)"
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Disable the rootful Podman API socket
+      ansible.builtin.systemd:
+        name: podman.socket
+        enabled: false
+        state: stopped
+
+    - name: Remove the inactive Podman socket path
+      ansible.builtin.file:
+        path: /run/podman/podman.sock
+        state: absent
+
+    - name: Remove controller-owned host initialization files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/elastic-control-host-init
+        - /etc/sysctl.d/99-elasticsearch.conf
+
+    - name: Remove only empty controller directories
+      ansible.builtin.shell:
+        cmd: |
+          rmdir /etc/elastic-stack/topology 2>/dev/null || true
+          rmdir /etc/elastic-stack/certs 2>/dev/null || true
+          rmdir /etc/elastic-stack 2>/dev/null || true
+          rmdir /var/lib/elastic-stack 2>/dev/null || true
+          rmdir /etc/elastic-control/clusters 2>/dev/null || true
+          rmdir /etc/elastic-control 2>/dev/null || true
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Confirm the Podman socket is inactive
+      ansible.builtin.command: systemctl is-active podman.socket
+      register: podman_socket_state
+      changed_when: false
+      failed_when: podman_socket_state.rc == 0

@@ -1,0 +1,15 @@
+---
+- name: Reboot managed Elastic host
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Reboot host
+      ansible.builtin.reboot:
+        connect_timeout: 15
+        post_reboot_delay: 5
+        reboot_timeout: 300
+
+    - name: Verify host is reachable after reboot
+      ansible.builtin.command: uptime
+      changed_when: false

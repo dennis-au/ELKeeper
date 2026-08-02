@@ -1,0 +1,75 @@
+---
+- name: Reconcile the supported Elastic topology role
+  hosts: all
+  become: true
+  vars:
+    target_role: ""
+    desired_state: present
+    role_config: {}
+    installer: /root/elk-podman-rootful-deploy.sh
+    cluster_name: "{{ role_config.cluster_name | default('elastic-lab', true) }}"
+    node_name: "{{ role_config.node_name | default('es-master-' ~ inventory_hostname, true) }}"
+    advertised_address: "{{ role_config.advertised_address | default(ansible_host, true) }}"
+    cpu_limit: "{{ role_config.cpu_limit | default('2', true) }}"
+    memory_limit: "{{ role_config.memory_limit | default('4g', true) }}"
+  tasks:
+    - name: Validate supported role and target state
+      ansible.builtin.assert:
+        that:
+          - target_role == 'elasticsearch'
+          - desired_state in ['present', 'absent']
+        fail_msg: >-
+          This controller currently deploys only the verified Elasticsearch
+          bootstrap workflow. Kibana, Logstash, Fleet Server, and Elastic Agent
+          remain unavailable here rather than being started without their
+          required TLS and enrollment configuration.
+
+    - name: Install the verified Elasticsearch installer
+      ansible.builtin.copy:
+        src: /opt/elastic-control/reference/elk-podman-rootful-deploy.sh
+        dest: "{{ installer }}"
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Bootstrap a managed Elasticsearch node
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          printf '%s\n' 1 y {{ cluster_name | quote }} {{ node_name | quote }} {{ advertised_address | quote }} /var/lib/elastic-stack/elasticsearch /usr/share/elasticsearch/data {{ cpu_limit | quote }} {{ memory_limit | quote }} '' y q | {{ installer | quote }}
+        executable: /bin/bash
+      when: desired_state == 'present'
+      changed_when: true
+
+    - name: Remove the local managed Elastic deployment
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          printf '%s\n' 12 REMOVE q | {{ installer | quote }}
+        executable: /bin/bash
+      when: desired_state == 'absent'
+      changed_when: true
+
+    - name: Verify the Elasticsearch service and managed TLS files
+      ansible.builtin.command:
+        argv:
+          - /bin/bash
+          - -c
+          - >-
+            systemctl is-active --quiet elasticsearch.service &&
+            test -f /etc/elastic-stack/certs/http-ca/ca.crt &&
+            test -f /etc/elastic-stack/credentials.txt
+      changed_when: false
+      when: desired_state == 'present'
+
+    - name: Verify managed Elastic resources are absent
+      ansible.builtin.command:
+        argv:
+          - /bin/bash
+          - -c
+          - >-
+            ! systemctl is-active --quiet elasticsearch.service &&
+            ! test -e /etc/elastic-stack &&
+            ! test -e /var/lib/elastic-stack/elasticsearch
+      changed_when: false
+      when: desired_state == 'absent'

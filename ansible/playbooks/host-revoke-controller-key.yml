@@ -1,0 +1,12 @@
+---
+- name: Revoke controller SSH access
+  hosts: all
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Remove the active controller public key
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user }}"
+        key: "{{ controller_public_key }}"
+        state: absent
+      no_log: true

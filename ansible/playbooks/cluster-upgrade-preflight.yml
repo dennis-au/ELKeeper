@@ -1,0 +1,47 @@
+---
+- name: Validate a non-destructive Elastic Stack upgrade
+  hosts: all
+  become: true
+  vars:
+    cluster_root: "/etc/elastic-control/clusters/{{ cluster.slug }}"
+    workload: "ecp-{{ cluster.slug }}-{{ assignment.role }}-{{ membership.node_id }}"
+    cert_root: "{{ cluster_root }}/workloads/{{ workload }}/certs"
+  tasks:
+    - name: Verify the coordinator is green and reachable over TLS
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          auth=$(mktemp)
+          trap 'rm -f "$auth"' EXIT
+          chmod 0600 "$auth"
+          printf 'user = "elastic:%s"\n' {{ credentials.elastic_password | quote }} > "$auth"
+          endpoint=https://{{ membership.user_address }}:{{ cluster.ports.elasticsearch_http }}
+          curl --fail --silent --show-error --max-time 15 --cacert {{ cert_root | quote }}/ca.crt --config "$auth" \
+            "$endpoint/_cluster/health?wait_for_status=green&timeout=15s" | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "green"'
+        executable: /bin/bash
+      no_log: true
+      changed_when: false
+
+    - name: Require a successful recent snapshot for a major upgrade
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          auth=$(mktemp)
+          snapshots=$(mktemp)
+          trap 'rm -f "$auth" "$snapshots"' EXIT
+          chmod 0600 "$auth" "$snapshots"
+          printf 'user = "elastic:%s"\n' {{ credentials.elastic_password | quote }} > "$auth"
+          endpoint=https://{{ membership.user_address }}:{{ cluster.ports.elasticsearch_http }}
+          curl --fail --silent --show-error --max-time 20 --cacert {{ cert_root | quote }}/ca.crt --config "$auth" \
+            "$endpoint/_snapshot/_all" > "$snapshots"
+          python3 - "$snapshots" <<'PY'
+          import json, sys, time
+          snapshots = json.load(open(sys.argv[1])).get("snapshots", [])
+          cutoff = int(time.time() * 1000) - 24 * 60 * 60 * 1000
+          if not any(item.get("state") == "SUCCESS" and item.get("end_time_in_millis", 0) >= cutoff for item in snapshots):
+              raise SystemExit("A successful Elasticsearch snapshot from the last 24 hours is required for a major upgrade")
+          PY
+        executable: /bin/bash
+      no_log: true
+      changed_when: false
+      when: upgrade_major | bool

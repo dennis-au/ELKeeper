@@ -1,0 +1,50 @@
+---
+- name: Bootstrap controller SSH access
+  hosts: all
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Verify password bootstrap connection
+      ansible.builtin.ping:
+      no_log: true
+
+    - name: Discover the target hostname
+      ansible.builtin.command: hostname -s
+      register: controller_hostname
+      changed_when: false
+
+    - name: Report the target hostname
+      ansible.builtin.debug:
+        msg: "ECP_HOSTNAME={{ controller_hostname.stdout | trim }}"
+
+    - name: Install the controller public key
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user }}"
+        key: "{{ controller_public_key }}"
+        state: present
+      no_log: true
+      when: install_controller_key | bool
+
+    - name: Verify controller key authentication
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - "StrictHostKeyChecking={{ controller_ssh_host_key_checking }}"
+          - -o
+          - "UserKnownHostsFile={{ controller_known_hosts_path }}"
+          - -o
+          - ConnectTimeout=8
+          - -i
+          - "{{ controller_key_path }}"
+          - -p
+          - "{{ controller_ssh_port | string }}"
+          - "{{ controller_ssh_user }}@{{ controller_address }}"
+          - /usr/bin/true
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      no_log: true
+      when: install_controller_key | bool
