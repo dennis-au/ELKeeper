@@ -374,7 +374,7 @@ class ApiTests(unittest.TestCase):
             node = con.execute("SELECT name FROM nodes WHERE id=?", (response.json()["id"],)).fetchone()
             run_id = con.execute(
                 "INSERT INTO runs(kind,target,status,command_json,log,context_json) VALUES ('host-enroll','pending','running','[]',?,?)",
-                ("ECP_HOSTNAME=lab101\n", json.dumps({
+                ("ECP_HOSTNAME=target-alpha\n", json.dumps({
                     "enrollment_node_id": response.json()["id"], "enrollment_enabled": True,
                     "enrollment_existing_key": True, "enrollment_auto_name": True, "enrollment_username": "operator",
                 })),
@@ -383,7 +383,7 @@ class ApiTests(unittest.TestCase):
         asyncio.run(self.main.run(run_id, ["/usr/bin/true"]))
         with self.main.db() as con:
             node = con.execute("SELECT name FROM nodes WHERE id=?", (response.json()["id"],)).fetchone()
-        self.assertEqual(node["name"], "lab101")
+        self.assertEqual(node["name"], "target-alpha")
 
     def test_node_addresses_must_be_ip_literals(self):
         headers = self.login()

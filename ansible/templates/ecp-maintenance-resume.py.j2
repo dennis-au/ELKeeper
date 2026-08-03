@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import base64
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlsplit
+
+
+SCHEMA_VERSION = 1
+SIGNING_CONTEXT = "elkeeper-host-executor-v1"
+STATE_ROOT = Path("/var/lib/elastic-control")
+MAINTENANCE_ROOT = STATE_ROOT / "maintenance"
+OPERATIONS_ROOT = MAINTENANCE_ROOT / "operations"
+EXPECTED_OWNER_UID = 0
+OPERATION_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+BOOT_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+UNIT_PATTERN = re.compile(r"^ecp-[a-z0-9][a-z0-9_.@-]{0,126}\.service$")
+CHECK_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+KEY_ID_PATTERN = re.compile(r"^SHA256:[A-Za-z0-9_-]{43}$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+MAX_MANIFEST_BYTES = 262144
+MAX_KEY_BYTES = 16384
+MAX_STATE_BYTES = 65536
+MAX_MANIFEST_LIFETIME_SECONDS = 86400
+MAX_TOTAL_CHECK_SECONDS = 3600
+
+
+class ExecutorFailure(Exception):
+    def __init__(self, reason_code: str):
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def isoformat(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def parse_time(value: object, reason: str) -> datetime:
+    if not isinstance(value, str):
+        raise ExecutorFailure(reason)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ExecutorFailure(reason) from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ExecutorFailure(reason)
+    return parsed.astimezone(timezone.utc)
+
+
+def canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def no_duplicate_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ExecutorFailure("manifest_json_invalid")
+        result[key] = value
+    return result
+
+
+def load_json_file(path: Path, maximum: int) -> object:
+    raw = read_secure_file(path, 0o600, maximum)
+    try:
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=no_duplicate_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ExecutorFailure("manifest_json_invalid") from error
+
+
+def require_exact_keys(value: object, keys: set[str], reason: str) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ExecutorFailure(reason)
+    return value
+
+
+def require_string(value: object, pattern: re.Pattern[str], reason: str) -> str:
+    if not isinstance(value, str) or not pattern.fullmatch(value):
+        raise ExecutorFailure(reason)
+    return value
+
+
+def require_integer(value: object, minimum: int, maximum: int, reason: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ExecutorFailure(reason)
+    return value
+
+
+def validate_operation_id(value: str) -> str:
+    return require_string(value, OPERATION_PATTERN, "operation_id_invalid")
+
+
+def operation_paths(operation_id: str) -> tuple[Path, Path, Path, Path, Path]:
+    operation_id = validate_operation_id(operation_id)
+    operation_dir = OPERATIONS_ROOT / operation_id
+    return (
+        operation_dir,
+        operation_dir / "manifest.json",
+        operation_dir / "signing-key.pem",
+        operation_dir / "checkpoint.json",
+        operation_dir / "result.json",
+    )
+
+
+def require_secure_directory(path: Path, mode: int) -> None:
+    try:
+        item = path.lstat()
+    except OSError as error:
+        raise ExecutorFailure("executor_path_invalid") from error
+    if not stat.S_ISDIR(item.st_mode) or stat.S_ISLNK(item.st_mode) or item.st_uid != EXPECTED_OWNER_UID:
+        raise ExecutorFailure("executor_path_invalid")
+    if stat.S_IMODE(item.st_mode) != mode:
+        raise ExecutorFailure("executor_path_invalid")
+
+
+def secure_regular_stat(path: Path, mode: int, maximum: int) -> os.stat_result:
+    try:
+        item = path.lstat()
+    except OSError as error:
+        raise ExecutorFailure("executor_file_invalid") from error
+    if not stat.S_ISREG(item.st_mode) or stat.S_ISLNK(item.st_mode) or item.st_uid != EXPECTED_OWNER_UID:
+        raise ExecutorFailure("executor_file_invalid")
+    if stat.S_IMODE(item.st_mode) != mode or item.st_size < 1 or item.st_size > maximum:
+        raise ExecutorFailure("executor_file_invalid")
+    return item
+
+
+def read_secure_file(path: Path, mode: int, maximum: int) -> bytes:
+    before = secure_regular_stat(path, mode, maximum)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise ExecutorFailure("executor_file_changed")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, maximum + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum:
+                raise ExecutorFailure("executor_file_invalid")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise ExecutorFailure("executor_file_invalid")
+        offset += written
+
+
+def validate_managed_unit(value: object) -> str:
+    unit = require_string(value, UNIT_PATTERN, "manifest_unit_invalid")
+    if unit.startswith("ecp-maintenance-"):
+        raise ExecutorFailure("manifest_unit_invalid")
+    return unit
+
+
+def validate_managed_path(value: object) -> str:
+    if not isinstance(value, str) or not value.startswith("/") or os.path.normpath(value) != value:
+        raise ExecutorFailure("manifest_path_invalid")
+    path = Path(value)
+    allowed = (
+        path == Path("/run/podman/podman.sock")
+        or path == Path("/etc/elastic-control")
+        or Path("/etc/elastic-control") in path.parents
+        or path == MAINTENANCE_ROOT
+        or MAINTENANCE_ROOT in path.parents
+    )
+    if not allowed:
+        raise ExecutorFailure("manifest_path_invalid")
+    return value
+
+
+def validate_local_https_url(value: object) -> str:
+    if not isinstance(value, str):
+        raise ExecutorFailure("manifest_url_invalid")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise ExecutorFailure("manifest_url_invalid") from error
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or port is None
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ExecutorFailure("manifest_url_invalid")
+    if parsed.hostname != "localhost":
+        try:
+            ipaddress.ip_address(parsed.hostname)
+        except ValueError as error:
+            raise ExecutorFailure("manifest_url_invalid") from error
+    return value
+
+
+def validate_check(value: object, required_units: set[str]) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ExecutorFailure("manifest_check_invalid")
+    kind = value.get("kind")
+    common = {"kind", "check_id", "timeout_seconds"}
+    if kind == "systemd_unit_active":
+        check = require_exact_keys(value, common | {"unit"}, "manifest_check_invalid")
+        unit = validate_managed_unit(check["unit"])
+        if unit not in required_units:
+            raise ExecutorFailure("manifest_check_invalid")
+        normalized = dict(check)
+        normalized["unit"] = unit
+    elif kind == "path_exists":
+        check = require_exact_keys(value, common | {"path"}, "manifest_check_invalid")
+        normalized = dict(check)
+        normalized["path"] = validate_managed_path(check["path"])
+    elif kind == "local_https":
+        allowed = common | {"url", "ca_path", "curl_config_path"}
+        check = require_exact_keys(value, allowed, "manifest_check_invalid")
+        normalized = dict(check)
+        normalized["url"] = validate_local_https_url(check["url"])
+        normalized["ca_path"] = validate_managed_path(check["ca_path"])
+        curl_config = check["curl_config_path"]
+        normalized["curl_config_path"] = None if curl_config is None else validate_managed_path(curl_config)
+    else:
+        raise ExecutorFailure("manifest_check_invalid")
+    normalized["check_id"] = require_string(check["check_id"], CHECK_ID_PATTERN, "manifest_check_invalid")
+    normalized["timeout_seconds"] = require_integer(check["timeout_seconds"], 1, 900, "manifest_check_invalid")
+    return normalized
+
+
+def validate_manifest(envelope: object, operation_id: str) -> tuple[dict[str, object], dict[str, object]]:
+    envelope = require_exact_keys(envelope, {"manifest", "signature"}, "manifest_envelope_invalid")
+    manifest_keys = {
+        "schema_version", "signing_context", "operation_id", "plan_id", "node_id",
+        "created_at", "expires_at", "expected_boot_transition", "pre_reboot_boot_id",
+        "required_units", "checks", "checkpoint_path", "result_path",
+        "unit_wait_timeout_seconds", "poll_interval_seconds",
+    }
+    manifest = require_exact_keys(envelope["manifest"], manifest_keys, "manifest_fields_invalid")
+    if manifest["schema_version"] != SCHEMA_VERSION or manifest["signing_context"] != SIGNING_CONTEXT:
+        raise ExecutorFailure("manifest_version_invalid")
+    if validate_operation_id(manifest["operation_id"]) != operation_id:
+        raise ExecutorFailure("manifest_operation_mismatch")
+    require_string(manifest["plan_id"], OPERATION_PATTERN, "manifest_plan_invalid")
+    require_integer(manifest["node_id"], 1, 2147483647, "manifest_node_invalid")
+    created_at = parse_time(manifest["created_at"], "manifest_time_invalid")
+    expires_at = parse_time(manifest["expires_at"], "manifest_time_invalid")
+    lifetime = (expires_at - created_at).total_seconds()
+    if lifetime <= 0 or lifetime > MAX_MANIFEST_LIFETIME_SECONDS or utc_now() >= expires_at:
+        raise ExecutorFailure("manifest_expired")
+    if manifest["expected_boot_transition"] != "must_change":
+        raise ExecutorFailure("manifest_boot_transition_invalid")
+    require_string(manifest["pre_reboot_boot_id"], BOOT_ID_PATTERN, "manifest_boot_id_invalid")
+    required_units_value = manifest["required_units"]
+    if not isinstance(required_units_value, list) or len(required_units_value) > 100:
+        raise ExecutorFailure("manifest_unit_invalid")
+    required_units = [validate_managed_unit(item) for item in required_units_value]
+    if required_units != sorted(required_units) or len(required_units) != len(set(required_units)):
+        raise ExecutorFailure("manifest_unit_invalid")
+    checks_value = manifest["checks"]
+    if not isinstance(checks_value, list) or len(checks_value) > 100:
+        raise ExecutorFailure("manifest_check_invalid")
+    checks = [validate_check(item, set(required_units)) for item in checks_value]
+    check_ids = [str(item["check_id"]) for item in checks]
+    if len(check_ids) != len(set(check_ids)):
+        raise ExecutorFailure("manifest_check_invalid")
+    operation_dir, _, _, checkpoint_path, result_path = operation_paths(operation_id)
+    if manifest["checkpoint_path"] != str(checkpoint_path) or manifest["result_path"] != str(result_path):
+        raise ExecutorFailure("manifest_path_invalid")
+    unit_wait = require_integer(manifest["unit_wait_timeout_seconds"], 1, 3600, "manifest_timeout_invalid")
+    poll_interval = require_integer(manifest["poll_interval_seconds"], 1, 60, "manifest_timeout_invalid")
+    if unit_wait + sum(int(item["timeout_seconds"]) for item in checks) > MAX_TOTAL_CHECK_SECONDS:
+        raise ExecutorFailure("manifest_timeout_invalid")
+    manifest = dict(manifest)
+    manifest["required_units"] = required_units
+    manifest["checks"] = checks
+
+    signature_keys = {"algorithm", "key_id", "payload_sha256", "value"}
+    signature = require_exact_keys(envelope["signature"], signature_keys, "manifest_signature_invalid")
+    if signature["algorithm"] != "ed25519":
+        raise ExecutorFailure("manifest_signature_invalid")
+    require_string(signature["key_id"], KEY_ID_PATTERN, "manifest_signature_invalid")
+    require_string(signature["payload_sha256"], SHA256_PATTERN, "manifest_signature_invalid")
+    signature_value = signature["value"]
+    if not isinstance(signature_value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{86}", signature_value):
+        raise ExecutorFailure("manifest_signature_invalid")
+    return manifest, signature
+
+
+def public_key_id(key_path: Path) -> str:
+    completed = subprocess.run(
+        ["openssl", "pkey", "-pubin", "-in", str(key_path), "-outform", "DER"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=15,
+    )
+    if completed.returncode != 0 or not completed.stdout:
+        raise ExecutorFailure("public_key_invalid")
+    digest = base64.urlsafe_b64encode(hashlib.sha256(completed.stdout).digest()).decode("ascii").rstrip("=")
+    return "SHA256:" + digest
+
+
+def verify_manifest_signature(manifest: dict[str, object], signature: dict[str, object], key_path: Path, operation_dir: Path) -> bytes:
+    payload = canonical_json(manifest)
+    if hashlib.sha256(payload).hexdigest() != signature["payload_sha256"]:
+        raise ExecutorFailure("manifest_digest_mismatch")
+    if public_key_id(key_path) != signature["key_id"]:
+        raise ExecutorFailure("manifest_key_mismatch")
+    try:
+        raw_signature = base64.b64decode(str(signature["value"]) + "==", altchars=b"-_", validate=True)
+    except (ValueError, TypeError) as error:
+        raise ExecutorFailure("manifest_signature_invalid") from error
+    if len(raw_signature) != 64:
+        raise ExecutorFailure("manifest_signature_invalid")
+    signature_descriptor, signature_path = tempfile.mkstemp(prefix=".signature-", dir=operation_dir)
+    payload_descriptor, payload_path = tempfile.mkstemp(prefix=".payload-", dir=operation_dir)
+    try:
+        os.fchmod(signature_descriptor, 0o600)
+        write_all(signature_descriptor, raw_signature)
+        os.fsync(signature_descriptor)
+        os.close(signature_descriptor)
+        signature_descriptor = -1
+        os.fchmod(payload_descriptor, 0o600)
+        write_all(payload_descriptor, payload)
+        os.fsync(payload_descriptor)
+        os.close(payload_descriptor)
+        payload_descriptor = -1
+        completed = subprocess.run(
+            [
+                "openssl", "pkeyutl", "-verify", "-pubin", "-inkey", str(key_path),
+                "-rawin", "-in", payload_path, "-sigfile", signature_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=15,
+        )
+        if completed.returncode != 0:
+            raise ExecutorFailure("manifest_signature_invalid")
+    finally:
+        if signature_descriptor >= 0:
+            os.close(signature_descriptor)
+        if payload_descriptor >= 0:
+            os.close(payload_descriptor)
+        try:
+            os.unlink(signature_path)
+        except FileNotFoundError:
+            pass
+        try:
+            os.unlink(payload_path)
+        except FileNotFoundError:
+            pass
+    return payload
+
+
+def read_boot_id() -> str:
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    except OSError as error:
+        raise ExecutorFailure("boot_id_unavailable") from error
+    return require_string(value, BOOT_ID_PATTERN, "boot_id_unavailable")
+
+
+def unit_active(unit: str) -> bool:
+    try:
+        completed = subprocess.run(
+            ["systemctl", "is-active", "--quiet", unit],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=15,
+        )
+        return completed.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def wait_for_units(units: list[str], timeout_seconds: int, poll_interval: int) -> list[dict[str, object]]:
+    deadline = time.monotonic() + timeout_seconds
+    observations = [{"unit": unit, "active": False} for unit in units]
+    while True:
+        observations = [{"unit": unit, "active": unit_active(unit)} for unit in units]
+        if all(bool(item["active"]) for item in observations):
+            return observations
+        if time.monotonic() >= deadline:
+            raise ExecutorFailure("unit_timeout")
+        time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+
+
+def wait_for_path(path: str, timeout_seconds: int) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if os.path.exists(path):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+
+
+def require_protected_reference(path: str, credential: bool = False) -> None:
+    try:
+        item = Path(path).lstat()
+    except OSError as error:
+        raise ExecutorFailure("protected_file_unavailable") from error
+    if not stat.S_ISREG(item.st_mode) or stat.S_ISLNK(item.st_mode) or item.st_uid != EXPECTED_OWNER_UID:
+        raise ExecutorFailure("protected_file_invalid")
+    mode = stat.S_IMODE(item.st_mode)
+    if mode & 0o022 or (credential and mode & 0o077):
+        raise ExecutorFailure("protected_file_invalid")
+
+
+def run_check(check: dict[str, object]) -> tuple[bool, str | None]:
+    kind = str(check["kind"])
+    timeout_seconds = int(check["timeout_seconds"])
+    if kind == "systemd_unit_active":
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            if unit_active(str(check["unit"])):
+                return True, None
+            if time.monotonic() >= deadline:
+                return False, "unit_timeout"
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    if kind == "path_exists":
+        return (True, None) if wait_for_path(str(check["path"]), timeout_seconds) else (False, "path_timeout")
+    if kind == "local_https":
+        ca_path = str(check["ca_path"])
+        require_protected_reference(ca_path)
+        command = [
+            "curl", "--silent", "--fail", "--output", "/dev/null",
+            "--max-time", str(timeout_seconds), "--cacert", ca_path,
+        ]
+        curl_config = check["curl_config_path"]
+        if curl_config is not None:
+            require_protected_reference(str(curl_config), credential=True)
+            command.extend(["--config", str(curl_config)])
+        command.append(str(check["url"]))
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=timeout_seconds + 5,
+            )
+            return (True, None) if completed.returncode == 0 else (False, "https_check_failed")
+        except (OSError, subprocess.SubprocessError):
+            return False, "https_check_failed"
+    raise ExecutorFailure("manifest_check_invalid")
+
+
+def atomic_write_json(path: Path, value: dict[str, object], allow_replace: bool) -> None:
+    if os.path.lexists(path):
+        secure_regular_stat(path, 0o600, MAX_STATE_BYTES)
+        if not allow_replace:
+            raise ExecutorFailure("result_already_exists")
+    payload = canonical_json(value) + b"\n"
+    if len(payload) > MAX_STATE_BYTES:
+        raise ExecutorFailure("result_too_large")
+    descriptor, temporary_path = tempfile.mkstemp(prefix="." + path.name + "-", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        write_all(descriptor, payload)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary_path, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+
+
+def checkpoint(path: Path, operation_id: str, state: str, manifest_hash: str) -> None:
+    atomic_write_json(
+        path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "operation_id": operation_id,
+            "state": state,
+            "manifest_hash": manifest_hash,
+            "observed_at": isoformat(utc_now()),
+        },
+        allow_replace=True,
+    )
+
+
+def disable_self(operation_id: str) -> None:
+    unit = f"ecp-maintenance-resume@{operation_id}.service"
+    # Disable only the exact signed operation instance; never start or stop workload units.
+    try:
+        subprocess.run(
+            ["systemctl", "disable", unit],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        return 2
+    try:
+        operation_id = validate_operation_id(sys.argv[1])
+    except ExecutorFailure:
+        return 2
+    operation_dir, manifest_path, key_path, checkpoint_path, result_path = operation_paths(operation_id)
+    started_at = utc_now()
+    manifest: dict[str, object] | None = None
+    manifest_hash = "0" * 64
+    observed_boot_id: str | None = None
+    unit_results: list[dict[str, object]] = []
+    check_results: list[dict[str, object]] = []
+    reason_code = "unexpected_failure"
+    state = "recovery_required"
+    try:
+        require_secure_directory(STATE_ROOT, 0o750)
+        require_secure_directory(MAINTENANCE_ROOT, 0o700)
+        require_secure_directory(OPERATIONS_ROOT, 0o700)
+        require_secure_directory(operation_dir, 0o700)
+        if os.path.lexists(result_path):
+            secure_regular_stat(result_path, 0o600, MAX_STATE_BYTES)
+            return 0
+        secure_regular_stat(manifest_path, 0o600, MAX_MANIFEST_BYTES)
+        secure_regular_stat(key_path, 0o600, MAX_KEY_BYTES)
+        if os.path.lexists(checkpoint_path):
+            secure_regular_stat(checkpoint_path, 0o600, MAX_STATE_BYTES)
+        envelope = load_json_file(manifest_path, MAX_MANIFEST_BYTES)
+        manifest, signature = validate_manifest(envelope, operation_id)
+        payload = verify_manifest_signature(manifest, signature, key_path, operation_dir)
+        manifest_hash = hashlib.sha256(payload).hexdigest()
+        checkpoint(checkpoint_path, operation_id, "manifest_verified", manifest_hash)
+
+        observed_boot_id = read_boot_id()
+        if observed_boot_id == manifest["pre_reboot_boot_id"]:
+            raise ExecutorFailure("boot_id_unchanged")
+        checkpoint(checkpoint_path, operation_id, "boot_transition_verified", manifest_hash)
+
+        unit_results = wait_for_units(
+            list(manifest["required_units"]),
+            int(manifest["unit_wait_timeout_seconds"]),
+            int(manifest["poll_interval_seconds"]),
+        )
+        checkpoint(checkpoint_path, operation_id, "required_units_ready", manifest_hash)
+
+        for check in manifest["checks"]:
+            passed, error_category = run_check(check)
+            check_results.append({
+                "check_id": check["check_id"],
+                "passed": passed,
+                "error_category": error_category,
+            })
+            if not passed:
+                raise ExecutorFailure(error_category or "check_failed")
+        state = "complete"
+        reason_code = "completed"
+        checkpoint(checkpoint_path, operation_id, "complete", manifest_hash)
+    except ExecutorFailure as error:
+        reason_code = error.reason_code
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        reason_code = "unexpected_failure"
+    finally:
+        if manifest is not None and not unit_results:
+            unit_results = [
+                {"unit": unit, "active": unit_active(unit)}
+                for unit in manifest.get("required_units", [])
+            ]
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "signing_context": SIGNING_CONTEXT,
+            "operation_id": operation_id,
+            "plan_id": manifest.get("plan_id") if manifest is not None else None,
+            "manifest_hash": manifest_hash,
+            "state": state,
+            "reason_code": reason_code,
+            "pre_reboot_boot_id": manifest.get("pre_reboot_boot_id") if manifest is not None else None,
+            "observed_boot_id": observed_boot_id,
+            "units": unit_results,
+            "checks": check_results,
+            "started_at": isoformat(started_at),
+            "completed_at": isoformat(utc_now()),
+        }
+        try:
+            if not os.path.lexists(result_path):
+                atomic_write_json(result_path, result, allow_replace=False)
+        except ExecutorFailure:
+            pass
+        disable_self(operation_id)
+    return 0 if state == "complete" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

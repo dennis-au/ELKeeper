@@ -6,6 +6,11 @@ import type { Cluster } from '../types';
 import { ClustersPage } from './ClustersPage';
 
 const state = vi.hoisted(() => ({
+  maintenanceCapabilities: {
+    planning: false,
+    operations: { host_reboot: false, rolling_restart: false, upgrade: false, evacuation: false },
+    backends: { documented_rolling: true, node_shutdown: false },
+  },
   api: vi.fn<(path: string, options?: RequestInit) => Promise<unknown>>((path) => {
     if (path === '/api/clusters/1/versions') return Promise.resolve({ available_versions: [], assignments: [] });
     if (path === '/api/clusters/1/log-monitoring') return Promise.resolve({ run_id: 55 });
@@ -16,6 +21,7 @@ const state = vi.hoisted(() => ({
 vi.mock('../api', () => ({
   api: state.api,
   jsonBody: vi.fn((value) => ({ body: JSON.stringify(value), headers: { 'Content-Type': 'application/json' } })),
+  queries: { maintenanceCapabilities: () => Promise.resolve(state.maintenanceCapabilities) },
 }));
 
 const cluster: Cluster = {
@@ -43,7 +49,14 @@ function renderPage() {
 }
 
 describe('ClustersPage role port associations', () => {
-  afterEach(() => { cleanup(); state.api.mockClear(); });
+  afterEach(() => {
+    cleanup(); state.api.mockClear();
+    state.maintenanceCapabilities = {
+      planning: false,
+      operations: { host_reboot: false, rolling_restart: false, upgrade: false, evacuation: false },
+      backends: { documented_rolling: true, node_shutdown: false },
+    };
+  });
 
   it('shows distinct suggested role ports and saves the role-port association profile', async () => {
     renderPage();
@@ -143,5 +156,34 @@ describe('ClustersPage role port associations', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(screen.queryByRole('heading', { name: 'Elasticsearch settings' })).not.toBeInTheDocument();
+  });
+
+  it('shows maintenance policy only for an existing cluster when planning is enabled', async () => {
+    state.maintenanceCapabilities.planning = true;
+    state.api.mockImplementation((path) => {
+      if (path === '/api/clusters/1/maintenance-policy') return Promise.resolve({
+        policy: {
+          max_unavailable: 1, max_surge: 0, minimum_master_eligible: 'quorum', minimum_data_per_tier: 1,
+          minimum_kibana: 1, minimum_fleet_server: 1, minimum_logstash: 1, minimum_coordinating: 1,
+          allow_agent_interruption: 'true-with-warning', required_cluster_health: 'green',
+          allocation_guard: 'primaries-for-data', observation_max_age_seconds: 120,
+          restart_allocation_delay_seconds: null, host_return_timeout_seconds: 900,
+          workload_ready_timeout_seconds: 900, plan_validity_seconds: 300,
+        },
+        revision: 0, customized: false, updated_by: null, updated_at: null,
+      });
+      if (path === '/api/clusters/1/versions') return Promise.resolve({ available_versions: [], assignments: [] });
+      return Promise.resolve({ id: 2 });
+    });
+    renderPage();
+
+    expect(screen.queryByRole('heading', { name: 'Maintenance policy' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Create cluster' }));
+    expect(screen.queryByRole('heading', { name: 'Maintenance policy' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    expect(await screen.findByRole('heading', { name: 'Maintenance policy' })).toBeInTheDocument();
+    expect(state.api).toHaveBeenCalledWith('/api/clusters/1/maintenance-policy');
   });
 });

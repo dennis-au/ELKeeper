@@ -37,6 +37,8 @@ vi.mock('../api', () => ({
   queries: { dashboard: vi.fn(() => Promise.resolve(state.data)) },
 }));
 
+vi.mock('echarts-for-react', () => ({ default: () => <div data-testid="echarts-chart" /> }));
+
 class EventSourceMock {
   addEventListener() {}
   close() {}
@@ -235,5 +237,54 @@ describe('DashboardPage', () => {
     const [health] = await screen.findAllByLabelText('Green status: All primary and replica shards are assigned and configured hosts are reachable.');
     fireEvent.mouseOver(health);
     expect(await screen.findByText('All primary and replica shards are assigned and configured hosts are reachable.')).toBeInTheDocument();
+  });
+
+  it('renders cross-cluster host resource graphs with cluster attribution', async () => {
+    state.data = {
+      ...state.data,
+      cross_cluster_host_usage: [{
+        node_id: 7,
+        name: 'node-a',
+        reachable: true,
+        observed_at: '2026-08-01T10:00:00Z',
+        last_error: '',
+        resource_observation_error: '',
+        clusters: [{ id: 1, name: 'Production', theme_color: '#0077CC' }],
+        history: [{
+          observed_at: '2026-08-01T10:00:00Z',
+          cpu_percent: 42.5,
+          memory_usage_bytes: 6_000,
+          memory_total_bytes: 8_000,
+          network_rx_bytes_per_second: 100,
+          network_tx_bytes_per_second: 250,
+          disk_read_bytes_per_second: 150,
+          disk_write_bytes_per_second: 300,
+        }],
+      }],
+    };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const cluster: Cluster = {
+      id: 1, name: 'Production', slug: 'production', theme_color: '#0077CC', desired_version: '8.19.0',
+      ports: { elasticsearch_http: 9200, elasticsearch_transport: 9300, kibana: 5601, fleet: 8220, logstash_api: 9600 },
+      network_defaults: { mode: 'shared' as const },
+      elasticsearch_settings: {
+        allocation_enable: 'all', rebalance_enable: 'all', disk_watermark_low: '85%', disk_watermark_high: '90%',
+        disk_watermark_flood_stage: '95%', recovery_max_bytes_per_sec: '40mb',
+      },
+      members: [], assignments: [],
+    };
+    render(
+      <QueryClientProvider client={client}>
+        <ConsoleContext.Provider value={{ clusters: [cluster], selectedCluster: cluster, selectedClusterId: 1, setSelectedClusterId: () => undefined, watchRun: () => undefined, refreshAll: async () => undefined }}>
+          <DashboardPage />
+        </ConsoleContext.Provider>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByRole('heading', { name: 'Cross-cluster host resource usage' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'node-a' })).toBeInTheDocument();
+    expect(screen.getAllByText('Production').length).toBeGreaterThan(2);
+    expect(screen.getByLabelText('Network bandwidth for node-a')).toBeInTheDocument();
+    expect(screen.getByLabelText('Disk I/O for node-a')).toBeInTheDocument();
   });
 });

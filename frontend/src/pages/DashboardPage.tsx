@@ -8,7 +8,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, queries } from '../api';
 import { useConsole } from '../app-context';
 import { bytes, formatDateTime, formatTime, percent, timeAgo } from '../format';
-import type { ClusterMetrics, ClusterSummary, ContainerMetric, ControllerSettings, DashboardSnapshot, Health, LogMonitoring, NodeBreakdown, TopologyResponse, ZoneBreakdown } from '../types';
+import type { ClusterMetrics, ClusterSummary, ContainerMetric, ControllerSettings, CrossClusterHostUsage, DashboardSnapshot, Health, HostResourceSample, LogMonitoring, NodeBreakdown, TopologyResponse, ZoneBreakdown } from '../types';
 
 const healthColor: Record<Health, 'success' | 'warning' | 'danger' | 'subdued'> = {
   green: 'success', yellow: 'warning', red: 'danger', unknown: 'subdued', awaiting_data: 'subdued',
@@ -49,6 +49,86 @@ function kibanaLogsUrl(endpoint: string, slug: string) {
 
 function Metric({ title, value, description }: { title: string; value: string | number; description?: string }) {
   return <EuiPanel paddingSize="m" hasBorder><EuiStat title={String(value)} description={title} titleSize="s"><EuiText size="xs" color="subdued">{description}</EuiText></EuiStat></EuiPanel>;
+}
+
+function rate(value: number | null | undefined) {
+  return typeof value === 'number' && Number.isFinite(value) ? `${bytes(value)}/s` : 'Awaiting sample';
+}
+
+function usagePercent(used: number, total: number) {
+  return total > 0 ? percent(used, total) : undefined;
+}
+
+function hostChartAxis(history: HostResourceSample[], timezone: string) {
+  return { type: 'category', boundaryGap: false, data: history.map((sample) => formatTime(sample.observed_at, timezone)), axisLabel: { hideOverlap: true } };
+}
+
+function HostResourceUsage({ host, timezone }: { host: CrossClusterHostUsage; timezone: string }) {
+  const history = host.history || [];
+  const latest = history[history.length - 1];
+  const memory = latest ? usagePercent(latest.memory_usage_bytes, latest.memory_total_bytes) : undefined;
+  const rateAxis = { type: 'value', axisLabel: { formatter: (value: number) => `${bytes(value)}/s` } };
+  const resourceChart = {
+    animation: false,
+    grid: { left: 42, right: 10, top: 30, bottom: 26 },
+    tooltip: { trigger: 'axis', valueFormatter: (value: number) => `${value}%` },
+    legend: { top: 0, data: ['CPU', 'Memory'] },
+    xAxis: hostChartAxis(history, timezone),
+    yAxis: { type: 'value', min: 0, max: 100, axisLabel: { formatter: '{value}%' } },
+    series: [
+      { name: 'CPU', type: 'line', showSymbol: false, data: history.map((sample) => sample.cpu_percent), itemStyle: { color: '#0077CC' } },
+      { name: 'Memory', type: 'line', showSymbol: false, data: history.map((sample) => usagePercent(sample.memory_usage_bytes, sample.memory_total_bytes)), itemStyle: { color: '#00A67E' } },
+    ],
+  };
+  const networkChart = {
+    animation: false,
+    grid: { left: 56, right: 10, top: 30, bottom: 26 },
+    tooltip: { trigger: 'axis', valueFormatter: (value: number) => `${bytes(value)}/s` },
+    legend: { top: 0, data: ['Received', 'Sent'] },
+    xAxis: hostChartAxis(history, timezone),
+    yAxis: rateAxis,
+    series: [
+      { name: 'Received', type: 'line', showSymbol: false, data: history.map((sample) => sample.network_rx_bytes_per_second), itemStyle: { color: '#0077CC' } },
+      { name: 'Sent', type: 'line', showSymbol: false, data: history.map((sample) => sample.network_tx_bytes_per_second), itemStyle: { color: '#E7664C' } },
+    ],
+  };
+  const diskChart = {
+    animation: false,
+    grid: { left: 56, right: 10, top: 30, bottom: 26 },
+    tooltip: { trigger: 'axis', valueFormatter: (value: number) => `${bytes(value)}/s` },
+    legend: { top: 0, data: ['Read', 'Write'] },
+    xAxis: hostChartAxis(history, timezone),
+    yAxis: rateAxis,
+    series: [
+      { name: 'Read', type: 'line', showSymbol: false, data: history.map((sample) => sample.disk_read_bytes_per_second), itemStyle: { color: '#343741' } },
+      { name: 'Write', type: 'line', showSymbol: false, data: history.map((sample) => sample.disk_write_bytes_per_second), itemStyle: { color: '#9170B8' } },
+    ],
+  };
+  const unavailable = !host.reachable ? host.last_error || 'Host is unreachable.' : host.resource_observation_error;
+
+  return <article className="host-resource-row">
+    <div className="host-resource-summary">
+      <div className="host-resource-summary__heading">
+        <div><EuiTitle size="xs"><h3>{host.name}</h3></EuiTitle><EuiText size="s" color="subdued">Updated {timeAgo(latest?.observed_at || host.observed_at)}</EuiText></div>
+        <EuiBadge color={host.reachable ? 'success' : 'danger'}>{host.reachable ? 'Live' : 'Unreachable'}</EuiBadge>
+      </div>
+      <div className="host-resource-clusters" aria-label={`${host.name} cluster membership`}>
+        {host.clusters.map((cluster) => <span key={cluster.id} className="host-resource-cluster" style={{ '--item-accent': cluster.theme_color } as React.CSSProperties}>{cluster.name}</span>)}
+      </div>
+      <dl className="host-resource-current">
+        <div><dt>CPU</dt><dd>{latest?.cpu_percent == null ? 'Awaiting sample' : `${latest.cpu_percent.toFixed(1)}%`}</dd></div>
+        <div><dt>Memory</dt><dd>{memory == null ? 'Unavailable' : `${memory}%`}</dd></div>
+        <div><dt>Network</dt><dd>{rate(latest?.network_rx_bytes_per_second)} in</dd></div>
+        <div><dt>Disk I/O</dt><dd>{rate(latest?.disk_write_bytes_per_second)} write</dd></div>
+      </dl>
+      {unavailable && <EuiCallOut size="s" color="warning" title="Resource telemetry unavailable">{unavailable}</EuiCallOut>}
+    </div>
+    <div className="host-resource-charts">
+      <div className="host-resource-chart" role="img" aria-label={`CPU and memory usage for ${host.name}`}><EuiText size="xs" color="subdued">CPU and memory</EuiText><ReactECharts option={resourceChart} style={{ height: 172 }} /></div>
+      <div className="host-resource-chart" role="img" aria-label={`Network bandwidth for ${host.name}`}><EuiText size="xs" color="subdued">Network bandwidth</EuiText><ReactECharts option={networkChart} style={{ height: 172 }} /></div>
+      <div className="host-resource-chart" role="img" aria-label={`Disk I/O for ${host.name}`}><EuiText size="xs" color="subdued">Disk I/O</EuiText><ReactECharts option={diskChart} style={{ height: 172 }} /></div>
+    </div>
+  </article>;
 }
 
 function ClusterOverview({ cluster, selected }: { cluster: ClusterSummary; selected: boolean }) {
@@ -111,6 +191,7 @@ export function DashboardPage() {
   const accessUrls = topology?.access_urls || [];
   const logMonitoring = cluster?.log_monitoring || selectedCluster?.log_monitoring;
   const logsState = monitoringState(logMonitoring);
+  const crossClusterHostUsage = data.cross_cluster_host_usage || [];
   const kibana = accessUrls.find((access) => access.role === 'kibana');
   const logsUrl = kibana && logMonitoring?.filebeat_enabled ? kibanaLogsUrl(kibana.url, cluster?.slug || selectedCluster?.slug || '') : undefined;
   const timezone = controllerSettings?.timezone || 'UTC';
@@ -229,6 +310,10 @@ export function DashboardPage() {
         </section>
         </>}
       </>}
+      <section className="section-band" aria-label="Cross-cluster host resource usage">
+        <div className="section-heading"><div><EuiTitle size="s"><h2>Cross-cluster host resource usage</h2></EuiTitle><EuiText color="subdued">Live host CPU, memory, network bandwidth, and physical disk I/O across cluster members.</EuiText></div></div>
+        {crossClusterHostUsage.length ? <div className="host-resource-list">{crossClusterHostUsage.map((host) => <HostResourceUsage key={host.node_id} host={host} timezone={timezone} />)}</div> : <EuiText color="subdued">No cluster members are reporting resource telemetry yet.</EuiText>}
+      </section>
     </div>
   );
 }

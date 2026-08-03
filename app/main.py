@@ -32,6 +32,16 @@ from fastapi.responses import FileResponse, RedirectResponse, Response, Streamin
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.maintenance_store import MaintenanceRepository, install_maintenance_schema
+from app.maintenance_models import MaintenanceBackend, ProviderType
+from app.maintenance_provider import (
+    OwnershipState,
+    ProviderCapability,
+    ProviderProfile,
+    provider_profile_from_record,
+    require_capability,
+)
+
 PERSISTENT_DATA_DIR = Path("/var/lib/elastic-control")
 
 
@@ -125,6 +135,23 @@ FILEBEAT_RETENTION_DAYS = 30
 UPGRADE_ORDER = ("warm", "hot", "ml", "ingest", "coordinating", "master", "kibana", "fleet-server", "logstash", "elastic-agent")
 WORKLOAD_DEPLOY_ORDER = ("master", "hot", "warm", "ml", "ingest", "coordinating", "kibana", "fleet-server", "logstash", "elastic-agent")
 ZONING_RECONCILE_ORDER = ("hot", "warm", "ml", "ingest", "coordinating", "master")
+
+
+def environment_flag(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+MAINTENANCE_CAPABILITIES = {
+    "planning": environment_flag("MAINTENANCE_PLANNING_ENABLED"),
+    "host_reboot": environment_flag("MAINTENANCE_HOST_REBOOT_ENABLED"),
+    "rolling_restart": environment_flag("MAINTENANCE_ROLLING_RESTART_ENABLED"),
+    "upgrade": environment_flag("MAINTENANCE_UPGRADE_ENABLED"),
+    "evacuation": environment_flag("MAINTENANCE_EVACUATION_ENABLED"),
+    "node_shutdown_backend": environment_flag("MAINTENANCE_NODE_SHUTDOWN_BACKEND_ENABLED"),
+}
 
 
 class Login(BaseModel):
@@ -398,6 +425,45 @@ class ClusterInput(BaseModel):
             result["role_ports"] = default_role_ports(value.get("ports") or {})
             return result
         return value
+
+
+class ClusterProviderUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=1)
+    provider_type: ProviderType
+    ownership_state: OwnershipState
+    maintenance_backend: MaintenanceBackend
+    capability_overrides: dict[str, bool] = Field(default_factory=dict)
+    connection_references: dict[str, str] = Field(default_factory=dict)
+    expected_cluster_uuid: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{8,128}$")
+
+    @field_validator("connection_references")
+    @classmethod
+    def validate_connection_references(cls, value):
+        allowed = {"endpoint_ref", "ca_ref", "credential_ref", "provider_resource_id"}
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ValueError("Unsupported provider connection references: " + ", ".join(unknown))
+        normalized = {}
+        for key, reference in value.items():
+            reference = str(reference).strip()
+            if not reference or len(reference) > 256 or any(char in reference for char in "\r\n\0"):
+                raise ValueError(f"Provider connection reference {key} is invalid")
+            normalized[key] = reference
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_provider_profile(self):
+        ProviderProfile(
+            provider_type=self.provider_type,
+            ownership_state=self.ownership_state,
+            maintenance_backend=self.maintenance_backend,
+            capability_overrides=self.capability_overrides,
+            connection_references=self.connection_references,
+            revision=self.expected_revision,
+        ).capabilities
+        return self
 
 
 class MembershipInput(BaseModel):
@@ -1313,6 +1379,42 @@ def profile_conflict(con, cluster_id, role_ports):
     return None
 
 
+def stored_provider_profile(record):
+    try:
+        return provider_profile_from_record(record)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise HTTPException(409, "Cluster provider metadata is invalid and must be repaired before mutation") from error
+
+
+def require_cluster_capability(con, cluster_id, capability):
+    record = con.execute(
+        "SELECT provider_type,ownership_state,maintenance_backend,provider_capabilities_json,"
+        "provider_connection_json,provider_revision FROM clusters WHERE id=?",
+        (cluster_id,),
+    ).fetchone()
+    if not record:
+        raise HTTPException(404, "Cluster not found")
+    profile = stored_provider_profile(record)
+    try:
+        require_capability(profile, capability)
+    except PermissionError as error:
+        raise HTTPException(409, str(error)) from error
+    return profile
+
+
+def provider_profile_payload(profile, expected_cluster_uuid=None):
+    return {
+        "provider_type": profile.provider_type.value,
+        "ownership_state": profile.ownership_state.value,
+        "maintenance_backend": profile.maintenance_backend.value,
+        "capability_overrides": dict(profile.capability_overrides),
+        "capabilities": profile.capabilities.model_dump(),
+        "connection_references": dict(profile.connection_references),
+        "expected_cluster_uuid": expected_cluster_uuid,
+        "revision": profile.revision,
+    }
+
+
 def cluster_record(con, cluster_id):
     cluster = con.execute("SELECT * FROM clusters WHERE id=?", (cluster_id,)).fetchone()
     if not cluster:
@@ -1326,6 +1428,14 @@ def cluster_record(con, cluster_id):
     result["elasticsearch_settings"] = json.loads(result.pop("elasticsearch_settings_json", "{}") or "{}")
     result["zoning"] = stored_zoning(result.pop("zoning_json", "{}")).model_dump()
     result["log_monitoring"] = log_monitoring_config(result.pop("observability_json", "{}"))
+    profile = stored_provider_profile(result)
+    result["provider"] = provider_profile_payload(profile, result.pop("expected_cluster_uuid", None))
+    result.pop("provider_type", None)
+    result.pop("ownership_state", None)
+    result.pop("maintenance_backend", None)
+    result.pop("provider_capabilities_json", None)
+    result.pop("provider_connection_json", None)
+    result.pop("provider_revision", None)
     zoning_observation = con.execute("SELECT * FROM cluster_zoning_observations WHERE cluster_id=?", (cluster_id,)).fetchone()
     result["zoning_status"] = ({
         **dict(zoning_observation),
@@ -1418,6 +1528,7 @@ def init():
     if old_runtime_keys != SSH_RUNTIME and old_runtime_keys.exists():
         for path in old_runtime_keys.glob("*.key"):
             path.unlink(missing_ok=True)
+    protected_maintenance_run_ids = frozenset()
     with db() as con:
         con.executescript("""
         CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL);
@@ -1501,6 +1612,7 @@ def init():
           podman_socket_active INTEGER NOT NULL DEFAULT 0,
           os_name TEXT NOT NULL DEFAULT '',
           podman_version TEXT NOT NULL DEFAULT '',
+          network_interfaces_json TEXT NOT NULL DEFAULT '{}',
           observed_at TEXT,
           last_error TEXT NOT NULL DEFAULT ''
         );
@@ -1545,6 +1657,8 @@ def init():
             con.execute("ALTER TABLE clusters ADD COLUMN role_ports_json TEXT NOT NULL DEFAULT '{}'")
         if "os_name" not in runtime_columns:
             con.execute("ALTER TABLE host_runtime_observations ADD COLUMN os_name TEXT NOT NULL DEFAULT ''")
+        if "network_interfaces_json" not in runtime_columns:
+            con.execute("ALTER TABLE host_runtime_observations ADD COLUMN network_interfaces_json TEXT NOT NULL DEFAULT '{}'")
         if "secrets_json" not in cluster_columns:
             con.execute("ALTER TABLE clusters ADD COLUMN secrets_json TEXT NOT NULL DEFAULT '{}'")
         cluster_additions = {
@@ -1606,19 +1720,27 @@ def init():
             observability = log_monitoring_config(row["observability_json"])
             if row["observability_json"] != json.dumps(observability, sort_keys=True):
                 con.execute("UPDATE clusters SET observability_json=? WHERE id=?", (json.dumps(observability, sort_keys=True), row["id"]))
+        install_maintenance_schema(con)
+        startup_recovery = MaintenanceRepository(con).prepare_startup_recovery()
+        protected_maintenance_run_ids = startup_recovery.protected_run_ids
         con.execute("DELETE FROM assignments")
         con.execute("DELETE FROM cluster_assignments WHERE cluster_id NOT IN (SELECT id FROM clusters) OR node_id NOT IN (SELECT id FROM nodes)")
         con.execute("DELETE FROM memberships WHERE cluster_id NOT IN (SELECT id FROM clusters) OR node_id NOT IN (SELECT id FROM nodes)")
         con.execute(
-            "UPDATE workload_change_batches SET phase='rolling_back' WHERE run_id IN (SELECT id FROM runs WHERE status IN ('queued','running'))"
+            "UPDATE workload_change_batches SET phase='rolling_back' "
+            "WHERE run_id IN (SELECT id FROM runs WHERE status IN ('queued','running')) "
+            "AND run_id NOT IN (SELECT run_id FROM maintenance_plans WHERE run_id IS NOT NULL)"
         )
         con.execute(
             "UPDATE runs SET status='recovery_required', finished_at=CURRENT_TIMESTAMP, log=log || ? "
-            "WHERE id IN (SELECT run_id FROM workload_change_batches) AND status IN ('queued','running')",
+            "WHERE id IN (SELECT run_id FROM workload_change_batches) AND status IN ('queued','running') "
+            "AND id NOT IN (SELECT run_id FROM maintenance_plans WHERE run_id IS NOT NULL)",
             ("Controller restarted before this workload batch completed; rollback is required.\n",),
         )
         con.execute(
-            "UPDATE runs SET status='failed', finished_at=CURRENT_TIMESTAMP, log=log || ? WHERE status IN ('queued','running')",
+            "UPDATE runs SET status='failed', finished_at=CURRENT_TIMESTAMP, log=log || ? "
+            "WHERE status IN ('queued','running') "
+            "AND id NOT IN (SELECT run_id FROM maintenance_plans WHERE run_id IS NOT NULL)",
             ("Controller restarted before this run completed.\n",),
         )
         if not con.execute("SELECT 1 FROM users WHERE username=?", (ADMIN,)).fetchone():
@@ -1629,6 +1751,9 @@ def init():
         )
     for directory in (INVENTORIES, VARIABLES):
         for path in directory.glob("run-*.yaml"):
+            artifact_run = re.match(r"^run-(\d+)(?:-|\.yaml)", path.name)
+            if artifact_run and int(artifact_run.group(1)) in protected_maintenance_run_ids:
+                continue
             path.unlink(missing_ok=True)
 
 
@@ -2137,6 +2262,89 @@ def active_cluster_operation(con, cluster_name):
         "WHERE clusters.name=? AND cluster_assignments.operation_run_id IS NOT NULL))",
         (cluster_name, cluster_name, cluster_name, cluster_name),
     ).fetchone()
+
+
+def maintenance_conflicts(con, *, cluster_id=None, node_id=None, assignment_id=None):
+    cluster_ids = {int(cluster_id)} if cluster_id is not None else set()
+    node_ids = {int(node_id)} if node_id is not None else set()
+    assignment_ids = {int(assignment_id)} if assignment_id is not None else set()
+
+    if assignment_ids:
+        placeholders = ",".join("?" for _ in assignment_ids)
+        rows = con.execute(
+            "SELECT id,cluster_id,node_id FROM cluster_assignments WHERE id IN (" + placeholders + ")",
+            tuple(sorted(assignment_ids)),
+        ).fetchall()
+        cluster_ids.update(row["cluster_id"] for row in rows)
+        node_ids.update(row["node_id"] for row in rows)
+    if node_ids:
+        placeholders = ",".join("?" for _ in node_ids)
+        cluster_ids.update(
+            row["cluster_id"] for row in con.execute(
+                "SELECT cluster_id FROM memberships WHERE node_id IN (" + placeholders + ")",
+                tuple(sorted(node_ids)),
+            ).fetchall()
+        )
+        cluster_ids.update(
+            row["cluster_id"] for row in con.execute(
+                "SELECT cluster_id FROM cluster_assignments WHERE node_id IN (" + placeholders + ")",
+                tuple(sorted(node_ids)),
+            ).fetchall()
+        )
+    if cluster_ids:
+        placeholders = ",".join("?" for _ in cluster_ids)
+        cluster_rows = con.execute(
+            "SELECT id,node_id FROM cluster_assignments WHERE cluster_id IN (" + placeholders + ")",
+            tuple(sorted(cluster_ids)),
+        ).fetchall()
+        assignment_ids.update(row["id"] for row in cluster_rows)
+        node_ids.update(row["node_id"] for row in cluster_rows)
+        node_ids.update(
+            row["node_id"] for row in con.execute(
+                "SELECT node_id FROM memberships WHERE cluster_id IN (" + placeholders + ")",
+                tuple(sorted(cluster_ids)),
+            ).fetchall()
+        )
+
+    clauses = []
+    parameters = []
+    for column, values in (
+        ("target_node_id", node_ids),
+        ("target_cluster_id", cluster_ids),
+        ("target_assignment_id", assignment_ids),
+    ):
+        if values:
+            clauses.append(column + " IN (" + ",".join("?" for _ in values) + ")")
+            parameters.extend(sorted(values))
+    if clauses and con.execute(
+        "SELECT 1 FROM maintenance_plans WHERE lifecycle_state IN "
+        "('ready','executing','paused','recovery_required') AND (" + " OR ".join(clauses) + ") LIMIT 1",
+        parameters,
+    ).fetchone():
+        return True
+
+    lock_scopes = []
+    lock_parameters = []
+    for scope, values in (
+        ("host", node_ids),
+        ("cluster", cluster_ids),
+        ("assignment", assignment_ids),
+    ):
+        if values:
+            lock_scopes.append(
+                "(scope_kind=? AND scope_id IN (" + ",".join("?" for _ in values) + "))"
+            )
+            lock_parameters.extend((scope, *(str(value) for value in sorted(values))))
+    return bool(lock_scopes and con.execute(
+        "SELECT 1 FROM maintenance_locks WHERE released_at IS NULL AND ("
+        + " OR ".join(lock_scopes) + ") LIMIT 1",
+        lock_parameters,
+    ).fetchone())
+
+
+def require_no_maintenance_conflict(con, **scope):
+    if maintenance_conflicts(con, **scope):
+        raise HTTPException(409, "An active maintenance operation covers this host, cluster, or workload")
 
 
 def active_assignments_for_change_set(con, cluster_id):
@@ -2819,6 +3027,23 @@ async def health():
     return {"status": "ok", "roles": [{"id": key, "label": value["label"]} for key, value in ROLE_SPECS.items()]}
 
 
+@app.get("/api/maintenance/capabilities")
+async def maintenance_capabilities(_: Annotated[str, Depends(user)]):
+    return {
+        "planning": MAINTENANCE_CAPABILITIES["planning"],
+        "operations": {
+            "host_reboot": MAINTENANCE_CAPABILITIES["host_reboot"],
+            "rolling_restart": MAINTENANCE_CAPABILITIES["rolling_restart"],
+            "upgrade": MAINTENANCE_CAPABILITIES["upgrade"],
+            "evacuation": MAINTENANCE_CAPABILITIES["evacuation"],
+        },
+        "backends": {
+            "documented_rolling": True,
+            "node_shutdown": MAINTENANCE_CAPABILITIES["node_shutdown_backend"],
+        },
+    }
+
+
 @app.post("/api/auth/login")
 async def login(input: Login):
     with db() as con:
@@ -3029,6 +3254,8 @@ async def create_node(input: Node, _: Annotated[str, Depends(user)]):
 async def install_controller_key(node_id: int, input: KeyInstall, request: Request, username: Annotated[str, Depends(user)]):
     with db() as con:
         row = con.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
+        if row:
+            require_no_maintenance_conflict(con, node_id=node_id)
     if not row:
         raise HTTPException(404, "Node not found")
     node = dict(row)
@@ -3042,6 +3269,7 @@ async def update_node(node_id: int, input: NodeUpdate, username: Annotated[str, 
         existing = con.execute("SELECT ssh_host_key FROM nodes WHERE id=?", (node_id,)).fetchone()
         if not existing:
             raise HTTPException(404, "Node not found")
+        require_no_maintenance_conflict(con, node_id=node_id)
         host_key = normalize_ssh_host_key(input.ssh_host_key) if input.ssh_host_key is not None else existing["ssh_host_key"]
         cursor = con.execute(
             "UPDATE nodes SET name=?,address=?,ssh_port=?,ssh_user=?,enabled=?,ssh_host_key=? WHERE id=?",
@@ -3068,6 +3296,7 @@ async def update_node_zone(node_id: int, input: HostZoneInput, username: Annotat
         node = con.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
         if not node:
             raise HTTPException(404, "Node not found")
+        require_no_maintenance_conflict(con, node_id=node_id)
         validate_host_zone_change(con, node_id, input.cluster_id, input.zone_id)
         previous = node["zone_id"]
         if previous == input.zone_id:
@@ -3116,6 +3345,7 @@ async def remove_legacy_known_hosts_record(node_id: int, username: Annotated[str
         node = con.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
         if not node:
             raise HTTPException(404, "Node not found")
+        require_no_maintenance_conflict(con, node_id=node_id)
         if node["ssh_auth_state"] != "legacy":
             raise HTTPException(409, "This host is not using legacy SSH host-key trust")
         con.execute("UPDATE nodes SET legacy_known_hosts_disabled=1 WHERE id=?", (node_id,))
@@ -3132,6 +3362,7 @@ async def delete_node(node_id: int, username: Annotated[str, Depends(user)], rev
         node = con.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
         if not node:
             raise HTTPException(404, "Node not found")
+        require_no_maintenance_conflict(con, node_id=node_id)
         if con.execute("SELECT 1 FROM memberships WHERE node_id=?", (node_id,)).fetchone():
             raise HTTPException(409, "Remove this host from clusters before deleting its inventory record")
         if revoke_controller_key and records_only:
@@ -3226,12 +3457,76 @@ async def get_cluster(cluster_id: int, _: Annotated[str, Depends(user)]):
         return cluster_record(con, cluster_id)
 
 
+@app.get("/api/clusters/{cluster_id}/provider")
+async def get_cluster_provider(cluster_id: int, _: Annotated[str, Depends(user)]):
+    with db() as con:
+        record = con.execute("SELECT * FROM clusters WHERE id=?", (cluster_id,)).fetchone()
+        if not record:
+            raise HTTPException(404, "Cluster not found")
+        return provider_profile_payload(stored_provider_profile(record), record["expected_cluster_uuid"])
+
+
+@app.put("/api/clusters/{cluster_id}/provider")
+async def update_cluster_provider(
+    cluster_id: int,
+    input: ClusterProviderUpdate,
+    username: Annotated[str, Depends(user)],
+):
+    with db() as con:
+        record = con.execute("SELECT * FROM clusters WHERE id=?", (cluster_id,)).fetchone()
+        if not record:
+            raise HTTPException(404, "Cluster not found")
+        require_no_maintenance_conflict(con, cluster_id=cluster_id)
+        current = stored_provider_profile(record)
+        if current.revision != input.expected_revision:
+            raise HTTPException(409, "Cluster provider metadata changed; reload before saving")
+        if (current.provider_type != input.provider_type or current.maintenance_backend != input.maintenance_backend):
+            if con.execute("SELECT 1 FROM cluster_assignments WHERE cluster_id=? LIMIT 1", (cluster_id,)).fetchone():
+                raise HTTPException(409, "Remove managed assignments before changing provider type or backend")
+        profile = ProviderProfile(
+            provider_type=input.provider_type,
+            ownership_state=input.ownership_state,
+            maintenance_backend=input.maintenance_backend,
+            capability_overrides=input.capability_overrides,
+            connection_references=input.connection_references,
+            revision=current.revision + 1,
+        )
+        con.execute(
+            "UPDATE clusters SET provider_type=?,ownership_state=?,maintenance_backend=?,"
+            "provider_capabilities_json=?,provider_connection_json=?,expected_cluster_uuid=?,"
+            "provider_revision=provider_revision+1 WHERE id=? AND provider_revision=?",
+            (
+                profile.provider_type.value,
+                profile.ownership_state.value,
+                profile.maintenance_backend.value,
+                json.dumps(dict(profile.capability_overrides), sort_keys=True),
+                json.dumps(dict(profile.connection_references), sort_keys=True),
+                input.expected_cluster_uuid,
+                cluster_id,
+                input.expected_revision,
+            ),
+        )
+        con.execute(
+            "INSERT INTO audit_events(username,action,cluster_id,item_id,detail) VALUES (?,?,?,?,?)",
+            (
+                username,
+                "cluster_provider_updated",
+                cluster_id,
+                str(cluster_id),
+                f"{profile.provider_type.value}:{profile.ownership_state.value}:revision={profile.revision}",
+            ),
+        )
+        return provider_profile_payload(profile, input.expected_cluster_uuid)
+
+
 @app.put("/api/clusters/{cluster_id}")
 async def update_cluster(cluster_id: int, input: ClusterInput, _: Annotated[str, Depends(user)]):
     slug = slugify(input.name)
     try:
         with db() as con:
             cluster_record(con, cluster_id)
+            require_no_maintenance_conflict(con, cluster_id=cluster_id)
+            require_cluster_capability(con, cluster_id, ProviderCapability.CLUSTER_SETTINGS)
             conflict = profile_conflict(con, cluster_id, input.role_ports.model_dump(by_alias=True))
             if conflict:
                 raise HTTPException(409, conflict)
@@ -3265,6 +3560,8 @@ async def get_cluster_zoning(cluster_id: int, _: Annotated[str, Depends(user)]):
 async def update_cluster_zoning(cluster_id: int, zoning: ZoningConfig, username: Annotated[str, Depends(user)]):
     with db() as con:
         cluster = cluster_record(con, cluster_id)
+        require_no_maintenance_conflict(con, cluster_id=cluster_id)
+        require_cluster_capability(con, cluster_id, ProviderCapability.CLUSTER_SETTINGS)
         validate_zoning_catalog_update(con, cluster_id, zoning)
         con.execute("UPDATE clusters SET zoning_json=? WHERE id=?", (zoning.model_dump_json(), cluster_id))
         con.execute(
@@ -3280,6 +3577,9 @@ async def update_cluster_zoning(cluster_id: int, zoning: ZoningConfig, username:
 
 @app.post("/api/clusters/{cluster_id}/zoning/apply")
 async def apply_cluster_zoning(cluster_id: int, _: Annotated[str, Depends(user)]):
+    with db() as con:
+        require_no_maintenance_conflict(con, cluster_id=cluster_id)
+        require_cluster_capability(con, cluster_id, ProviderCapability.CLUSTER_SETTINGS)
     return {"run_id": launch_zoning_apply(cluster_id)}
 
 
@@ -3293,6 +3593,8 @@ async def get_cluster_log_monitoring(cluster_id: int, _: Annotated[str, Depends(
 async def update_cluster_log_monitoring(cluster_id: int, input: LogMonitoringInput, username: Annotated[str, Depends(user)]):
     with db() as con:
         cluster = cluster_record(con, cluster_id)
+        require_no_maintenance_conflict(con, cluster_id=cluster_id)
+        require_cluster_capability(con, cluster_id, ProviderCapability.WORKLOAD_MUTATION)
         if active_cluster_operation(con, cluster["name"]):
             raise HTTPException(409, "Wait for the active cluster operation to finish")
         settings = {"filebeat_enabled": input.filebeat_enabled, "retention_days": FILEBEAT_RETENTION_DAYS}
@@ -3338,6 +3640,8 @@ async def refresh_cluster_versions(cluster_id: int, _: Annotated[str, Depends(us
 async def download_cluster_versions(cluster_id: int, input: VersionTargetInput, _: Annotated[str, Depends(user)]):
     with db() as con:
         cluster = cluster_record(con, cluster_id)
+        require_no_maintenance_conflict(con, cluster_id=cluster_id)
+        require_cluster_capability(con, cluster_id, ProviderCapability.WORKLOAD_MUTATION)
         if con.execute("SELECT 1 FROM runs WHERE status IN ('queued','running') AND target LIKE ?", (cluster["name"] + ":%",)).fetchone():
             raise HTTPException(409, "Wait for the active cluster operation to finish")
     candidates = await asyncio.to_thread(available_versions, cluster["assignments"], cluster["log_monitoring"]["filebeat_enabled"])
@@ -3359,6 +3663,8 @@ async def download_cluster_versions(cluster_id: int, input: VersionTargetInput, 
 async def upgrade_cluster(cluster_id: int, input: VersionTargetInput, _: Annotated[str, Depends(user)]):
     with db() as con:
         cluster = cluster_record(con, cluster_id)
+        require_cluster_capability(con, cluster_id, ProviderCapability.WORKLOAD_MUTATION)
+        require_cluster_capability(con, cluster_id, ProviderCapability.LIFECYCLE_API)
     candidates = await asyncio.to_thread(available_versions, cluster["assignments"], cluster["log_monitoring"]["filebeat_enabled"])
     return {"run_id": launch_upgrade(cluster_id, input.target_version, candidates)}
 
@@ -3508,6 +3814,7 @@ async def cluster_topology(cluster_id: int, _: Annotated[str, Depends(user)]):
 async def delete_cluster(cluster_id: int, _: Annotated[str, Depends(user)]):
     with db() as con:
         count = con.execute("SELECT count(*) FROM cluster_assignments WHERE cluster_id=?", (cluster_id,)).fetchone()[0]
+        require_no_maintenance_conflict(con, cluster_id=cluster_id)
         if count:
             raise HTTPException(409, "Detach or purge all roles before deleting the cluster")
         cursor = con.execute("DELETE FROM clusters WHERE id=?", (cluster_id,))
@@ -3522,6 +3829,8 @@ async def add_member(cluster_id: int, input: MembershipInput, _: Annotated[str, 
     validate_membership_network(input)
     with db() as con:
         cluster = cluster_record(con, cluster_id)
+        require_no_maintenance_conflict(con, cluster_id=cluster_id)
+        require_cluster_capability(con, cluster_id, ProviderCapability.WORKLOAD_MUTATION)
         node = con.execute("SELECT enabled,zone_id FROM nodes WHERE id=?", (input.node_id,)).fetchone()
         if not node:
             raise HTTPException(404, "Node not found")
@@ -3552,6 +3861,8 @@ async def update_member(cluster_id: int, node_id: int, input: MembershipInput, _
     validate_membership_network(input)
     with db() as con:
         cluster = cluster_record(con, cluster_id)
+        require_no_maintenance_conflict(con, cluster_id=cluster_id)
+        require_cluster_capability(con, cluster_id, ProviderCapability.WORKLOAD_MUTATION)
         node = con.execute("SELECT zone_id FROM nodes WHERE id=?", (node_id,)).fetchone()
         if not node:
             raise HTTPException(404, "Node not found")
@@ -3565,6 +3876,8 @@ async def update_member(cluster_id: int, node_id: int, input: MembershipInput, _
 @app.delete("/api/clusters/{cluster_id}/members/{node_id}", status_code=204)
 async def remove_member(cluster_id: int, node_id: int, _: Annotated[str, Depends(user)]):
     with db() as con:
+        require_no_maintenance_conflict(con, cluster_id=cluster_id)
+        require_cluster_capability(con, cluster_id, ProviderCapability.WORKLOAD_MUTATION)
         if con.execute("SELECT 1 FROM cluster_assignments WHERE cluster_id=? AND node_id=?", (cluster_id, node_id)).fetchone():
             raise HTTPException(409, "Detach or purge the host roles first")
         con.execute("DELETE FROM memberships WHERE cluster_id=? AND node_id=?", (cluster_id, node_id))
@@ -3575,6 +3888,8 @@ async def add_assignment(cluster_id: int, input: AssignmentInput, _: Annotated[s
     validate_config(input.role, input.config)
     with db() as con:
         cluster_record(con, cluster_id)
+        require_no_maintenance_conflict(con, cluster_id=cluster_id)
+        require_cluster_capability(con, cluster_id, ProviderCapability.WORKLOAD_MUTATION)
         if not con.execute("SELECT 1 FROM memberships WHERE cluster_id=? AND node_id=?", (cluster_id, input.node_id)).fetchone():
             raise HTTPException(422, "Add the host to this cluster first")
         conflict = conflict_message(con, cluster_id, input.node_id, input.role)
@@ -3594,6 +3909,9 @@ async def add_assignment(cluster_id: int, input: AssignmentInput, _: Annotated[s
 
 @app.post("/api/clusters/{cluster_id}/workload-changes/apply")
 async def apply_workload_changes(cluster_id: int, input: WorkloadChangeSet, _: Annotated[str, Depends(user)]):
+    with db() as con:
+        require_no_maintenance_conflict(con, cluster_id=cluster_id)
+        require_cluster_capability(con, cluster_id, ProviderCapability.WORKLOAD_MUTATION)
     return {"run_id": launch_workload_change_batch(cluster_id, input)}
 
 
@@ -3602,6 +3920,8 @@ async def update_resources(assignment_id: int, input: ResourceInput, _: Annotate
     update = input.model_dump()
     with db() as con:
         row = assignment_record(con, assignment_id)
+        require_no_maintenance_conflict(con, assignment_id=assignment_id)
+        require_cluster_capability(con, row["cluster_id"], ProviderCapability.WORKLOAD_MUTATION)
         if row["operation_run_id"]:
             raise HTTPException(409, "This workload is already part of an active change set")
         require_ready_membership(row)
@@ -3620,6 +3940,8 @@ async def update_resources(assignment_id: int, input: ResourceInput, _: Annotate
 async def apply_assignment(assignment_id: int, _: Annotated[str, Depends(user)]):
     with db() as con:
         row = assignment_record(con, assignment_id)
+        require_no_maintenance_conflict(con, assignment_id=assignment_id)
+        require_cluster_capability(con, row["cluster_id"], ProviderCapability.WORKLOAD_MUTATION)
         if row["operation_run_id"]:
             raise HTTPException(409, "This workload is already part of an active change set")
         if not con.execute("SELECT enabled FROM nodes WHERE id=?", (row["node_id"],)).fetchone()["enabled"]:
@@ -3636,6 +3958,8 @@ async def remove_assignment(assignment_id: int, _: Annotated[str, Depends(user)]
         raise HTTPException(422, "Removal mode must be detach or purge")
     with db() as con:
         row = assignment_record(con, assignment_id)
+        require_no_maintenance_conflict(con, assignment_id=assignment_id)
+        require_cluster_capability(con, row["cluster_id"], ProviderCapability.WORKLOAD_MUTATION)
         if row["operation_run_id"]:
             raise HTTPException(409, "This workload is already part of an active change set")
         initial_master = con.execute(
@@ -3659,6 +3983,8 @@ async def remove_assignment(assignment_id: int, _: Annotated[str, Depends(user)]
 @app.post("/api/hosts/initialize")
 async def initialize_hosts(input: Targets, _: Annotated[str, Depends(user)]):
     with db() as con:
+        for node_id in input.node_ids:
+            require_no_maintenance_conflict(con, node_id=node_id)
         selected = con.execute("SELECT name FROM nodes WHERE enabled=1 AND id IN (" + ",".join("?" * len(input.node_ids)) + ")", input.node_ids).fetchall()
     return {"run_ids": [launch("host-init", row["name"], lambda inv, _variables, name=row["name"]: [
         "ansible-playbook", "-i", str(inv), str(PLAYBOOKS / "host-init.yml"), "--limit", name, "--private-key", active_ssh_key_path(),
@@ -3699,8 +4025,10 @@ async def events(run_id: int, request: Request, token: str = ""):
 
 
 from app import console
+from app import maintenance_api
 
 app.include_router(console.router)
+app.include_router(maintenance_api.router)
 
 
 @app.get("/{frontend_path:path}", include_in_schema=False)

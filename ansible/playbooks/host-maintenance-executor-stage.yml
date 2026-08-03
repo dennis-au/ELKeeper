@@ -1,0 +1,212 @@
+---
+- name: Stage disabled-by-default one-shot host maintenance executor
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    maintenance_executor_root: /var/lib/elastic-control/maintenance
+    maintenance_executor_operations_dir: "{{ maintenance_executor_root }}/operations"
+    maintenance_executor_operation_dir: "{{ maintenance_executor_operations_dir }}/{{ maintenance_executor_operation_id }}"
+    maintenance_executor_manifest_path: "{{ maintenance_executor_operation_dir }}/manifest.json"
+    maintenance_executor_public_key_path: "{{ maintenance_executor_operation_dir }}/signing-key.pem"
+    maintenance_executor_checkpoint_path: "{{ maintenance_executor_operation_dir }}/checkpoint.json"
+    maintenance_executor_result_path: "{{ maintenance_executor_operation_dir }}/result.json"
+    maintenance_executor_instance: "ecp-maintenance-resume@{{ maintenance_executor_operation_id }}.service"
+  tasks:
+    - name: Require explicit executor staging opt-in and bounded inputs
+      ansible.builtin.assert:
+        that:
+          - maintenance_executor_stage_enabled | default(false) | bool
+          - maintenance_executor_operation_id is defined
+          - maintenance_executor_operation_id is match('^[0-9a-f]{32}$')
+          - maintenance_executor_manifest_json is defined
+          - maintenance_executor_manifest_json is string
+          - maintenance_executor_manifest_json | length > 0
+          - maintenance_executor_manifest_json | length <= 262144
+          - maintenance_executor_manifest_json | trim == maintenance_executor_manifest_json
+          - maintenance_executor_public_key_pem is defined
+          - maintenance_executor_public_key_pem is string
+          - maintenance_executor_public_key_pem | length > 0
+          - maintenance_executor_public_key_pem | length <= 16384
+          - maintenance_executor_checkpoint_json is defined
+          - maintenance_executor_checkpoint_json is string
+          - maintenance_executor_checkpoint_json | length > 0
+          - maintenance_executor_checkpoint_json | length <= 65536
+          - maintenance_executor_checkpoint_json | trim == maintenance_executor_checkpoint_json
+        fail_msg: Maintenance executor staging is disabled or its signed inputs are invalid.
+
+    - name: Verify controller-owned host initialization marker
+      ansible.builtin.stat:
+        path: /etc/elastic-control-host-init
+        follow: false
+      register: maintenance_host_init_marker
+
+    - name: Require initialized managed host
+      ansible.builtin.assert:
+        that:
+          - maintenance_host_init_marker.stat.exists
+          - maintenance_host_init_marker.stat.isreg
+          - not maintenance_host_init_marker.stat.islnk
+          - maintenance_host_init_marker.stat.uid == 0
+        fail_msg: The host is not initialized inside the ELKeeper ownership boundary.
+
+    - name: Inspect existing executor directories
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - /var/lib/elastic-control
+        - "{{ maintenance_executor_root }}"
+        - "{{ maintenance_executor_operations_dir }}"
+        - "{{ maintenance_executor_operation_dir }}"
+      register: maintenance_executor_existing_directories
+
+    - name: Reject unsafe existing executor directories
+      ansible.builtin.assert:
+        that:
+          - not item.stat.exists or (item.stat.isdir and not item.stat.islnk and item.stat.uid == 0)
+        fail_msg: Existing maintenance executor path is not a root-owned directory.
+      loop: "{{ maintenance_executor_existing_directories.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Create fixed controller-owned executor directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: /var/lib/elastic-control, mode: "0750" }
+        - { path: "{{ maintenance_executor_root }}", mode: "0700" }
+        - { path: "{{ maintenance_executor_operations_dir }}", mode: "0700" }
+        - { path: "{{ maintenance_executor_operation_dir }}", mode: "0700" }
+
+    - name: Inspect existing staged executor files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - "{{ maintenance_executor_manifest_path }}"
+        - "{{ maintenance_executor_public_key_path }}"
+        - "{{ maintenance_executor_checkpoint_path }}"
+        - "{{ maintenance_executor_result_path }}"
+      register: maintenance_executor_existing_state
+
+    - name: Reject unsafe existing staged executor files
+      ansible.builtin.assert:
+        that:
+          - not item.stat.exists or (item.stat.isreg and not item.stat.islnk and item.stat.uid == 0 and item.stat.mode == '0600')
+        fail_msg: Existing staged executor file is not a root-owned regular 0600 file.
+      loop: "{{ maintenance_executor_existing_state.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Refuse staging over an existing executor result
+      ansible.builtin.assert:
+        that:
+          - not maintenance_executor_existing_state.results[3].stat.exists
+        fail_msg: A result already exists for this operation; import or clean it through the controller first.
+
+    - name: Read an existing operation manifest for idempotency validation
+      ansible.builtin.slurp:
+        path: "{{ maintenance_executor_manifest_path }}"
+      register: maintenance_executor_existing_manifest
+      when: maintenance_executor_existing_state.results[0].stat.exists
+      no_log: true
+
+    - name: Refuse to overwrite a different operation manifest
+      ansible.builtin.assert:
+        that:
+          - maintenance_executor_existing_manifest.content | b64decode == maintenance_executor_manifest_json ~ '\n'
+        fail_msg: A different manifest is already staged for this operation identifier.
+      when: maintenance_executor_existing_state.results[0].stat.exists
+      no_log: true
+
+    - name: Read existing verification key for idempotency validation
+      ansible.builtin.slurp:
+        path: "{{ maintenance_executor_public_key_path }}"
+      register: maintenance_executor_existing_public_key
+      when: maintenance_executor_existing_state.results[1].stat.exists
+      no_log: true
+
+    - name: Refuse to overwrite a different verification key
+      ansible.builtin.assert:
+        that:
+          - maintenance_executor_existing_public_key.content | b64decode == maintenance_executor_public_key_pem
+        fail_msg: A different verification key is already staged for this operation identifier.
+      when: maintenance_executor_existing_state.results[1].stat.exists
+      no_log: true
+
+    - name: Read existing pre-reboot checkpoint for idempotency validation
+      ansible.builtin.slurp:
+        path: "{{ maintenance_executor_checkpoint_path }}"
+      register: maintenance_executor_existing_checkpoint
+      when: maintenance_executor_existing_state.results[2].stat.exists
+      no_log: true
+
+    - name: Refuse to overwrite a changed pre-reboot checkpoint
+      ansible.builtin.assert:
+        that:
+          - maintenance_executor_existing_checkpoint.content | b64decode == maintenance_executor_checkpoint_json ~ '\n'
+        fail_msg: The staged checkpoint has changed and requires controller recovery.
+      when: maintenance_executor_existing_state.results[2].stat.exists
+      no_log: true
+
+    - name: Create fixed executor installation directory
+      ansible.builtin.file:
+        path: /usr/libexec/elkeeper
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Install bounded one-shot executor
+      ansible.builtin.template:
+        src: ../templates/ecp-maintenance-resume.py.j2
+        dest: /usr/libexec/elkeeper/ecp-maintenance-resume
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Install exact one-shot systemd template
+      ansible.builtin.template:
+        src: ../templates/ecp-maintenance-resume@.service.j2
+        dest: /etc/systemd/system/ecp-maintenance-resume@.service
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Stage signed executor manifest
+      ansible.builtin.copy:
+        dest: "{{ maintenance_executor_manifest_path }}"
+        content: "{{ maintenance_executor_manifest_json }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Stage public verification key
+      ansible.builtin.copy:
+        dest: "{{ maintenance_executor_public_key_path }}"
+        content: "{{ maintenance_executor_public_key_pem }}"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Stage pre-reboot checkpoint
+      ansible.builtin.copy:
+        dest: "{{ maintenance_executor_checkpoint_path }}"
+        content: "{{ maintenance_executor_checkpoint_json }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Enable executor instance for the next boot without starting it
+      ansible.builtin.systemd:
+        name: "{{ maintenance_executor_instance }}"
+        enabled: true
+        daemon_reload: true

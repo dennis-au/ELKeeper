@@ -1,4 +1,4 @@
-import type { Cluster, ControllerSettings, DashboardSnapshot, NodeRecord, RunRecord } from './types';
+import type { Cluster, ControllerSettings, DashboardSnapshot, MaintenanceCapabilities, NodeRecord, RunRecord } from './types';
 
 const TOKEN_KEY = 'elastic-control-token';
 
@@ -38,6 +38,7 @@ export const queries = {
   runs: () => api<RunRecord[]>('/api/runs'),
   dashboard: () => api<DashboardSnapshot>('/api/dashboard/snapshot'),
   controllerSettings: () => api<ControllerSettings>('/api/controller/settings'),
+  maintenanceCapabilities: () => api<MaintenanceCapabilities>('/api/maintenance/capabilities'),
 };
 
 export function jsonBody(value: unknown): RequestInit {

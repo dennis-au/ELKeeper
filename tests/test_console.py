@@ -331,12 +331,16 @@ class ConsoleApiTests(unittest.TestCase):
                 if kwargs["headers"]["Authorization"] == "ApiKey stale-key":
                     return Response({}, 401)
                 payloads = {
-                    "/_cluster/health?level=indices": {"status": "green", "number_of_nodes": 1, "number_of_data_nodes": 1, "indices": {}},
+                    "/_cluster/health?level=indices": {
+                        "cluster_name": "lab-a", "cluster_uuid": "cluster-uuid-a",
+                        "status": "green", "number_of_nodes": 1, "number_of_data_nodes": 1, "indices": {},
+                    },
                     "/_cluster/stats": {"indices": {"count": 1, "docs": {"count": 2}, "store": {"size_in_bytes": 3}}},
                     "/_nodes/stats/fs,jvm,process,os": {"nodes": {}},
                     "/_cluster/pending_tasks": {"tasks": []},
                     "/_cluster/settings?include_defaults=true&flat_settings=true": {},
                     "/_cat/allocation?format=json&bytes=b&h=node,shards": [],
+                    "/_nodes/shutdown": {"nodes": []},
                 }
                 return Response(payloads[path])
 
@@ -349,14 +353,38 @@ class ConsoleApiTests(unittest.TestCase):
         state = manager.cluster_states[cluster_id]
         replacement = "ApiKey " + self.main.console.base64.b64encode(b"replacement-id:replacement-key").decode()
         self.assertEqual(state["status"], "green", state)
+        self.assertEqual(state["cluster_name"], "lab-a")
+        self.assertEqual(state["cluster_uuid"], "cluster-uuid-a")
+        self.assertFalse(state["stale_shutdown_record"])
+        self.assertEqual(state["initializing_shards"], 0)
+        self.assertEqual(state["relocating_shards"], 0)
         self.assertEqual(state["last_error"], "")
         self.assertEqual(Client.instances[0].kwargs["base_url"], "https://192.0.2.102:9210")
         self.assertEqual(len(Client.post_calls), 1)
         self.assertTrue(any(call[1]["headers"]["Authorization"] == "ApiKey stale-key" for call in Client.get_calls))
         self.assertTrue(any(call[1]["headers"]["Authorization"] == replacement for call in Client.get_calls))
         with self.main.db() as con:
-            stored = self.main.open_config(con.execute("SELECT secrets_json FROM clusters WHERE id=?", (cluster_id,)).fetchone()["secrets_json"])
+            cluster_row = con.execute(
+                "SELECT secrets_json,expected_cluster_uuid FROM clusters WHERE id=?", (cluster_id,),
+            ).fetchone()
+            stored = self.main.open_config(cluster_row["secrets_json"])
         self.assertEqual(stored["monitoring_api_key"], replacement.removeprefix("ApiKey "))
+        self.assertEqual(cluster_row["expected_cluster_uuid"], "cluster-uuid-a")
+
+    def test_parse_network_interfaces_uses_structured_ip_json(self):
+        parsed = self.main.console.parse_network_interfaces([
+            {
+                "ifname": "ens18",
+                "addr_info": [
+                    {"family": "inet", "local": "192.0.2.101", "prefixlen": 24},
+                    {"family": "inet6", "local": "2001:db8::101", "prefixlen": 64},
+                ],
+            },
+            {"ifname": "lo", "addr_info": [{"family": "inet", "local": "127.0.0.1"}]},
+        ])
+
+        self.assertEqual(parsed["ens18"], ["192.0.2.101", "2001:db8::101"])
+        self.assertEqual(parsed["lo"], ["127.0.0.1"])
 
     def test_node_breakdown_classifies_tiers_and_combines_allocation(self):
         breakdown = self.main.console.node_breakdown({
@@ -387,6 +415,255 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual([(item["zone"], item["nodes"], item["shards"]) for item in zones], [
             ("zone-a", 1, 7), ("zone-b", 1, 4), ("unassigned", 1, 0),
         ])
+
+    def test_host_resource_rates_use_counter_deltas_and_ignore_counter_resets(self):
+        previous = {
+            "observed_at": "2026-08-03T10:00:00Z",
+            "cpu_total": 1_000, "cpu_idle": 400,
+            "memory_total_bytes": 8_000, "memory_available_bytes": 3_000,
+            "network_rx_bytes": 10_000, "network_tx_bytes": 20_000,
+            "disk_read_bytes": 30_000, "disk_write_bytes": 40_000,
+        }
+        current = {
+            "observed_at": "2026-08-03T10:00:10Z",
+            "cpu_total": 1_200, "cpu_idle": 450,
+            "memory_total_bytes": 8_000, "memory_available_bytes": 2_000,
+            "network_rx_bytes": 11_000, "network_tx_bytes": 22_500,
+            "disk_read_bytes": 31_500, "disk_write_bytes": 43_000,
+        }
+
+        sample = self.main.console.host_resource_rates(previous, current)
+        self.assertEqual(sample["cpu_percent"], 75.0)
+        self.assertEqual(sample["memory_usage_bytes"], 6_000)
+        self.assertEqual(sample["network_rx_bytes_per_second"], 100.0)
+        self.assertEqual(sample["network_tx_bytes_per_second"], 250.0)
+        self.assertEqual(sample["disk_read_bytes_per_second"], 150.0)
+        self.assertEqual(sample["disk_write_bytes_per_second"], 300.0)
+
+        reset = {**current, "observed_at": "2026-08-03T10:00:20Z", "network_rx_bytes": 100, "disk_read_bytes": 200}
+        reset_sample = self.main.console.host_resource_rates(current, reset)
+        self.assertIsNone(reset_sample["network_rx_bytes_per_second"])
+        self.assertIsNone(reset_sample["disk_read_bytes_per_second"])
+
+    def test_ssh_pool_reuses_one_master_connection_per_host(self):
+        node = {
+            "id": 7, "address": "192.0.2.107", "ssh_port": 22, "ssh_user": "root",
+            "ssh_host_key": "", "ssh_auth_state": "managed",
+        }
+        pool = self.main.console.SSHConnectionPool()
+        created = []
+
+        class Process:
+            def __init__(self, running=False):
+                self.returncode = None if running else 0
+                self.stderr = SimpleNamespace(read=AsyncMock(return_value=b""))
+
+            def terminate(self):
+                self.returncode = 0
+
+            def kill(self):
+                self.returncode = -9
+
+            async def wait(self):
+                return self.returncode
+
+            async def communicate(self):
+                return b"ok\n", b""
+
+        async def fake_exec(*args, **kwargs):
+            created.append((args, kwargs))
+            if "-N" in args:
+                process = Process(running=True)
+                pool.control_path(node).parent.mkdir(parents=True, exist_ok=True)
+                pool.control_path(node).touch()
+                return process
+            return Process()
+
+        async def exercise():
+            with patch.object(self.main.console.asyncio, "create_subprocess_exec", new=fake_exec):
+                self.assertEqual(await pool.run(node, ("printf", "one")), b"ok\n")
+                self.assertEqual(await pool.run(node, ("printf", "two")), b"ok\n")
+            await pool.close()
+
+        asyncio.run(exercise())
+        masters = [args for args, _kwargs in created if "-N" in args]
+        commands = [args for args, _kwargs in created if "-N" not in args]
+        self.assertEqual(len(masters), 1)
+        self.assertEqual(len(commands), 2)
+        self.assertIn("ControlMaster=yes", masters[0])
+        self.assertTrue(any("ControlMaster=auto" in value for value in commands[0]))
+
+    def test_ssh_pool_discards_dead_master_after_command_failure(self):
+        node = {
+            "id": 8, "address": "192.0.2.108", "ssh_port": 22, "ssh_user": "root",
+            "ssh_host_key": "", "ssh_auth_state": "managed",
+        }
+        pool = self.main.console.SSHConnectionPool()
+        created = []
+        fail_next = [True]
+
+        class Process:
+            def __init__(self, running=False, failed=False):
+                self.returncode = None if running else (1 if failed else 0)
+                self.stderr = SimpleNamespace(read=AsyncMock(return_value=b"connection closed"))
+
+            def terminate(self):
+                self.returncode = 0
+
+            def kill(self):
+                self.returncode = -9
+
+            async def wait(self):
+                return self.returncode
+
+            async def communicate(self):
+                return (b"", b"command failed") if self.returncode else (b"recovered\n", b"")
+
+        async def fake_exec(*args, **kwargs):
+            created.append(args)
+            if "-N" in args:
+                process = Process(running=True)
+                pool.control_path(node).parent.mkdir(parents=True, exist_ok=True)
+                pool.control_path(node).touch()
+                return process
+            if fail_next[0]:
+                fail_next[0] = False
+                master = pool.sessions.get(node["id"])
+                master["process"].returncode = 1
+                pool.control_path(node).unlink(missing_ok=True)
+                return Process(failed=True)
+            return Process()
+
+        async def exercise():
+            with patch.object(self.main.console.asyncio, "create_subprocess_exec", new=fake_exec):
+                with self.assertRaises(RuntimeError):
+                    await pool.run(node, ("false",))
+                self.assertNotIn(node["id"], pool.sessions)
+                self.assertEqual(await pool.run(node, ("printf", "ok")), b"recovered\n")
+            await pool.close()
+
+        asyncio.run(exercise())
+        self.assertEqual(sum("-N" in args for args in created), 2)
+
+    def test_podman_tunnel_keeps_a_dedicated_forwarding_process(self):
+        node = {
+            "id": 9, "address": "192.0.2.109", "ssh_port": 22, "ssh_user": "root",
+            "ssh_host_key": "", "ssh_auth_state": "managed",
+        }
+        tunnel = self.main.console.PodmanTunnel(node["id"])
+        created = []
+
+        class Process:
+            returncode = None
+            stderr = SimpleNamespace(read=AsyncMock(return_value=b""))
+
+            def terminate(self):
+                self.returncode = 0
+
+            def kill(self):
+                self.returncode = -9
+
+            async def wait(self):
+                return self.returncode
+
+        async def fake_exec(*args, **kwargs):
+            created.append((args, kwargs))
+            tunnel.path.parent.mkdir(parents=True, exist_ok=True)
+            tunnel.path.touch()
+            return Process()
+
+        async def exercise():
+            with patch.object(
+                self.main.console, "ssh_args",
+                return_value=["ssh", "-o", "BatchMode=yes", "root@192.0.2.109"],
+            ), patch.object(
+                self.main.console.asyncio, "create_subprocess_exec", new=fake_exec,
+            ), patch.object(
+                self.main.console.ssh_pool, "ensure", new=AsyncMock(),
+            ) as pooled_ensure:
+                self.assertEqual(await tunnel.ensure(node), tunnel.path)
+                pooled_ensure.assert_not_awaited()
+            await tunnel.close()
+
+        asyncio.run(exercise())
+        args = created[0][0]
+        self.assertIn("-NT", args)
+        self.assertIn(f"{tunnel.path}:/run/podman/podman.sock", args)
+        self.assertFalse(any("ControlMaster=" in value for value in args))
+
+    def test_fast_host_collector_publishes_resource_sample_without_inventory_refresh(self):
+        headers = self.login()
+        node_id = self.node(headers)
+        with self.main.db() as con:
+            node = dict(con.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone())
+
+        manager = self.main.console.TelemetryManager()
+        manager.host_states[node_id] = {
+            "node_id": node_id, "reachable": True, "initialized": True,
+            "observed_at": "2026-08-03T10:00:00Z", "last_error": "", "containers": [], "pods": [],
+        }
+        event = AsyncMock()
+        with patch.object(self.main.console, "host_resource_counters", new=AsyncMock(return_value={
+            "cpu_total": 200, "cpu_idle": 100, "memory_total_bytes": 8_000, "memory_available_bytes": 3_000,
+            "network_rx_bytes": 1_000, "network_tx_bytes": 2_000,
+            "disk_read_bytes": 3_000, "disk_write_bytes": 4_000,
+        })) as counters, patch.object(manager, "publish", new=event):
+            asyncio.run(manager._collect_fast_hosts([node]))
+
+        counters.assert_awaited_once_with(node)
+        payload = event.await_args.args[1]
+        self.assertEqual(payload["node_id"], node_id)
+        self.assertIsNotNone(payload["sample"])
+        self.assertEqual(manager.host_states[node_id]["observed_at"], "2026-08-03T10:00:00Z")
+        self.assertEqual(manager.host_states[node_id]["resource_observation_error"], "")
+
+    def test_snapshot_uses_fast_resource_timestamp_for_host_freshness(self):
+        headers = self.login()
+        node_id = self.node(headers)
+        cluster_id = self.cluster(headers)
+        with self.main.db() as con:
+            con.execute(
+                "INSERT INTO memberships(cluster_id,node_id,network_mode,data_interface,data_address,user_interface,user_address) VALUES (?,?, 'shared','ens18','192.0.2.102','ens18','192.0.2.102')",
+                (cluster_id, node_id),
+            )
+
+        manager = self.main.console.TelemetryManager()
+        manager.host_states[node_id] = {
+            "node_id": node_id, "reachable": True, "initialized": True,
+            "observed_at": "2026-08-03T10:00:00Z", "resource_observed_at": "2026-08-03T10:00:05Z",
+            "last_error": "", "containers": [], "pods": [],
+        }
+        payload = manager.snapshot()
+        self.assertEqual(payload["cross_cluster_host_usage"][0]["observed_at"], "2026-08-03T10:00:05Z")
+
+    def test_dashboard_exposes_bounded_cross_cluster_host_resource_history(self):
+        headers = self.login()
+        node_id = self.node(headers)
+        cluster_id = self.cluster(headers)
+        with self.main.db() as con:
+            con.execute(
+                "INSERT INTO memberships(cluster_id,node_id,network_mode,data_interface,data_address,user_interface,user_address) VALUES (?,?, 'shared','ens18','192.0.2.102','ens18','192.0.2.102')",
+                (cluster_id, node_id),
+            )
+
+        manager = self.main.console.TelemetryManager()
+        manager.host_states[node_id] = {
+            "node_id": node_id, "reachable": True, "initialized": True, "podman_socket_active": True,
+            "observed_at": "2026-08-03T10:00:10Z", "last_error": "", "containers": [], "pods": [],
+        }
+        manager.host_history[node_id] = [{
+            "observed_at": "2026-08-03T10:00:10Z", "cpu_percent": 45.0,
+            "memory_usage_bytes": 6_000, "memory_total_bytes": 8_000,
+            "network_rx_bytes_per_second": 100.0, "network_tx_bytes_per_second": 250.0,
+            "disk_read_bytes_per_second": 150.0, "disk_write_bytes_per_second": 300.0,
+        }]
+
+        payload = manager.snapshot()
+        usage = payload["cross_cluster_host_usage"]
+        self.assertEqual(len(usage), 1)
+        self.assertEqual(usage[0]["node_id"], node_id)
+        self.assertEqual(usage[0]["clusters"], [{"id": cluster_id, "name": "lab-a", "theme_color": "#0077CC"}])
+        self.assertEqual(usage[0]["history"][0]["network_tx_bytes_per_second"], 250.0)
 
     def test_runtime_zoning_observation_records_drift_and_dashboard_alert(self):
         headers = self.login()

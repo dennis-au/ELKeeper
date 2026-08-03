@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import random
 import secrets
 import ssl
 import time
@@ -24,6 +25,14 @@ router = APIRouter()
 RUNTIME = core.DATA / "runtime"
 CA_CACHE = core.DATA / "cluster-cas"
 COLLECT_INTERVAL = int(os.getenv("TELEMETRY_INTERVAL_SECONDS", "5"))
+FAST_COLLECT_INTERVAL = max(1, int(os.getenv("TELEMETRY_FAST_INTERVAL_SECONDS", str(COLLECT_INTERVAL))))
+SLOW_COLLECT_INTERVAL = max(FAST_COLLECT_INTERVAL, int(os.getenv("TELEMETRY_SLOW_INTERVAL_SECONDS", "30")))
+CLUSTER_COLLECT_INTERVAL = max(FAST_COLLECT_INTERVAL, int(os.getenv("CLUSTER_TELEMETRY_INTERVAL_SECONDS", "15")))
+MAX_FAST_HOST_PROBES = max(1, int(os.getenv("TELEMETRY_FAST_MAX_CONCURRENCY", "5")))
+MAX_SLOW_HOST_PROBES = max(1, int(os.getenv("TELEMETRY_SLOW_MAX_CONCURRENCY", "3")))
+POLL_JITTER_SECONDS = max(0.0, float(os.getenv("TELEMETRY_POLL_JITTER_SECONDS", "0.25")))
+SSH_CONTROL_PERSIST_SECONDS = max(30, int(os.getenv("SSH_CONTROL_PERSIST_SECONDS", "120")))
+HOST_RESOURCE_HISTORY_SECONDS = 900
 STREAM_TOKEN_TTL = 600
 REVEAL_GRANT_TTL = 60
 VIRTUAL_STORAGE_TYPES = {
@@ -101,21 +110,148 @@ def ssh_args(node):
     return args + [f"{node['ssh_user']}@{node['address']}"]
 
 
+class SSHConnectionPool:
+    """Keep one multiplexed SSH master per enabled host and reuse it for commands."""
+
+    def __init__(self):
+        self.sessions = {}
+        self.lock = asyncio.Lock()
+
+    def control_path(self, node):
+        return RUNTIME / "ssh-control" / f"node-{node['id']}"
+
+    def _signature(self, node):
+        return (
+            node["id"], node["address"], int(node["ssh_port"]), node["ssh_user"],
+            core.active_ssh_key_path(), str(core.known_hosts_path([node["id"]])),
+        )
+
+    async def _close_session(self, session):
+        process = session.get("process")
+        if process and process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+        session["path"].unlink(missing_ok=True)
+
+    async def close_node(self, node_id):
+        async with self.lock:
+            session = self.sessions.pop(node_id, None)
+            if session:
+                await self._close_session(session)
+
+    async def close(self):
+        async with self.lock:
+            sessions = list(self.sessions.values())
+            self.sessions.clear()
+            await asyncio.gather(*(self._close_session(session) for session in sessions), return_exceptions=True)
+
+    async def _start_master(self, node):
+        path = self.control_path(node)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        path.unlink(missing_ok=True)
+        base = ssh_args(node)
+        host = base.pop()
+        args = base + [
+            "-o", "ControlMaster=yes", "-o", "ControlPersist=no",
+            "-o", f"ControlPath={path}", "-N", host,
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *args, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        for _ in range(50):
+            if path.exists():
+                return {"process": process, "path": path, "signature": self._signature(node)}
+            if process.returncode is not None:
+                error = await process.stderr.read()
+                raise RuntimeError(error.decode(errors="replace").strip() or "SSH connection failed")
+            await asyncio.sleep(0.1)
+        await self._close_session({"process": process, "path": path})
+        raise RuntimeError("SSH control connection did not become ready")
+
+    async def ensure(self, node):
+        signature = self._signature(node)
+        async with self.lock:
+            current = self.sessions.get(node["id"])
+            if (
+                current and current["signature"] == signature
+                and current["process"].returncode is None and current["path"].exists()
+            ):
+                return current
+            if current:
+                await self._close_session(current)
+            session = await self._start_master(node)
+            self.sessions[node["id"]] = session
+            return session
+
+    def client_args(self, node):
+        base = ssh_args(node)
+        host = base.pop()
+        path = self.control_path(node)
+        return base + [
+            "-o", "ControlMaster=auto", "-o", f"ControlPersist={SSH_CONTROL_PERSIST_SECONDS}",
+            "-o", f"ControlPath={path}", host,
+        ]
+
+    async def run(self, node, command, timeout=8):
+        session = await self.ensure(node)
+        process = await asyncio.create_subprocess_exec(
+            *self.client_args(node), *command,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            raise RuntimeError("SSH operation timed out")
+        if process.returncode:
+            message = stderr.decode(errors="replace").strip() or "SSH operation failed"
+            if session["process"].returncode is not None or not session["path"].exists():
+                await self.close_node(node["id"])
+            raise RuntimeError(message)
+        return stdout
+
+
+ssh_pool = SSHConnectionPool()
+
+
 async def remote_command(node, *command, timeout=8):
-    process = await asyncio.create_subprocess_exec(
-        *ssh_args(node), *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    return await ssh_pool.run(node, command, timeout=timeout)
+
+
+def parse_network_interfaces(payload):
+    if not isinstance(payload, list):
+        raise ValueError("ip address output must be a JSON array")
+    interfaces = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("ifname")
+        if not isinstance(name, str) or not name:
+            continue
+        addresses = []
+        for address in item.get("addr_info") or []:
+            if not isinstance(address, dict):
+                continue
+            local = address.get("local")
+            if isinstance(local, str) and local:
+                addresses.append(local)
+        interfaces[name] = sorted(set(addresses))
+    return interfaces
+
+
+async def host_network_interfaces(node):
+    output = await remote_command(node, "ip", "-j", "address", "show")
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.wait()
-        raise RuntimeError("SSH operation timed out")
-    if process.returncode:
-        raise RuntimeError(stderr.decode(errors="replace").strip() or "SSH operation failed")
-    return stdout
+        return parse_network_interfaces(json.loads(output.decode(errors="strict")))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise RuntimeError("Host network inventory returned invalid JSON") from error
 
 
 def ssh_error_summary(error):
@@ -151,6 +287,22 @@ async def host_identity(node):
         elif line.startswith("ECP_PODMAN="):
             values["podman_version"] = line[11:].replace("podman version ", "", 1).strip()[:128]
     return values.get("os_name", "unknown"), values.get("podman_version", "")
+
+
+async def host_resource_counters(node):
+    script = r'''
+awk '/^cpu / { total=0; for (i=2; i<=NF; i++) total+=$i; print "cpu_total=" total; print "cpu_idle=" $5+$6; exit }' /proc/stat
+awk '/^MemTotal:/ { total=$2*1024 } /^MemAvailable:/ { available=$2*1024 } END { print "memory_total_bytes=" total; print "memory_available_bytes=" available }' /proc/meminfo
+awk 'NR>2 { iface=$1; sub(/:$/, "", iface); if (iface != "lo") { rx+=$2; tx+=$10 } } END { print "network_rx_bytes=" rx; print "network_tx_bytes=" tx }' /proc/net/dev
+for path in /sys/block/*; do
+  test -e "$path" || continue
+  device=${path##*/}
+  case "$device" in loop*|ram*|zram*|fd*|sr*|md*|dm-*|nbd*) continue ;; esac
+  test -e "$path/device" || continue
+  awk -v device="$device" '$3 == device { read += $6 * 512; write += $10 * 512 } END { print read, write }' /proc/diskstats
+done | awk '{ read += $1; write += $2 } END { print "disk_read_bytes=" read; print "disk_write_bytes=" write }'
+'''
+    return parse_host_resource_counters(await remote_command(node, script))
 
 
 def storage_mount_entries(filesystems):
@@ -227,6 +379,9 @@ class PodmanTunnel:
         await self.close()
         RUNTIME.mkdir(parents=True, exist_ok=True)
         self.path.unlink(missing_ok=True)
+        # A local Unix-socket forward must remain a live client process.  A
+        # multiplexed `-L` request is owned by the master and exits as soon
+        # as the request is accepted, so keep this long-lived tunnel direct.
         args = ssh_args(node)[:-1] + [
             "-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindUnlink=yes", "-NT",
             "-L", f"{self.path}:/run/podman/podman.sock", ssh_args(node)[-1],
@@ -279,6 +434,64 @@ def container_stats(item):
         "network_rx": sum(value.get("rx_bytes", 0) for value in networks.values()),
         "network_tx": sum(value.get("tx_bytes", 0) for value in networks.values()),
     }
+
+
+HOST_RESOURCE_COUNTERS = {
+    "cpu_total", "cpu_idle", "memory_total_bytes", "memory_available_bytes",
+    "network_rx_bytes", "network_tx_bytes", "disk_read_bytes", "disk_write_bytes",
+}
+
+
+def parse_host_resource_counters(output):
+    counters = {}
+    for line in output.decode(errors="replace").splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key not in HOST_RESOURCE_COUNTERS:
+            continue
+        try:
+            counters[key] = int(value.strip())
+        except ValueError:
+            continue
+    missing = HOST_RESOURCE_COUNTERS - counters.keys()
+    if missing or any(value < 0 for value in counters.values()):
+        raise RuntimeError("Host resource counters are incomplete")
+    return counters
+
+
+def host_resource_rates(previous, current):
+    sample = {
+        "observed_at": current["observed_at"],
+        "cpu_percent": None,
+        "memory_usage_bytes": max(current["memory_total_bytes"] - current["memory_available_bytes"], 0),
+        "memory_total_bytes": current["memory_total_bytes"],
+        "network_rx_bytes_per_second": None,
+        "network_tx_bytes_per_second": None,
+        "disk_read_bytes_per_second": None,
+        "disk_write_bytes_per_second": None,
+    }
+    if not previous:
+        return sample
+    try:
+        elapsed = datetime.fromisoformat(current["observed_at"].replace("Z", "+00:00")).timestamp() - datetime.fromisoformat(previous["observed_at"].replace("Z", "+00:00")).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return sample
+    if elapsed <= 0:
+        return sample
+
+    total_delta = current["cpu_total"] - previous["cpu_total"]
+    idle_delta = current["cpu_idle"] - previous["cpu_idle"]
+    if total_delta > 0 and 0 <= idle_delta <= total_delta:
+        sample["cpu_percent"] = round((total_delta - idle_delta) / total_delta * 100, 2)
+    for counter, field in (
+        ("network_rx_bytes", "network_rx_bytes_per_second"),
+        ("network_tx_bytes", "network_tx_bytes_per_second"),
+        ("disk_read_bytes", "disk_read_bytes_per_second"),
+        ("disk_write_bytes", "disk_write_bytes_per_second"),
+    ):
+        delta = current[counter] - previous[counter]
+        if delta >= 0:
+            sample[field] = round(delta / elapsed, 2)
+    return sample
 
 
 NODE_TYPE_ORDER = {
@@ -369,44 +582,113 @@ def zone_breakdown(nodes):
 class TelemetryManager:
     def __init__(self):
         self.host_states = {}
+        self.host_counters = {}
+        self.host_history = {}
         self.cluster_states = {}
         self.history = {}
         self.tunnels = {}
         self.subscribers = set()
         self.task = None
+        self.slow_task = None
+        self.cluster_task = None
 
     async def start(self):
         RUNTIME.mkdir(parents=True, exist_ok=True)
         CA_CACHE.mkdir(parents=True, exist_ok=True)
         if not self.task:
-            self.task = asyncio.create_task(self._loop())
+            self.task = asyncio.create_task(self._fast_loop())
+            self.slow_task = asyncio.create_task(self._slow_loop())
+            self.cluster_task = asyncio.create_task(self._cluster_loop())
 
     async def stop(self):
-        if self.task:
-            self.task.cancel()
-            try:
-                await self.task
-            except asyncio.CancelledError:
-                pass
-            self.task = None
+        tasks = [task for task in (self.task, self.slow_task, self.cluster_task) if task]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.task = self.slow_task = self.cluster_task = None
         await asyncio.gather(*(tunnel.close() for tunnel in self.tunnels.values()), return_exceptions=True)
+        self.tunnels.clear()
+        await ssh_pool.close()
 
-    async def _loop(self):
+    async def _sleep_until_next(self, started, interval):
+        remaining = max(0.0, interval - (asyncio.get_running_loop().time() - started))
+        await asyncio.sleep(remaining + random.uniform(0, POLL_JITTER_SECONDS))
+
+    async def _fast_loop(self):
         while True:
+            started = asyncio.get_running_loop().time()
             try:
-                await self.collect_once()
+                await self._collect_fast_hosts()
             except Exception:
                 pass
-            await asyncio.sleep(COLLECT_INTERVAL)
+            await self._sleep_until_next(started, FAST_COLLECT_INTERVAL)
+
+    async def _slow_loop(self):
+        while True:
+            started = asyncio.get_running_loop().time()
+            try:
+                await self._collect_slow_hosts()
+            except Exception:
+                pass
+            await self._sleep_until_next(started, SLOW_COLLECT_INTERVAL)
+
+    async def _cluster_loop(self):
+        while True:
+            started = asyncio.get_running_loop().time()
+            try:
+                await self._collect_clusters()
+            except Exception:
+                pass
+            await self._sleep_until_next(started, CLUSTER_COLLECT_INTERVAL)
 
     async def collect_once(self):
         with core.db() as con:
             nodes = [dict(row) for row in con.execute("SELECT * FROM nodes WHERE enabled=1 ORDER BY id")]
             cluster_ids = [row["id"] for row in con.execute("SELECT id FROM clusters ORDER BY id")]
-        if nodes:
-            await asyncio.gather(*(self._collect_host(node) for node in nodes))
-        for cluster_id in cluster_ids:
-            await self._collect_cluster(cluster_id)
+        await asyncio.gather(
+            self._collect_fast_hosts(nodes),
+            self._collect_slow_hosts(nodes),
+            self._collect_clusters(cluster_ids),
+        )
+
+    async def _collect_fast_hosts(self, nodes=None):
+        if nodes is None:
+            with core.db() as con:
+                nodes = [dict(row) for row in con.execute("SELECT * FROM nodes WHERE enabled=1 ORDER BY id")]
+        semaphore = asyncio.Semaphore(MAX_FAST_HOST_PROBES)
+
+        async def collect(node):
+            async with semaphore:
+                try:
+                    await self._collect_host_fast(node)
+                except Exception as error:
+                    state = self.host_states.get(node["id"], {})
+                    state["resource_observation_error"] = f"Resource telemetry: {error}"[:300]
+                    self.host_states[node["id"]] = state
+
+        await asyncio.gather(*(collect(node) for node in nodes))
+
+    async def _collect_slow_hosts(self, nodes=None):
+        if nodes is None:
+            with core.db() as con:
+                nodes = [dict(row) for row in con.execute("SELECT * FROM nodes WHERE enabled=1 ORDER BY id")]
+        semaphore = asyncio.Semaphore(MAX_SLOW_HOST_PROBES)
+
+        async def collect(node):
+            async with semaphore:
+                try:
+                    await self._collect_host(node)
+                except Exception:
+                    pass
+
+        await asyncio.gather(*(collect(node) for node in nodes))
+
+    async def _collect_clusters(self, cluster_ids=None):
+        if cluster_ids is None:
+            with core.db() as con:
+                cluster_ids = [row["id"] for row in con.execute("SELECT id FROM clusters ORDER BY id")]
+        await asyncio.gather(*(self._collect_cluster(cluster_id) for cluster_id in cluster_ids))
 
     async def publish(self, event, payload):
         message = {"event": event, "data": payload, "id": f"{int(time.time() * 1000)}-{secrets.token_hex(2)}"}
@@ -437,6 +719,19 @@ class TelemetryManager:
                 return response.json()
             last = response
         raise RuntimeError(f"Podman API returned HTTP {last.status_code if last else 'error'}")
+
+    def _record_host_resource_sample(self, node_id, observed_at, counters):
+        current = {**counters, "observed_at": observed_at}
+        sample = host_resource_rates(self.host_counters.get(node_id), current)
+        self.host_counters[node_id] = current
+        history = self.host_history.setdefault(node_id, [])
+        history.append(sample)
+        cutoff = time.time() - HOST_RESOURCE_HISTORY_SECONDS
+        self.host_history[node_id] = [
+            item for item in history
+            if datetime.fromisoformat(item["observed_at"].replace("Z", "+00:00")).timestamp() >= cutoff
+        ][-(HOST_RESOURCE_HISTORY_SECONDS // max(FAST_COLLECT_INTERVAL, 1) + 2):]
+        return sample
 
     def _record_workload_runtime(self, node_id, containers):
         by_name = {item["name"]: item for item in containers}
@@ -515,6 +810,43 @@ class TelemetryManager:
                 (cluster["id"], applied_mode, json.dumps(applied_zones), json.dumps(observed), status, last_error),
             )
 
+    async def _collect_host_fast(self, node):
+        state = self.host_states.get(node["id"])
+        if state is None:
+            with core.db() as con:
+                observed = con.execute(
+                    "SELECT initialized,reachable,podman_socket_active,os_name,podman_version,observed_at,last_error,network_interfaces_json "
+                    "FROM host_runtime_observations WHERE node_id=?",
+                    (node["id"],),
+                ).fetchone()
+            if observed:
+                state = {
+                    "node_id": node["id"], "initialized": bool(observed["initialized"]),
+                    "reachable": bool(observed["reachable"]), "podman_socket_active": bool(observed["podman_socket_active"]),
+                    "os_name": observed["os_name"], "podman_version": observed["podman_version"],
+                    "observed_at": observed["observed_at"], "last_error": observed["last_error"],
+                    "network_interfaces": json.loads(observed["network_interfaces_json"] or "{}"),
+                    "containers": [], "pods": [],
+                }
+                self.host_states[node["id"]] = state
+        if not state or not state.get("reachable") or not state.get("initialized"):
+            return
+
+        observed_at = utc_now()
+        try:
+            sample = self._record_host_resource_sample(node["id"], observed_at, await host_resource_counters(node))
+        except Exception as error:
+            current = self.host_states.get(node["id"], state)
+            current["resource_observation_error"] = f"Resource telemetry: {error}"[:300]
+            self.host_states[node["id"]] = current
+            await self.publish("host_stats", {"node_id": node["id"], "observed_at": observed_at, "sample": None})
+            return
+        current = self.host_states.get(node["id"], state)
+        current["resource_observed_at"] = observed_at
+        current["resource_observation_error"] = ""
+        self.host_states[node["id"]] = current
+        await self.publish("host_stats", {"node_id": node["id"], "observed_at": observed_at, "sample": sample})
+
     async def _collect_host(self, node):
         observed = utc_now()
         tunnel = self.tunnels.get(node["id"])
@@ -533,12 +865,19 @@ class TelemetryManager:
                 "os_name": "", "podman_version": "", "observed_at": observed, "last_error": f"SSH: {ssh_error_summary(error)}", "containers": [], "pods": [],
             }
         else:
+            try:
+                network_interfaces = await host_network_interfaces(node)
+                network_observation_error = ""
+            except Exception as error:
+                network_interfaces = {}
+                network_observation_error = f"Network inventory: {error}"[:300]
             if not initialized:
                 if tunnel:
                     await tunnel.close()
                 state = {
                     "node_id": node["id"], "reachable": True, "initialized": False, "podman_socket_active": False,
                     "os_name": os_name, "podman_version": installed_podman, "observed_at": observed, "last_error": "", "containers": [], "pods": [],
+                    "network_interfaces": network_interfaces, "network_observation_error": network_observation_error,
                 }
             else:
                 try:
@@ -574,6 +913,7 @@ class TelemetryManager:
                     state = {
                         "node_id": node["id"], "reachable": True, "initialized": True, "podman_socket_active": True,
                         "os_name": os_name, "podman_version": version, "observed_at": observed, "last_error": "", "containers": managed, "pods": pods,
+                        "network_interfaces": network_interfaces, "network_observation_error": network_observation_error,
                     }
                 except Exception as error:
                     if tunnel:
@@ -581,17 +921,21 @@ class TelemetryManager:
                     state = {
                         "node_id": node["id"], "reachable": True, "initialized": True, "podman_socket_active": False,
                         "os_name": os_name, "podman_version": installed_podman, "observed_at": observed, "last_error": f"Podman: {error}"[:300], "containers": [], "pods": [],
+                        "network_interfaces": network_interfaces, "network_observation_error": network_observation_error,
                     }
+        previous = self.host_states.get(node["id"], {})
+        state["resource_observation_error"] = previous.get("resource_observation_error", "")
+        state["resource_observed_at"] = previous.get("resource_observed_at")
         self.host_states[node["id"]] = state
         with core.db() as con:
             con.execute(
-                "INSERT INTO host_runtime_observations(node_id,initialized,reachable,podman_socket_active,os_name,podman_version,observed_at,last_error) VALUES (?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(node_id) DO UPDATE SET initialized=excluded.initialized,reachable=excluded.reachable,podman_socket_active=excluded.podman_socket_active,os_name=excluded.os_name,podman_version=excluded.podman_version,observed_at=excluded.observed_at,last_error=excluded.last_error",
-                (node["id"], int(state["initialized"]), int(state["reachable"]), int(state["podman_socket_active"]), state["os_name"], state["podman_version"], observed, state["last_error"]),
+                "INSERT INTO host_runtime_observations(node_id,initialized,reachable,podman_socket_active,os_name,podman_version,observed_at,last_error,network_interfaces_json) VALUES (?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(node_id) DO UPDATE SET initialized=excluded.initialized,reachable=excluded.reachable,podman_socket_active=excluded.podman_socket_active,os_name=excluded.os_name,podman_version=excluded.podman_version,observed_at=excluded.observed_at,last_error=excluded.last_error,network_interfaces_json=excluded.network_interfaces_json",
+                (node["id"], int(state["initialized"]), int(state["reachable"]), int(state["podman_socket_active"]), state["os_name"], state["podman_version"], observed, state["last_error"], json.dumps(state.get("network_interfaces", {}), sort_keys=True)),
             )
         if state["podman_socket_active"]:
             self._record_workload_runtime(node["id"], state["containers"])
-        await self.publish("host_stats", state)
+        await self.publish("host_stats", {"node_id": node["id"], "observed_at": observed, "kind": "inventory"})
 
     async def _ensure_cluster_ca(self, cluster, master, node):
         path = CA_CACHE / f"cluster-{cluster['id']}.crt"
@@ -690,17 +1034,21 @@ class TelemetryManager:
                         allocation = await get("/_cat/allocation?format=json&bytes=b&h=node,shards")
                     except httpx.HTTPError:
                         allocation = []
-                    return health, stats, nodes, pending, settings, allocation
+                    try:
+                        shutdown = await get("/_nodes/shutdown")
+                    except httpx.HTTPError:
+                        shutdown = None
+                    return health, stats, nodes, pending, settings, allocation, shutdown
 
                 key, cached_key = await self._monitoring_key(cluster, client)
                 try:
-                    health, stats, nodes, pending, settings, allocation = await collect_metrics(key)
+                    health, stats, nodes, pending, settings, allocation, shutdown = await collect_metrics(key)
                 except httpx.HTTPStatusError as error:
                     if error.response.status_code != 401 or not cached_key:
                         raise
                     self._clear_monitoring_key(cluster_id)
                     key, _ = await self._monitoring_key(cluster, client)
-                    health, stats, nodes, pending, settings, allocation = await collect_metrics(key)
+                    health, stats, nodes, pending, settings, allocation, shutdown = await collect_metrics(key)
             node_stats = nodes.get("nodes", {})
             fs_total = sum(item.get("fs", {}).get("total", {}).get("total_in_bytes", 0) for item in node_stats.values())
             fs_available = sum(item.get("fs", {}).get("total", {}).get("available_in_bytes", 0) for item in node_stats.values())
@@ -708,9 +1056,13 @@ class TelemetryManager:
             heap_max = sum(item.get("jvm", {}).get("mem", {}).get("heap_max_in_bytes", 0) for item in node_stats.values())
             breakdown = node_breakdown(node_stats, allocation)
             state = {
-                "cluster_id": cluster_id, "status": health.get("status", "unknown"), "observed_at": observed, "last_error": "",
+                "cluster_id": cluster_id,
+                "cluster_name": health.get("cluster_name", ""),
+                "cluster_uuid": health.get("cluster_uuid", ""),
+                "status": health.get("status", "unknown"), "observed_at": observed, "last_error": "",
                 "nodes": health.get("number_of_nodes", 0), "data_nodes": health.get("number_of_data_nodes", 0),
                 "active_primary_shards": health.get("active_primary_shards", 0), "active_shards": health.get("active_shards", 0),
+                "initializing_shards": health.get("initializing_shards", 0), "relocating_shards": health.get("relocating_shards", 0),
                 "unassigned_shards": health.get("unassigned_shards", 0), "unassigned_primary_shards": health.get("unassigned_primary_shards", 0),
                 "indices": stats.get("indices", {}).get("count", 0), "documents": stats.get("indices", {}).get("docs", {}).get("count", 0),
                 "store_bytes": stats.get("indices", {}).get("store", {}).get("size_in_bytes", 0),
@@ -720,7 +1072,22 @@ class TelemetryManager:
                 "node_breakdown": breakdown,
                 "zone_breakdown": zone_breakdown(breakdown),
                 "effective_settings": settings,
+                "stale_shutdown_record": True if shutdown is None else bool(shutdown.get("nodes", [])),
             }
+            provider = cluster.get("provider") or {}
+            if (
+                not provider.get("expected_cluster_uuid")
+                and provider.get("provider_type") == "native_podman"
+                and provider.get("ownership_state") == "verified"
+                and state["cluster_name"] == cluster["name"]
+                and state["cluster_uuid"]
+            ):
+                with core.db() as con:
+                    con.execute(
+                        "UPDATE clusters SET expected_cluster_uuid=? "
+                        "WHERE id=? AND expected_cluster_uuid IS NULL",
+                        (state["cluster_uuid"], cluster_id),
+                    )
             self._record_cluster_zoning(cluster, breakdown)
         except Exception as error:
             if "CERTIFICATE_VERIFY_FAILED" in str(error):
@@ -738,6 +1105,12 @@ class TelemetryManager:
             clusters = [core.cluster_record(con, row["id"]) for row in con.execute("SELECT id FROM clusters ORDER BY name")]
             nodes = [dict(row) for row in con.execute("SELECT * FROM nodes ORDER BY name")]
             observations = {row["node_id"]: dict(row) for row in con.execute("SELECT * FROM host_runtime_observations")}
+        host_clusters = {}
+        for cluster in clusters:
+            for member in cluster["members"]:
+                host_clusters.setdefault(member["node_id"], []).append({
+                    "id": cluster["id"], "name": cluster["name"], "theme_color": cluster["theme_color"],
+                })
         hosts = []
         alerts = []
         for node in nodes:
@@ -746,7 +1119,9 @@ class TelemetryManager:
                 **node, "enabled": bool(node["enabled"]),
                 "initialized": bool(observed.get("initialized", 0)), "reachable": bool(observed.get("reachable", 0)),
                 "podman_socket_active": bool(observed.get("podman_socket_active", 0)), "os_name": observed.get("os_name", ""), "podman_version": observed.get("podman_version", ""),
-                "observed_at": observed.get("observed_at"), "last_error": observed.get("last_error", ""),
+                "observed_at": observed.get("observed_at"),
+                "resource_observed_at": (self.host_states.get(node["id"]) or {}).get("resource_observed_at"),
+                "last_error": observed.get("last_error", ""),
                 "containers": observed.get("containers", []), "pods": observed.get("pods", []),
             }
             hosts.append(host)
@@ -791,7 +1166,16 @@ class TelemetryManager:
                 "health": health, "node_count": len(cluster["members"]), "workload_count": len(cluster["assignments"]),
                 "metrics": metrics, "history": self.history.get(cluster["id"], []), "log_monitoring": monitoring,
             })
-        return {"generated_at": utc_now(), "clusters": summaries, "hosts": hosts, "alerts": alerts}
+        cross_cluster_host_usage = [{
+            "node_id": host["id"], "name": host["name"], "reachable": host["reachable"],
+            "observed_at": host.get("resource_observed_at") or host.get("observed_at"), "last_error": host["last_error"],
+            "resource_observation_error": (self.host_states.get(host["id"]) or {}).get("resource_observation_error", ""),
+            "clusters": host_clusters[host["id"]], "history": self.host_history.get(host["id"], []),
+        } for host in hosts if host["id"] in host_clusters]
+        return {
+            "generated_at": utc_now(), "clusters": summaries, "hosts": hosts, "alerts": alerts,
+            "cross_cluster_host_usage": cross_cluster_host_usage,
+        }
 
 
 telemetry = TelemetryManager()
@@ -897,6 +1281,8 @@ def enabled_node(node_id):
 @router.post("/api/nodes/{node_id}/initialize")
 async def initialize_node(node_id: int, _: str = Depends(core.user)):
     node = enabled_node(node_id)
+    with core.db() as con:
+        core.require_no_maintenance_conflict(con, node_id=node_id)
     run_id = core.launch("host-init", node["name"], lambda inv, _variables: [
         "ansible-playbook", "-i", str(inv), str(core.PLAYBOOKS / "host-init.yml"), "--limit", node["name"], "--private-key", core.active_ssh_key_path(),
     ])
@@ -906,6 +1292,8 @@ async def initialize_node(node_id: int, _: str = Depends(core.user)):
 @router.post("/api/nodes/{node_id}/reboot")
 async def reboot_node(node_id: int, _: str = Depends(core.user)):
     node = enabled_node(node_id)
+    with core.db() as con:
+        core.require_no_maintenance_conflict(con, node_id=node_id)
     run_id = core.launch("host-reboot", node["name"], lambda inv, _variables: [
         "ansible-playbook", "-i", str(inv), str(core.PLAYBOOKS / "host-reboot.yml"), "--limit", node["name"], "--private-key", core.active_ssh_key_path(),
     ])
@@ -916,6 +1304,7 @@ async def reboot_node(node_id: int, _: str = Depends(core.user)):
 async def deinitialize_node(node_id: int, _: str = Depends(core.user)):
     node = enabled_node(node_id)
     with core.db() as con:
+        core.require_no_maintenance_conflict(con, node_id=node_id)
         if con.execute("SELECT 1 FROM cluster_assignments WHERE node_id=?", (node_id,)).fetchone():
             raise HTTPException(409, "Detach or purge all managed workloads before de-initializing this host")
     run_id = core.launch("host-deinit", node["name"], lambda inv, _variables: [
@@ -938,6 +1327,8 @@ async def cluster_settings(cluster_id: int, _: str = Depends(core.user)):
 async def update_cluster_settings(cluster_id: int, settings: core.ElasticsearchSettings, _: str = Depends(core.user)):
     with core.db() as con:
         cluster = core.cluster_record(con, cluster_id)
+        core.require_no_maintenance_conflict(con, cluster_id=cluster_id)
+        core.require_cluster_capability(con, cluster_id, core.ProviderCapability.CLUSTER_SETTINGS)
         con.execute("UPDATE clusters SET elasticsearch_settings_json=? WHERE id=?", (settings.model_dump_json(), cluster_id))
         master = next((item for item in cluster["assignments"] if item["role"] == "master"), None)
         if master:

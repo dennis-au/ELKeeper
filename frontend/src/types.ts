@@ -143,6 +143,28 @@ export interface HostRuntime extends NodeRecord {
   pods: Array<Record<string, unknown>>;
 }
 
+export interface HostResourceSample {
+  observed_at: string;
+  cpu_percent: number | null;
+  memory_usage_bytes: number;
+  memory_total_bytes: number;
+  network_rx_bytes_per_second: number | null;
+  network_tx_bytes_per_second: number | null;
+  disk_read_bytes_per_second: number | null;
+  disk_write_bytes_per_second: number | null;
+}
+
+export interface CrossClusterHostUsage {
+  node_id: number;
+  name: string;
+  reachable: boolean;
+  observed_at?: string;
+  last_error: string;
+  resource_observation_error: string;
+  clusters: Array<{ id: number; name: string; theme_color: string }>;
+  history: HostResourceSample[];
+}
+
 export interface ControllerSshKey {
   key_id: string;
   algorithm: string;
@@ -160,6 +182,47 @@ export interface ControllerSshKeyStatus {
 
 export interface ControllerSettings {
   timezone: string;
+}
+
+export interface MaintenanceCapabilities {
+  planning: boolean;
+  operations: {
+    host_reboot: boolean;
+    rolling_restart: boolean;
+    upgrade: boolean;
+    evacuation: boolean;
+  };
+  backends: {
+    documented_rolling: boolean;
+    node_shutdown: boolean;
+  };
+}
+
+export interface MaintenancePolicy {
+  max_unavailable: number;
+  max_surge: 0;
+  minimum_master_eligible: number | 'quorum';
+  minimum_data_per_tier: number;
+  minimum_kibana: number;
+  minimum_fleet_server: number;
+  minimum_logstash: number;
+  minimum_coordinating: number;
+  allow_agent_interruption: 'true-with-warning' | 'block';
+  required_cluster_health: 'green' | 'yellow';
+  allocation_guard: 'primaries-for-data' | 'none';
+  observation_max_age_seconds: number;
+  restart_allocation_delay_seconds: number | null;
+  host_return_timeout_seconds: number;
+  workload_ready_timeout_seconds: number;
+  plan_validity_seconds: number;
+}
+
+export interface MaintenancePolicyResponse {
+  policy: MaintenancePolicy;
+  revision: number;
+  customized: boolean;
+  updated_by?: string | null;
+  updated_at?: string | null;
 }
 
 export interface StorageMount {
@@ -253,6 +316,7 @@ export interface DashboardSnapshot {
   clusters: ClusterSummary[];
   hosts: HostRuntime[];
   alerts: AlertRecord[];
+  cross_cluster_host_usage?: CrossClusterHostUsage[];
 }
 
 export interface RunRecord {

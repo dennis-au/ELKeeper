@@ -3,20 +3,65 @@ import {
   EuiBadge, EuiBasicTable, EuiButton, EuiButtonEmpty, EuiCallOut, EuiCheckbox, EuiConfirmModal,
   EuiFieldNumber, EuiFieldPassword, EuiFieldText, EuiForm, EuiFormRow, EuiHealth, EuiModal,
   EuiIcon, EuiModalBody, EuiModalFooter, EuiModalHeader, EuiModalHeaderTitle, EuiOverlayMask, EuiPanel,
-  EuiRadioGroup, EuiSelect, EuiSpacer, EuiSwitch, EuiText, EuiTitle,
+  EuiRadioGroup, EuiSelect, EuiSpacer, EuiSwitch, EuiText, EuiTextArea, EuiTitle,
 } from '@elastic/eui';
 import type { EuiBasicTableColumn } from '@elastic/eui';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, jsonBody, queries } from '../api';
 import { useConsole } from '../app-context';
-import { timeAgo } from '../format';
+import {
+  MaintenanceOperationActions,
+  MaintenanceOperationProgress,
+  MaintenancePlanPreview,
+} from '../components/maintenance';
+import { formatDateTime, timeAgo } from '../format';
 import type { Cluster, HostRuntime, NodeRecord } from '../types';
+import type {
+  MaintenanceAction,
+  MaintenanceActionControl,
+  MaintenanceOperationProgressModel,
+  MaintenancePlanViewModel,
+} from '../components/maintenance';
+
+type HostMaintenanceActionControls = Partial<Record<MaintenanceAction, MaintenanceActionControl & {
+  requiresSafeCheckpoint?: boolean;
+}>>;
+
+interface HostMaintenancePlanResponse {
+  plan_id: string;
+  plan_hash: string;
+  lifecycle_state: MaintenancePlanViewModel['header']['state'];
+  view: MaintenancePlanViewModel;
+  operation?: {
+    progress: MaintenanceOperationProgressModel;
+    safe_checkpoint: boolean;
+    safe_checkpoint_reason: string;
+    action_controls: HostMaintenanceActionControls;
+  };
+}
+
+const terminalMaintenanceStates = new Set(['succeeded', 'failed', 'cancelled']);
+
+export function maintenancePlanRefetchInterval(response?: {
+  lifecycle_state?: string;
+  operation?: { progress?: { lifecycleState?: string } };
+}) {
+  const lifecycleState = response?.operation?.progress?.lifecycleState || response?.lifecycle_state;
+  return lifecycleState && !terminalMaintenanceStates.has(lifecycleState) ? 2000 : false;
+}
 
 function isIpAddress(value: string) {
   const address = value.trim();
   const octets = address.split('.');
   if (octets.length === 4 && octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255)) return true;
   return address.includes(':') && /^[0-9A-Fa-f:.]+$/.test(address);
+}
+
+function maintenanceIdempotencyKey(nodeId: number) {
+  const requestId = typeof globalThis.crypto?.randomUUID === 'function'
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return `host-${nodeId}-reboot-${requestId}`.slice(0, 128);
 }
 
 function HostEditor({ node, cluster, onClose, onRun }: { node?: NodeRecord; cluster?: Cluster; onClose: () => void; onRun: (runId: number) => void }) {
@@ -88,6 +133,11 @@ export function HostsPage() {
   const { watchRun, clusters, selectedCluster } = useConsole();
   const { data: nodes = [] } = useQuery({ queryKey: ['nodes'], queryFn: queries.nodes });
   const { data: dashboard } = useQuery({ queryKey: ['dashboard'], queryFn: queries.dashboard, refetchInterval: 10000 });
+  const { data: maintenanceCapabilities } = useQuery({
+    queryKey: ['maintenance-capabilities'],
+    queryFn: queries.maintenanceCapabilities,
+    retry: false,
+  });
   const [editing, setEditing] = useState<NodeRecord | 'new'>();
   const [confirm, setConfirm] = useState<{ action: 'initialize' | 'reboot' | 'deinitialize' | 'delete' | 'removeLegacyKnownHosts'; node: NodeRecord }>();
   const [keyInstall, setKeyInstall] = useState<NodeRecord>();
@@ -98,6 +148,29 @@ export function HostsPage() {
   const [bootstrapBusy, setBootstrapBusy] = useState(false);
   const [revokeOnDelete, setRevokeOnDelete] = useState(false);
   const [error, setError] = useState('');
+  const [maintenanceNode, setMaintenanceNode] = useState<NodeRecord>();
+  const [maintenanceReason, setMaintenanceReason] = useState('Operating-system maintenance');
+  const [maintenanceRequestKey, setMaintenanceRequestKey] = useState('');
+  const [maintenancePlanId, setMaintenancePlanId] = useState<string>();
+  const [maintenanceBusy, setMaintenanceBusy] = useState(false);
+  const [maintenanceActionBusy, setMaintenanceActionBusy] = useState<MaintenanceAction>();
+  const [maintenanceError, setMaintenanceError] = useState('');
+  const maintenancePlanQuery = useQuery<HostMaintenancePlanResponse>({
+    queryKey: ['maintenance-plan', maintenancePlanId],
+    queryFn: () => api<HostMaintenancePlanResponse>(`/api/maintenance/plans/${maintenancePlanId}`),
+    enabled: Boolean(maintenancePlanId),
+    retry: false,
+    staleTime: 1500,
+    refetchInterval: (query) => maintenancePlanRefetchInterval(query.state.data),
+  });
+  const maintenancePlan = maintenancePlanQuery.data;
+  const maintenanceOperationState = maintenancePlan?.operation?.progress.lifecycleState || maintenancePlan?.lifecycle_state;
+  const maintenanceActionControls = maintenanceCapabilities?.operations.host_reboot
+    ? maintenancePlan?.operation?.action_controls
+    : undefined;
+  const maintenancePlanActionControls = maintenanceOperationState && ['draft', 'ready', 'blocked'].includes(maintenanceOperationState)
+    ? maintenanceActionControls
+    : undefined;
   const runtime = new Map((dashboard?.hosts || []).map((host) => [host.id, host]));
   const assignments = new Map<number, number>();
   clusters.forEach((cluster) => cluster.assignments.forEach((item) => assignments.set(item.node_id, (assignments.get(item.node_id) || 0) + 1)));
@@ -147,6 +220,56 @@ export function HostsPage() {
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to update host zone'); }
     finally { setZoneBusy(false); }
   };
+  const openMaintenancePlan = (node: NodeRecord) => {
+    setMaintenanceNode(node);
+    setMaintenanceReason('Operating-system maintenance');
+    setMaintenanceRequestKey(maintenanceIdempotencyKey(node.id));
+    setMaintenancePlanId(undefined);
+    setMaintenanceError('');
+  };
+  const closeMaintenancePlan = () => {
+    setMaintenanceNode(undefined);
+    setMaintenanceReason('Operating-system maintenance');
+    setMaintenanceRequestKey('');
+    setMaintenancePlanId(undefined);
+    setMaintenanceError('');
+  };
+  const createMaintenancePlan = async () => {
+    if (!maintenanceNode || !maintenanceReason.trim() || maintenanceCapabilities?.planning !== true) return;
+    setMaintenanceBusy(true); setMaintenanceError('');
+    try {
+      const result = await api<HostMaintenancePlanResponse>(`/api/nodes/${maintenanceNode.id}/maintenance/plans`, {
+        method: 'POST',
+        ...jsonBody({
+          operation: 'reboot',
+          reason: maintenanceReason.trim(),
+          availability_mode: 'zero-impact',
+          idempotency_key: maintenanceRequestKey || undefined,
+        }),
+      });
+      queryClient.setQueryData(['maintenance-plan', result.plan_id], result);
+      setMaintenancePlanId(result.plan_id);
+    } catch (reason) {
+      setMaintenanceError(reason instanceof Error ? reason.message : 'Unable to create maintenance plan');
+    } finally { setMaintenanceBusy(false); }
+  };
+  const runMaintenanceAction = async (action: MaintenanceAction) => {
+    if (!maintenancePlanId || maintenanceCapabilities?.operations.host_reboot !== true) return;
+    const operation = maintenancePlan?.operation;
+    const control = operation?.action_controls[action];
+    if (!operation || !control?.enabled || control.visible === false) return;
+    if (action !== 'execute' && control.requiresSafeCheckpoint !== false && operation.safe_checkpoint !== true) return;
+    setMaintenanceActionBusy(action); setMaintenanceError('');
+    try {
+      const result = await api<{ run_id?: number }>(`/api/maintenance/plans/${maintenancePlanId}/${action}`, { method: 'POST' });
+      if (typeof result.run_id === 'number') watchRun(result.run_id);
+    } catch (reason) {
+      setMaintenanceError(reason instanceof Error ? reason.message : 'Maintenance action failed');
+    } finally {
+      await maintenancePlanQuery.refetch();
+      setMaintenanceActionBusy(undefined);
+    }
+  };
   type HostItem = NodeRecord & { runtime?: HostRuntime; workload_count: number };
   const items: HostItem[] = nodes.map((node) => ({ ...node, runtime: runtime.get(node.id), workload_count: assignments.get(node.id) || 0 }));
   const columns: Array<EuiBasicTableColumn<HostItem>> = [
@@ -167,6 +290,7 @@ export function HostsPage() {
       { name: 'Edit zone', description: 'Assign a zone defined by the selected cluster', icon: 'globe', type: 'icon' as const, available: () => Boolean(selectedCluster?.zoning?.zones.length), onClick: (item: NodeRecord) => { setZoneId(item.zone_id || selectedCluster?.zoning?.zones[0] || ''); setZoneEdit(item); } },
       { name: 'Initialize', description: 'Install prerequisites and enable Podman socket', icon: 'play', type: 'icon' as const, onClick: (item: NodeRecord) => setConfirm({ action: 'initialize', node: item }) },
       { name: 'De-initialize', description: 'Remove controller-owned host setup', icon: 'stop', type: 'icon' as const, available: (item: HostItem) => item.runtime?.initialized === true, onClick: (item: NodeRecord) => setConfirm({ action: 'deinitialize', node: item }) },
+      { name: 'Plan maintenance', description: 'Preview zero-impact maintenance safety and affected workloads', icon: 'calendar', type: 'icon' as const, available: () => maintenanceCapabilities?.planning === true, onClick: openMaintenancePlan },
       { name: 'Reboot', description: 'Restart this host and wait for it to return', icon: 'refresh', color: 'danger', type: 'icon' as const, onClick: (item: NodeRecord) => setConfirm({ action: 'reboot', node: item }) },
       { name: 'Edit', description: 'Edit inventory host', icon: 'pencil', type: 'icon' as const, onClick: (item: NodeRecord) => setEditing(item) },
       { name: 'Delete', description: 'Delete inventory record', icon: 'trash', color: 'danger', type: 'icon' as const, onClick: (item: NodeRecord) => { setRevokeOnDelete(false); setConfirm({ action: 'delete', node: item }); } },
@@ -203,6 +327,52 @@ export function HostsPage() {
         <EuiModalHeader><EuiModalHeaderTitle>Edit zone for {zoneEdit.name}</EuiModalHeaderTitle></EuiModalHeader>
         <EuiModalBody><EuiText size="s"><p>The host zone is a physical attribute shared by every cluster that uses this host. Active Elasticsearch workloads are reconciled and rolled back if readiness fails.</p></EuiText><EuiSpacer /><EuiFormRow label="Host zone"><EuiSelect data-autofocus value={zoneId} onChange={(event) => setZoneId(event.target.value)} options={(selectedCluster.zoning?.zones || []).map((zone) => ({ value: zone, text: zone }))} /></EuiFormRow></EuiModalBody>
         <EuiModalFooter><EuiButtonEmpty onClick={() => { setZoneEdit(undefined); setZoneId(''); }}>Cancel</EuiButtonEmpty><EuiButton fill onClick={saveZone} isLoading={zoneBusy} disabled={!zoneId}>Save zone</EuiButton></EuiModalFooter>
+      </EuiModal></EuiOverlayMask>}
+      {maintenanceNode && <EuiOverlayMask><EuiModal onClose={closeMaintenancePlan} maxWidth={1000} initialFocus="[data-autofocus]">
+        <EuiModalHeader><EuiModalHeaderTitle>Plan maintenance for {maintenanceNode.name}</EuiModalHeaderTitle></EuiModalHeader>
+        <EuiModalBody>
+          {maintenanceError && <><EuiCallOut title="Maintenance request failed" color="danger" iconType="warning">{maintenanceError}</EuiCallOut><EuiSpacer /></>}
+          {maintenancePlanQuery.isError && maintenancePlan ? <><EuiCallOut title="Maintenance status refresh failed" color="warning" iconType="warning">
+            <p>{maintenancePlanQuery.error instanceof Error ? maintenancePlanQuery.error.message : 'The latest persisted maintenance state could not be loaded.'}</p>
+            <EuiButton size="s" iconType="refresh" onClick={() => maintenancePlanQuery.refetch()} isLoading={maintenancePlanQuery.isFetching}>Retry status refresh</EuiButton>
+          </EuiCallOut><EuiSpacer /></> : null}
+          {maintenancePlan ? <><MaintenancePlanPreview
+            plan={maintenancePlan.view}
+            actionControls={maintenancePlanActionControls}
+            busyAction={maintenanceActionBusy}
+            onAction={runMaintenanceAction}
+            formatTimestamp={(value) => formatDateTime(value)}
+          />
+            {maintenancePlan.operation && maintenanceOperationState && !['ready', 'blocked', 'draft'].includes(maintenanceOperationState) ? <>
+              <EuiSpacer />
+              <MaintenanceOperationProgress progress={maintenancePlan.operation.progress} formatTimestamp={(value) => formatDateTime(value)} />
+              <EuiSpacer />
+              <MaintenanceOperationActions
+                lifecycleState={maintenancePlan.operation.progress.lifecycleState}
+                safeCheckpoint={maintenancePlan.operation.safe_checkpoint}
+                safeCheckpointReason={maintenancePlan.operation.safe_checkpoint_reason}
+                controls={maintenanceActionControls}
+                busyAction={maintenanceActionBusy && maintenanceActionBusy !== 'execute' ? maintenanceActionBusy : undefined}
+                onAction={runMaintenanceAction}
+              />
+            </> : null}
+          </> : <>
+            <EuiCallOut title="Planning only" color="primary" iconType="inspect">
+              This collects current observations and evaluates every affected cluster. It does not reboot the host, restart workloads, or change Elasticsearch settings.
+            </EuiCallOut>
+            <EuiSpacer />
+            <EuiFormRow label="Reason" helpText="Recorded with the immutable maintenance plan and audit history.">
+              <EuiTextArea data-autofocus value={maintenanceReason} onChange={(event) => setMaintenanceReason(event.target.value)} rows={3} maxLength={512} />
+            </EuiFormRow>
+            <EuiFormRow label="Availability mode">
+              <EuiFieldText value="Zero impact" readOnly />
+            </EuiFormRow>
+          </>}
+        </EuiModalBody>
+        <EuiModalFooter>
+          <EuiButtonEmpty onClick={closeMaintenancePlan}>{maintenancePlan ? 'Close' : 'Cancel'}</EuiButtonEmpty>
+          {!maintenancePlan && <EuiButton fill iconType="inspect" onClick={createMaintenancePlan} isLoading={maintenanceBusy} disabled={!maintenanceReason.trim()}>Create plan</EuiButton>}
+        </EuiModalFooter>
       </EuiModal></EuiOverlayMask>}
     </div>
   );

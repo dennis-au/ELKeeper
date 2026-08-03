@@ -1,0 +1,32 @@
+[Unit]
+Description=ELKeeper one-shot maintenance recovery for operation %i
+After=local-fs.target network-online.target podman.socket
+Wants=network-online.target
+ConditionPathExists=/var/lib/elastic-control/maintenance/operations/%i/manifest.json
+ConditionPathExists=/var/lib/elastic-control/maintenance/operations/%i/signing-key.pem
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/libexec/elkeeper/ecp-maintenance-resume %i
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/elastic-control/maintenance/operations/%i
+TimeoutStartSec=3700
+
+[Install]
+WantedBy=multi-user.target

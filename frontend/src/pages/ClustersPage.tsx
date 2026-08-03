@@ -7,6 +7,7 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, jsonBody } from '../api';
 import { useConsole } from '../app-context';
+import { MaintenancePolicyEditor } from '../components/maintenance';
 import type { Cluster, ElasticsearchSettings, LogMonitoring, PortProfile, RolePortProfile, VersionResponse, ZoningConfig } from '../types';
 
 const defaultPorts: PortProfile = { elasticsearch_http: 9200, elasticsearch_transport: 9300, kibana: 5601, fleet: 8220, logstash_api: 9600 };
@@ -153,6 +154,7 @@ function ClusterEditor({ cluster, onClose }: { cluster?: Cluster; onClose: () =>
         <EuiFlexGroup justifyContent="flexEnd" gutterSize="s"><EuiButtonEmpty onClick={onClose}>Cancel</EuiButtonEmpty><EuiButton type="submit" fill isLoading={busy}>Save cluster</EuiButton></EuiFlexGroup>
       </EuiForm>
       {cluster && <div className="cluster-editor-operations">
+        <MaintenancePolicyEditor clusterId={cluster.id} />
         <ZoningPanel cluster={cluster} />
         <SettingsEditor cluster={cluster} />
         <LogMonitoringPanel cluster={cluster} />
