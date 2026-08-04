@@ -1,0 +1,90 @@
+name: Scheduled code review and release
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scheduled-code-review
+  cancel-in-progress: false
+
+jobs:
+  review-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          npm --prefix frontend ci --no-audit --no-fund
+
+      - name: Run review gates
+        run: |
+          git diff --check
+          python tools/run_test_profile.py 5mins --root .
+          npm --prefix frontend run build
+          for playbook in ansible/playbooks/*.yml; do
+            ansible-playbook --syntax-check "$playbook"
+          done
+
+      - name: Detect releasable changes
+        id: changes
+        shell: bash
+        run: |
+          base_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n 1)"
+          test -n "$base_tag"
+          echo "base_tag=$base_tag" >> "$GITHUB_OUTPUT"
+          if git diff --quiet "$base_tag"..HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes since $base_tag; review complete without a release."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare release metadata
+        if: steps.changes.outputs.changed == 'true'
+        id: release
+        shell: bash
+        run: |
+          notes_path="$RUNNER_TEMP/elkeeper-release-notes.md"
+          version="$(python tools/prepare_release.py --base-tag "${{ steps.changes.outputs.base_tag }}" --notes-path "$notes_path")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "notes_path=$notes_path" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        if: steps.changes.outputs.changed == 'true' && steps.release.outputs.version != 'NO_RELEASE'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          version="${{ steps.release.outputs.version }}"
+          tag="v$version"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md frontend/package.json frontend/package-lock.json
+          git commit -m "chore: release $tag"
+          git tag -a "$tag" -m "ELKeeper $tag"
+          git push origin main "$tag"
+          gh release create "$tag" --title "ELKeeper $tag" --notes-file "${{ steps.release.outputs.notes_path }}" --target "$tag"
