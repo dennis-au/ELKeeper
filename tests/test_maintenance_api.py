@@ -405,7 +405,7 @@ class MaintenanceApiTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
 
     def test_ready_maintenance_plan_blocks_overlapping_legacy_cluster_mutation(self):
-        from app.maintenance_store import MaintenanceRepository
+        from app.modules.maintenance.store import MaintenanceRepository
 
         headers = self.login()
         cluster_id = self.cluster(headers)

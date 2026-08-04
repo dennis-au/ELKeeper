@@ -5,9 +5,10 @@ import {
 } from '@elastic/eui';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { queries, setToken } from '../api';
+import { authApi } from '../features/auth';
+import { clusterApi } from '../features/clusters';
 import { ConsoleContext, type NavigationGuard } from '../app-context';
-import { ActionConsole } from './ActionConsole';
+import { ActionConsole } from '../features/runs/components/ActionConsole';
 
 const pages = [
   { path: '/dashboard', label: 'Dashboard' },
@@ -27,7 +28,7 @@ export function Shell() {
   const location = useLocation();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const { data: clusters = [] } = useQuery({ queryKey: ['clusters'], queryFn: queries.clusters, refetchInterval: 15000 });
+  const { data: clusters = [] } = useQuery({ queryKey: ['clusters'], queryFn: clusterApi.list, refetchInterval: 15000 });
   const [selectedClusterId, setSelectedClusterIdState] = useState<number>(() => Number(localStorage.getItem('elastic-selected-cluster')) || 0);
   const [watchedRunId, setWatchedRunId] = useState<number>();
   const [navOpen, setNavOpen] = useState(() => !isMobileNavigation());
@@ -115,7 +116,7 @@ export function Shell() {
           </EuiHeaderSection>
           <EuiHeaderSection side="right">
             <EuiHeaderSectionItem><EuiButtonIcon iconType="refresh" aria-label="Refresh all data" onClick={refreshAll} /></EuiHeaderSectionItem>
-            <EuiHeaderSectionItem><EuiButtonIcon iconType="exit" aria-label="Sign out" onClick={() => runGuarded(() => { setToken(''); navigate('/'); })} /></EuiHeaderSectionItem>
+            <EuiHeaderSectionItem><EuiButtonIcon iconType="exit" aria-label="Sign out" onClick={() => runGuarded(() => { authApi.setToken(''); navigate('/'); })} /></EuiHeaderSectionItem>
           </EuiHeaderSection>
         </EuiHeader>
         <aside id="primary-navigation" className="app-sidebar">

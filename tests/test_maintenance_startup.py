@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from app.maintenance_store import MaintenanceRepository
+from app.modules.maintenance.store import MaintenanceRepository
 
 
 class MaintenanceStartupTests(unittest.TestCase):

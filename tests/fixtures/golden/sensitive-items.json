@@ -1,0 +1,12 @@
+{
+  "route": "GET /api/clusters/{cluster_id}/sensitive-items",
+  "response": {
+    "items": [
+      {
+        "category": "Credentials",
+        "id": "cluster-credential",
+        "masked_value": "********"
+      }
+    ]
+  }
+}

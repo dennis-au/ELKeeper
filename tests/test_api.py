@@ -83,7 +83,7 @@ class ApiTests(unittest.TestCase):
         frontend = root / "frontend"
         if (frontend / "index.html").is_file() and (frontend / "src").is_dir():
             markup = (frontend / "index.html").read_text()
-            source_files = frontend.joinpath("src").rglob("*.tsx")
+            source_files = frontend.joinpath("src").rglob("*.ts*")
         else:
             frontend = root / "static"
             markup = (frontend / "index.html").read_text()

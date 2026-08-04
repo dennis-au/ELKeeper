@@ -1,0 +1,485 @@
+[
+  {
+    "file": "app/modules/platform/http.py",
+    "handler": "index",
+    "method": "GET",
+    "owner": "platform.app",
+    "path": "/"
+  },
+  {
+    "file": "app/modules/workloads/http.py",
+    "handler": "remove_assignment",
+    "method": "DELETE",
+    "owner": "workloads",
+    "path": "/api/assignments/{assignment_id}"
+  },
+  {
+    "file": "app/modules/workloads/http.py",
+    "handler": "apply_assignment",
+    "method": "POST",
+    "owner": "workloads",
+    "path": "/api/assignments/{assignment_id}/apply"
+  },
+  {
+    "file": "app/modules/workloads/http.py",
+    "handler": "update_resources",
+    "method": "PUT",
+    "owner": "workloads",
+    "path": "/api/assignments/{assignment_id}/resources"
+  },
+  {
+    "file": "app/modules/platform/http.py",
+    "handler": "login",
+    "method": "POST",
+    "owner": "platform.security",
+    "path": "/api/auth/login"
+  },
+  {
+    "file": "app/modules/secrets/http.py",
+    "handler": "create_reveal_grant",
+    "method": "POST",
+    "owner": "secrets",
+    "path": "/api/auth/reveal-grants"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "clusters",
+    "method": "GET",
+    "owner": "clusters",
+    "path": "/api/clusters"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "create",
+    "method": "POST",
+    "owner": "clusters",
+    "path": "/api/clusters"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "remove",
+    "method": "DELETE",
+    "owner": "clusters",
+    "path": "/api/clusters/{cluster_id}"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "cluster",
+    "method": "GET",
+    "owner": "clusters",
+    "path": "/api/clusters/{cluster_id}"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "update",
+    "method": "PUT",
+    "owner": "clusters",
+    "path": "/api/clusters/{cluster_id}"
+  },
+  {
+    "file": "app/modules/workloads/http.py",
+    "handler": "add_assignment",
+    "method": "POST",
+    "owner": "workloads",
+    "path": "/api/clusters/{cluster_id}/assignments"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "get_cluster_log_monitoring",
+    "method": "GET",
+    "owner": "log_monitoring",
+    "path": "/api/clusters/{cluster_id}/log-monitoring"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "update_cluster_log_monitoring",
+    "method": "PUT",
+    "owner": "log_monitoring",
+    "path": "/api/clusters/{cluster_id}/log-monitoring"
+  },
+  {
+    "file": "app/modules/maintenance/api.py",
+    "handler": "get_maintenance_policy",
+    "method": "GET",
+    "owner": "maintenance",
+    "path": "/api/clusters/{cluster_id}/maintenance-policy"
+  },
+  {
+    "file": "app/modules/maintenance/api.py",
+    "handler": "put_maintenance_policy",
+    "method": "PUT",
+    "owner": "maintenance",
+    "path": "/api/clusters/{cluster_id}/maintenance-policy"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "add_member",
+    "method": "POST",
+    "owner": "clusters",
+    "path": "/api/clusters/{cluster_id}/members"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "remove_member",
+    "method": "DELETE",
+    "owner": "clusters",
+    "path": "/api/clusters/{cluster_id}/members/{node_id}"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "update_member",
+    "method": "PUT",
+    "owner": "clusters",
+    "path": "/api/clusters/{cluster_id}/members/{node_id}"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "provider",
+    "method": "GET",
+    "owner": "clusters",
+    "path": "/api/clusters/{cluster_id}/provider"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "update_provider_route",
+    "method": "PUT",
+    "owner": "clusters",
+    "path": "/api/clusters/{cluster_id}/provider"
+  },
+  {
+    "file": "app/modules/secrets/http.py",
+    "handler": "sensitive_items",
+    "method": "GET",
+    "owner": "secrets",
+    "path": "/api/clusters/{cluster_id}/sensitive-items"
+  },
+  {
+    "file": "app/modules/secrets/http.py",
+    "handler": "reveal_sensitive_item",
+    "method": "POST",
+    "owner": "secrets",
+    "path": "/api/clusters/{cluster_id}/sensitive-items/{item_id}/reveal"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "cluster_settings",
+    "method": "GET",
+    "owner": "clusters",
+    "path": "/api/clusters/{cluster_id}/settings"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "update_cluster_settings",
+    "method": "PUT",
+    "owner": "clusters",
+    "path": "/api/clusters/{cluster_id}/settings"
+  },
+  {
+    "file": "app/modules/workloads/http.py",
+    "handler": "cluster_topology",
+    "method": "GET",
+    "owner": "workloads",
+    "path": "/api/clusters/{cluster_id}/topology"
+  },
+  {
+    "file": "app/modules/versions/http.py",
+    "handler": "upgrade_cluster",
+    "method": "POST",
+    "owner": "clusters",
+    "path": "/api/clusters/{cluster_id}/upgrades"
+  },
+  {
+    "file": "app/modules/versions/http.py",
+    "handler": "get_cluster_versions",
+    "method": "GET",
+    "owner": "versions",
+    "path": "/api/clusters/{cluster_id}/versions"
+  },
+  {
+    "file": "app/modules/versions/http.py",
+    "handler": "download_cluster_versions",
+    "method": "POST",
+    "owner": "versions",
+    "path": "/api/clusters/{cluster_id}/versions/download"
+  },
+  {
+    "file": "app/modules/versions/http.py",
+    "handler": "refresh_cluster_versions",
+    "method": "POST",
+    "owner": "versions",
+    "path": "/api/clusters/{cluster_id}/versions/refresh"
+  },
+  {
+    "file": "app/modules/workloads/http.py",
+    "handler": "apply_workload_changes",
+    "method": "POST",
+    "owner": "workloads",
+    "path": "/api/clusters/{cluster_id}/workload-changes/apply"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "get_cluster_zoning",
+    "method": "GET",
+    "owner": "clusters",
+    "path": "/api/clusters/{cluster_id}/zoning"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "update_cluster_zoning",
+    "method": "PUT",
+    "owner": "clusters",
+    "path": "/api/clusters/{cluster_id}/zoning"
+  },
+  {
+    "file": "app/modules/clusters/http.py",
+    "handler": "apply_cluster_zoning",
+    "method": "POST",
+    "owner": "clusters",
+    "path": "/api/clusters/{cluster_id}/zoning/apply"
+  },
+  {
+    "file": "app/modules/controller_identity/http.py",
+    "handler": "get_controller_settings",
+    "method": "GET",
+    "owner": "controller_identity",
+    "path": "/api/controller/settings"
+  },
+  {
+    "file": "app/modules/controller_identity/http.py",
+    "handler": "update_controller_settings",
+    "method": "PUT",
+    "owner": "controller_identity",
+    "path": "/api/controller/settings"
+  },
+  {
+    "file": "app/modules/controller_identity/http.py",
+    "handler": "controller_ssh_key",
+    "method": "GET",
+    "owner": "controller_identity",
+    "path": "/api/controller/ssh-key"
+  },
+  {
+    "file": "app/modules/controller_identity/http.py",
+    "handler": "activate_controller_ssh_key",
+    "method": "POST",
+    "owner": "controller_identity",
+    "path": "/api/controller/ssh-key/activate"
+  },
+  {
+    "file": "app/modules/controller_identity/http.py",
+    "handler": "generate_controller_ssh_key",
+    "method": "POST",
+    "owner": "controller_identity",
+    "path": "/api/controller/ssh-key/generate"
+  },
+  {
+    "file": "app/modules/controller_identity/http.py",
+    "handler": "import_controller_ssh_key",
+    "method": "POST",
+    "owner": "controller_identity",
+    "path": "/api/controller/ssh-key/import"
+  },
+  {
+    "file": "app/modules/observability/http.py",
+    "handler": "dashboard_events",
+    "method": "GET",
+    "owner": "observability",
+    "path": "/api/dashboard/events"
+  },
+  {
+    "file": "app/modules/observability/http.py",
+    "handler": "dashboard_snapshot",
+    "method": "GET",
+    "owner": "observability",
+    "path": "/api/dashboard/snapshot"
+  },
+  {
+    "file": "app/modules/observability/http.py",
+    "handler": "dashboard_stream_token",
+    "method": "POST",
+    "owner": "observability",
+    "path": "/api/dashboard/stream-token"
+  },
+  {
+    "file": "app/modules/platform/http.py",
+    "handler": "health",
+    "method": "GET",
+    "owner": "platform.app",
+    "path": "/api/health"
+  },
+  {
+    "file": "app/modules/hosts/http.py",
+    "handler": "initialize_hosts",
+    "method": "POST",
+    "owner": "hosts",
+    "path": "/api/hosts/initialize"
+  },
+  {
+    "file": "app/modules/maintenance/http.py",
+    "handler": "maintenance_capabilities",
+    "method": "GET",
+    "owner": "maintenance",
+    "path": "/api/maintenance/capabilities"
+  },
+  {
+    "file": "app/modules/maintenance/api.py",
+    "handler": "get_maintenance_plan",
+    "method": "GET",
+    "owner": "maintenance",
+    "path": "/api/maintenance/plans/{plan_id}"
+  },
+  {
+    "file": "app/modules/maintenance/api.py",
+    "handler": "maintenance_action",
+    "method": "POST",
+    "owner": "maintenance",
+    "path": "/api/maintenance/plans/{plan_id}/{action}"
+  },
+  {
+    "file": "app/modules/hosts/http.py",
+    "handler": "nodes",
+    "method": "GET",
+    "owner": "hosts",
+    "path": "/api/nodes"
+  },
+  {
+    "file": "app/modules/hosts/http.py",
+    "handler": "create",
+    "method": "POST",
+    "owner": "hosts",
+    "path": "/api/nodes"
+  },
+  {
+    "file": "app/modules/hosts/http.py",
+    "handler": "enroll_node",
+    "method": "POST",
+    "owner": "hosts",
+    "path": "/api/nodes/enroll"
+  },
+  {
+    "file": "app/modules/hosts/http.py",
+    "handler": "test_node_password",
+    "method": "POST",
+    "owner": "hosts",
+    "path": "/api/nodes/test-password"
+  },
+  {
+    "file": "app/modules/hosts/http.py",
+    "handler": "delete_node",
+    "method": "DELETE",
+    "owner": "hosts",
+    "path": "/api/nodes/{node_id}"
+  },
+  {
+    "file": "app/modules/hosts/http.py",
+    "handler": "update_node",
+    "method": "PUT",
+    "owner": "hosts",
+    "path": "/api/nodes/{node_id}"
+  },
+  {
+    "file": "app/modules/hosts/http.py",
+    "handler": "install_controller_key",
+    "method": "POST",
+    "owner": "controller_identity",
+    "path": "/api/nodes/{node_id}/controller-key"
+  },
+  {
+    "file": "app/modules/hosts/http.py",
+    "handler": "deinitialize_node",
+    "method": "POST",
+    "owner": "hosts",
+    "path": "/api/nodes/{node_id}/deinitialize"
+  },
+  {
+    "file": "app/modules/hosts/http.py",
+    "handler": "initialize_node",
+    "method": "POST",
+    "owner": "hosts",
+    "path": "/api/nodes/{node_id}/initialize"
+  },
+  {
+    "file": "app/modules/hosts/http.py",
+    "handler": "remove_legacy_known_hosts_record",
+    "method": "POST",
+    "owner": "hosts",
+    "path": "/api/nodes/{node_id}/legacy-known-hosts/remove"
+  },
+  {
+    "file": "app/modules/maintenance/api.py",
+    "handler": "create_host_maintenance_plan",
+    "method": "POST",
+    "owner": "maintenance",
+    "path": "/api/nodes/{node_id}/maintenance/plans"
+  },
+  {
+    "file": "app/modules/hosts/http.py",
+    "handler": "probe",
+    "method": "POST",
+    "owner": "hosts",
+    "path": "/api/nodes/{node_id}/probe"
+  },
+  {
+    "file": "app/modules/hosts/http.py",
+    "handler": "reboot_node",
+    "method": "POST",
+    "owner": "maintenance",
+    "path": "/api/nodes/{node_id}/reboot"
+  },
+  {
+    "file": "app/modules/workloads/http.py",
+    "handler": "legacy_add_role",
+    "method": "POST",
+    "owner": "workloads.compatibility",
+    "path": "/api/nodes/{node_id}/roles"
+  },
+  {
+    "file": "app/modules/workloads/http.py",
+    "handler": "legacy_remove_role",
+    "method": "DELETE",
+    "owner": "workloads.compatibility",
+    "path": "/api/nodes/{node_id}/roles/{role}"
+  },
+  {
+    "file": "app/modules/observability/http.py",
+    "handler": "node_runtime",
+    "method": "GET",
+    "owner": "observability",
+    "path": "/api/nodes/{node_id}/runtime"
+  },
+  {
+    "file": "app/modules/hosts/http.py",
+    "handler": "node_storage",
+    "method": "GET",
+    "owner": "hosts",
+    "path": "/api/nodes/{node_id}/storage"
+  },
+  {
+    "file": "app/modules/hosts/http.py",
+    "handler": "update_node_zone",
+    "method": "PUT",
+    "owner": "hosts",
+    "path": "/api/nodes/{node_id}/zone"
+  },
+  {
+    "file": "app/modules/platform/http.py",
+    "handler": "runs",
+    "method": "GET",
+    "owner": "platform.runs",
+    "path": "/api/runs"
+  },
+  {
+    "file": "app/modules/platform/http.py",
+    "handler": "events",
+    "method": "GET",
+    "owner": "platform.runs",
+    "path": "/api/runs/{run_id}/events"
+  },
+  {
+    "file": "app/modules/platform/http.py",
+    "handler": "frontend",
+    "method": "GET",
+    "owner": "platform.app",
+    "path": "/{frontend_path:path}"
+  }
+]

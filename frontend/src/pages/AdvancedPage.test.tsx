@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConsoleContext } from '../app-context';
-import type { Cluster } from '../types';
+import type { Cluster } from '../features/clusters';
 import { AdvancedPage } from './AdvancedPage';
 
 const state = vi.hoisted(() => ({
@@ -14,7 +14,7 @@ const state = vi.hoisted(() => ({
   request: vi.fn(),
 }));
 
-vi.mock('../api', () => ({
+vi.mock('../shared/api', () => ({
   api: (...args: unknown[]) => state.request(...args),
   jsonBody: vi.fn((value) => ({ body: JSON.stringify(value), headers: { 'Content-Type': 'application/json' } })),
 }));

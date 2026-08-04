@@ -31,7 +31,7 @@ from app.maintenance_reboot import (
     ReconnectObservation,
     SshDisconnectObservation,
 )
-from app.maintenance_store import MaintenanceRepository, install_maintenance_schema
+from app.modules.maintenance.store import MaintenanceRepository, install_maintenance_schema
 
 
 NOW = datetime(2026, 8, 3, 0, 0, tzinfo=timezone.utc)

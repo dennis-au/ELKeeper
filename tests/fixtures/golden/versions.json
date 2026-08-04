@@ -1,0 +1,8 @@
+{
+  "route": "GET /api/clusters/{cluster_id}/versions",
+  "response": {
+    "available_versions": [],
+    "cluster_id": 1,
+    "observations": []
+  }
+}

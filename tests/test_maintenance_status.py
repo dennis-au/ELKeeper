@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.maintenance_lifecycle import MaintenanceState, MaintenanceStepState, SideEffectState
 from app.maintenance_status import MaintenanceActionCapabilities, serialize_maintenance_operation
-from app.maintenance_store import MaintenanceRepository, install_maintenance_schema
+from app.modules.maintenance.store import MaintenanceRepository, install_maintenance_schema
 
 
 NOW = datetime(2026, 8, 3, tzinfo=timezone.utc)

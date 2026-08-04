@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter, Outlet, Route, Routes } from 'react-router-dom';
 import { Shell } from './Shell';
 
-vi.mock('./ActionConsole', () => ({ ActionConsole: () => null }));
+vi.mock('../features/runs/components/ActionConsole', () => ({ ActionConsole: () => null }));
 
 function renderShell() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });

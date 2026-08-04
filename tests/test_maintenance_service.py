@@ -22,7 +22,7 @@ from app.maintenance_service import (
     MaintenancePlanningService,
     build_host_reboot_snapshot,
 )
-from app.maintenance_store import (
+from app.modules.maintenance.store import (
     IdempotencyConflict,
     MaintenanceRepository,
     install_maintenance_schema,

@@ -1,0 +1,11 @@
+{
+  "route": "GET /api/nodes",
+  "response": [
+    {
+      "address": "192.0.2.10",
+      "enabled": true,
+      "id": 1,
+      "name": "node-a"
+    }
+  ]
+}

@@ -13,9 +13,11 @@ describe('console entry', () => {
   it('shows the in-page sign-in form without browser dialogs', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/']}><App /></MemoryRouter></QueryClientProvider>);
+    expect(screen.getByRole('img', { name: 'ELKeeper logo' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Sign in' })).toBeInTheDocument();
     expect(screen.getByLabelText('Username')).toBeInTheDocument();
     expect(screen.getByLabelText('Password')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Sign in' })).toBeDisabled();
   });
 
   it('contains no native alert, confirm, or prompt interactions', () => {

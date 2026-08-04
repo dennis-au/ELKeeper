@@ -2,6 +2,26 @@
 
 All notable changes to ELKeeper are documented in this file.
 
+## [1.2.0] - 2026-08-04
+
+### Changed
+
+- Refactored the controller into explicit platform, orchestration, host,
+  controller-identity, cluster, workload, version, observability, secret,
+  certificate, and maintenance modules while retaining compatibility facades.
+- Moved frontend behavior into feature-owned API clients, DTOs, components, and
+  route-page composition facades without changing the primary application routes.
+- Added checked-in route inventory, DTO fixtures, ownership metadata, and a
+  regression ledger for modular-controller release evidence.
+
+### Safety
+
+- Added strict checks that reject route-level SQL, private repository imports,
+  undeclared cross-owner reads, boundary violations, lab addresses, and insecure
+  Podman TCP endpoints.
+- Consolidated lifecycle, run, SSE, redaction, migration, remote-command, and
+  telemetry seams behind public feature contracts.
+
 ## [1.1.0] - 2026-08-03
 
 ### Added

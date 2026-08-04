@@ -91,13 +91,30 @@ function maintenancePlanResponse(
   };
 }
 
-vi.mock('../api', () => ({
-  api: apiMock,
-  jsonBody: vi.fn((value) => ({ body: JSON.stringify(value), headers: { 'Content-Type': 'application/json' } })),
-  queries: {
-    nodes: () => Promise.resolve(state.nodes),
-    dashboard: () => Promise.resolve(state.dashboard),
-    maintenanceCapabilities: () => Promise.resolve(state.maintenanceCapabilities),
+vi.mock('../features/hosts', () => ({
+  hostApi: {
+    list: () => Promise.resolve(state.nodes),
+    testPassword: (input: unknown) => apiMock('/api/nodes/test-password', { method: 'POST', body: JSON.stringify(input) }),
+    save: (nodeId: number | undefined, input: unknown) => apiMock(nodeId ? `/api/nodes/${nodeId}` : '/api/nodes/enroll', { method: nodeId ? 'PUT' : 'POST', body: JSON.stringify(input) }),
+    removeLegacyKnownHosts: (nodeId: number) => apiMock(`/api/nodes/${nodeId}/legacy-known-hosts/remove`, { method: 'POST' }),
+    remove: (nodeId: number, query = '') => apiMock(`/api/nodes/${nodeId}${query ? `?${query}` : ''}`, { method: 'DELETE' }),
+    action: (nodeId: number, action: string) => apiMock(`/api/nodes/${nodeId}/${action}`, { method: 'POST' }),
+    probe: (nodeId: number) => apiMock(`/api/nodes/${nodeId}/probe`, { method: 'POST' }),
+    installControllerKey: (nodeId: number, password: string) => apiMock(`/api/nodes/${nodeId}/controller-key`, { method: 'POST', body: JSON.stringify({ password }) }),
+    updateZone: (nodeId: number, input: unknown) => apiMock(`/api/nodes/${nodeId}/zone`, { method: 'PUT', body: JSON.stringify(input) }),
+    getMaintenancePlan: (planId: string) => apiMock(`/api/maintenance/plans/${planId}`),
+    createMaintenancePlan: (nodeId: number, input: unknown) => apiMock(`/api/nodes/${nodeId}/maintenance/plans`, { method: 'POST', body: JSON.stringify(input) }),
+    maintenanceAction: (planId: string, action: string) => apiMock(`/api/maintenance/plans/${planId}/${action}`, { method: 'POST' }),
+  },
+}));
+
+vi.mock('../features/dashboard', () => ({
+  dashboardApi: { snapshot: () => Promise.resolve(state.dashboard) },
+}));
+
+vi.mock('../features/maintenance', () => ({
+  maintenanceApi: {
+    capabilities: () => Promise.resolve(state.maintenanceCapabilities),
   },
 }));
 

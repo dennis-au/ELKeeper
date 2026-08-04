@@ -2,7 +2,8 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConsoleContext } from '../app-context';
-import type { Cluster, DashboardSnapshot } from '../types';
+import type { Cluster } from '../features/clusters';
+import type { DashboardSnapshot } from '../features/dashboard';
 import { DashboardPage } from './DashboardPage';
 
 const state = vi.hoisted(() => {
@@ -30,11 +31,13 @@ const state = vi.hoisted(() => {
   return { data: initialData, initialData };
 });
 
-vi.mock('../api', () => ({
-  api: vi.fn((path: string) => path === '/api/clusters/1/topology'
-    ? Promise.resolve({ topology: '', access_urls: [{ assignment_id: 10, role: 'kibana', label: 'Kibana', audience: 'browser', url: 'https://192.0.2.102:5601' }] })
-    : Promise.resolve({ token: 'dashboard-stream-token' })),
-  queries: { dashboard: vi.fn(() => Promise.resolve(state.data)) },
+vi.mock('../features/dashboard', () => ({
+  dashboardApi: {
+    snapshot: vi.fn(() => Promise.resolve(state.data)),
+    controllerSettings: vi.fn(() => Promise.resolve({ timezone: 'UTC' })),
+    topology: vi.fn(() => Promise.resolve({ topology: '', access_urls: [{ assignment_id: 10, role: 'kibana', label: 'Kibana', audience: 'browser', url: 'https://192.0.2.102:5601' }] })),
+    streamToken: vi.fn(() => Promise.resolve({ token: 'dashboard-stream-token' })),
+  },
 }));
 
 vi.mock('echarts-for-react', () => ({ default: () => <div data-testid="echarts-chart" /> }));

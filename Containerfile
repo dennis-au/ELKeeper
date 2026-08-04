@@ -26,6 +26,7 @@ COPY app ./app
 COPY --from=frontend-build /frontend/dist ./static
 COPY ansible ./ansible
 COPY tests ./tests
+COPY tools ./tools
 COPY reference ./reference
 
 EXPOSE 8080

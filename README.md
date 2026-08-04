@@ -49,6 +49,43 @@ Browsers communicate only with the FastAPI controller. Managed hosts are
 reached through controller-owned SSH credentials. Podman uses its rootful Unix
 socket; ELKeeper does not expose a Podman TCP listener.
 
+## Module Boundaries
+
+ELKeeper is a modular monolith. `app.main` is the application assembly and
+compatibility surface; new domain behavior belongs in an owning module rather
+than in a route page or the controller entry point.
+
+| Module | Owns | Public entry points |
+| --- | --- | --- |
+| `platform` | lifecycle, SQLite, migrations, authentication, security, audit, runs | `app.modules.platform` |
+| `orchestration` | typed SSH, Podman, Elasticsearch, and remote-file adapters | `app.modules.orchestration` |
+| `hosts` and `controller_identity` | host inventory, enrollment, SSH identity lifecycle | `app.modules.hosts`, `app.modules.controller_identity` |
+| `clusters` | cluster inventory, membership, NIC and provider policy | `app.modules.clusters` |
+| `workloads` | assignments, resources, batches, topology, managed cleanup | `app.modules.workloads` |
+| `versions` | registry discovery, image cache, download-only, guarded upgrades | `app.modules.versions` |
+| `observability` | bounded telemetry, Podman tunnels, dashboard/runtime projections | `app.modules.observability` |
+| `secrets` and `certificates` | masked metadata, audited reveal, certificate planning | `app.modules.secrets`, `app.modules.certificates` |
+| `maintenance` | plans, locks, recovery, execution, persistence | `app.modules.maintenance` |
+
+Modules expose public contracts from their package root, `contracts.py`,
+`repository.py`, `service.py`, or an HTTP router builder. Other modules must
+not import private implementation files or write another module's tables
+directly. Route and table ownership are declared in
+`app/refactor_ownership.py` and enforced by the boundary tools.
+
+### Adding A Module Slice
+
+1. Define public DTOs and a service/repository contract in the owning module.
+2. Keep SQL and remote mutation inside that module's repository or adapter.
+3. Inject cross-module providers from `app.main`; do not import `app.main`.
+4. Add module unit and HTTP integration tests before moving a compatibility
+   route or helper.
+5. Run the strict ownership checks and preserve response, run-ID, SSE, audit,
+   and redaction contracts.
+
+See [AGENTS.md](AGENTS.md) for the complete module map, named test profiles,
+and live-controller release rules.
+
 ## Technology
 
 - Python 3.13, FastAPI, Pydantic, SQLite, and cryptography
@@ -112,6 +149,7 @@ podman run -d --name elastic-control-plane --restart unless-stopped \
   -e SSH_KNOWN_HOSTS_PATH=/run/secrets/managed_nodes_known_hosts \
   -v "$PWD/data:/var/lib/elastic-control:Z" \
   -v "$PWD/config:/config:Z" \
+  -v "$PWD/playbooks:/opt/elastic-control/custom-playbooks:Z" \
   -v "$SSH_KEY_FILE:/run/secrets/managed_nodes_ssh_key:ro,Z" \
   -v "$SSH_KNOWN_HOSTS_FILE:/run/secrets/managed_nodes_known_hosts:ro,Z" \
   localhost/elkeeper:dev
@@ -161,6 +199,13 @@ Check an Ansible playbook before use:
 
 ```bash
 ansible-playbook --syntax-check ansible/playbooks/cluster-reconcile.yml
+```
+
+Run all strict refactor ownership checks from the repository root:
+
+```bash
+python tools/check_refactor_boundaries.py --strict
+python tools/check_table_ownership.py --strict
 ```
 
 ## Project Status

@@ -1,0 +1,15 @@
+{
+  "route": "GET /api/maintenance/plans/{plan_id}",
+  "response": {
+    "lifecycle_state": "ready",
+    "operation": {
+      "action_capabilities": {
+        "cancel": false,
+        "pause": false,
+        "recover": false,
+        "resume": false
+      }
+    },
+    "plan_id": "plan-example"
+  }
+}

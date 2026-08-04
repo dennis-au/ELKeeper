@@ -1,0 +1,7 @@
+{
+  "route": "GET /api/clusters/{cluster_id}/topology",
+  "response": {
+    "access_urls": [],
+    "topology": "Elastic Stack topology: elastic-lab"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "route": "GET /api/clusters",
+  "response": [
+    {
+      "assignments": [],
+      "id": 1,
+      "members": [],
+      "name": "elastic-lab",
+      "slug": "elastic-lab"
+    }
+  ]
+}

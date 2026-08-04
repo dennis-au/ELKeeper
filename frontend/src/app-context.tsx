@@ -1,5 +1,5 @@
 import { createContext, useContext } from 'react';
-import type { Cluster } from './types';
+import type { Cluster } from './features/clusters';
 
 export type NavigationGuard = (continueNavigation: () => void) => boolean;
 

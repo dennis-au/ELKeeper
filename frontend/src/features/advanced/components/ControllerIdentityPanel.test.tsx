@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { describe, expect, it, vi } from 'vitest';
 import { ControllerIdentityPanel } from './ControllerIdentityPanel';
 
-vi.mock('../api', () => ({
+vi.mock('../../../shared/api', () => ({
   api: vi.fn().mockResolvedValue({
     managed: false,
     active: {

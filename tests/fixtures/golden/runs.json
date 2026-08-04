@@ -1,0 +1,14 @@
+{
+  "route": "GET /api/runs",
+  "response": [
+    {
+      "context_json": null,
+      "finished_at": null,
+      "id": 1,
+      "kind": "probe",
+      "log": "",
+      "status": "running",
+      "target": "node-a"
+    }
+  ]
+}

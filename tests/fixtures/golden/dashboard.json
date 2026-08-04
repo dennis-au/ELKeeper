@@ -1,0 +1,8 @@
+{
+  "route": "GET /api/dashboard/snapshot",
+  "response": {
+    "alerts": [],
+    "clusters": [],
+    "hosts": []
+  }
+}

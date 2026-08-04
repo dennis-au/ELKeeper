@@ -17,9 +17,9 @@ import {
   EuiTitle,
 } from '@elastic/eui';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { api, jsonBody, queries } from '../../api';
-import { formatDateTime } from '../../format';
-import type { MaintenancePolicy, MaintenancePolicyResponse } from '../../types';
+import { maintenanceApi } from '../api';
+import { formatDateTime } from '../../../shared/format';
+import type { MaintenancePolicy, MaintenancePolicyResponse } from '../types';
 
 type MaintenancePolicyForm = Omit<MaintenancePolicy, 'minimum_master_eligible'> & {
   minimum_master_eligible: MaintenancePolicy['minimum_master_eligible'] | string;
@@ -94,13 +94,13 @@ export function MaintenancePolicyEditor({ clusterId }: { clusterId: number }) {
   const [conflict, setConflict] = useState(false);
   const { data: capabilities } = useQuery({
     queryKey: ['maintenance-capabilities'],
-    queryFn: queries.maintenanceCapabilities,
+    queryFn: maintenanceApi.capabilities,
     retry: false,
   });
   const enabled = capabilities?.planning === true;
   const policyQuery = useQuery({
     queryKey: ['maintenance-policy', clusterId],
-    queryFn: () => api<MaintenancePolicyResponse>(`/api/clusters/${clusterId}/maintenance-policy`),
+    queryFn: () => maintenanceApi.policy(clusterId),
     enabled,
     retry: false,
   });
@@ -115,9 +115,9 @@ export function MaintenancePolicyEditor({ clusterId }: { clusterId: number }) {
 
   const dirty = useMemo(() => Boolean(response) && JSON.stringify(policy) !== JSON.stringify(response?.policy), [policy, response]);
   const mutation = useMutation({
-    mutationFn: () => api<MaintenancePolicyResponse>(`/api/clusters/${clusterId}/maintenance-policy`, {
-      method: 'PUT',
-      ...jsonBody({ expected_revision: response?.revision ?? 0, policy: normalizedPolicy(policy) }),
+    mutationFn: () => maintenanceApi.updatePolicy(clusterId, {
+      expected_revision: response?.revision ?? 0,
+      policy: normalizedPolicy(policy),
     }),
     onSuccess: (updated) => {
       queryClient.setQueryData(['maintenance-policy', clusterId], updated);

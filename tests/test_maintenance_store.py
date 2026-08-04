@@ -17,7 +17,7 @@ from app.maintenance_lifecycle import (
     validate_plan_transition,
 )
 from app.maintenance_recovery import RecoveryClassification, RecoveryEvidence, classify_recovery
-from app.maintenance_store import (
+from app.modules.maintenance.store import (
     IdempotencyConflict,
     LockConflict,
     LockRequest,

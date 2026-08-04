@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { MaintenancePolicyResponse } from '../../types';
+import type { MaintenancePolicyResponse } from '../types';
 import { defaultMaintenancePolicy, MaintenancePolicyEditor } from './MaintenancePolicyEditor';
 
 const state = vi.hoisted(() => ({
@@ -43,15 +43,15 @@ const apiMock = vi.hoisted(() => vi.fn(async (path: string, options?: RequestIni
   return state.policyResponse;
 }));
 
-vi.mock('../../api', () => ({
-  api: apiMock,
-  jsonBody: vi.fn((value) => ({ body: JSON.stringify(value), headers: { 'Content-Type': 'application/json' } })),
-  queries: {
-    maintenanceCapabilities: () => Promise.resolve({
+vi.mock('../api', () => ({
+  maintenanceApi: {
+    capabilities: () => Promise.resolve({
       planning: state.planning,
       operations: { host_reboot: false, rolling_restart: false, upgrade: false, evacuation: false },
       backends: { documented_rolling: true, node_shutdown: false },
     }),
+    policy: () => apiMock('/api/clusters/7/maintenance-policy'),
+    updatePolicy: (_clusterId: number, input: unknown) => apiMock('/api/clusters/7/maintenance-policy', { method: 'PUT', body: JSON.stringify(input) }),
   },
 }));
 

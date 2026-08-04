@@ -11,7 +11,7 @@ from app.maintenance_execution import (
     MaintenanceValidationError,
 )
 from app.maintenance_lifecycle import MaintenanceState, SideEffectState
-from app.maintenance_store import LockRequest, MaintenanceRepository, install_maintenance_schema
+from app.modules.maintenance.store import LockRequest, MaintenanceRepository, install_maintenance_schema
 
 
 NOW = datetime(2026, 8, 3, 8, 0, tzinfo=timezone.utc)

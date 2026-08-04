@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ConsoleContext } from '../app-context';
-import type { Cluster } from '../types';
+import type { Cluster } from '../features/clusters';
 import { ClustersPage } from './ClustersPage';
 
 const state = vi.hoisted(() => ({
@@ -18,10 +18,16 @@ const state = vi.hoisted(() => ({
   }),
 }));
 
-vi.mock('../api', () => ({
+vi.mock('../shared/api', () => ({
   api: state.api,
   jsonBody: vi.fn((value) => ({ body: JSON.stringify(value), headers: { 'Content-Type': 'application/json' } })),
-  queries: { maintenanceCapabilities: () => Promise.resolve(state.maintenanceCapabilities) },
+}));
+vi.mock('../features/maintenance/api', () => ({
+  maintenanceApi: {
+    capabilities: () => Promise.resolve(state.maintenanceCapabilities),
+    policy: (clusterId: number) => state.api(`/api/clusters/${clusterId}/maintenance-policy`),
+    updatePolicy: (clusterId: number, input: unknown) => state.api(`/api/clusters/${clusterId}/maintenance-policy`, { method: 'PUT', body: JSON.stringify(input) }),
+  },
 }));
 
 const cluster: Cluster = {

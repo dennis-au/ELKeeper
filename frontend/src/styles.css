@@ -165,8 +165,39 @@ button, input, select, textarea { letter-spacing: 0; }
 .action-console__terminal { height: calc(100% - var(--console-collapsed)); padding: 8px; background: #0b0f14; }
 .run-tab { display: flex; align-items: center; gap: 6px; height: 30px; padding: 0 8px; border: 1px solid transparent; border-radius: 3px; background: transparent; color: #c6d0db; cursor: pointer; }
 .run-tab:hover, .run-tab.is-selected { border-color: #506273; background: #24313e; }
-.login-page { display: grid; min-height: 100vh; place-items: center; padding: 24px; background: #edf1f4; }
-.login-panel { width: min(420px, 100%); border-top: 5px solid #00a67e; }
+.login-page { display: grid; min-height: 100vh; grid-template-columns: minmax(340px, 0.82fr) minmax(480px, 1.18fr); background: #f5f7f9; }
+.login-brand { position: relative; display: grid; min-height: 100vh; align-content: space-between; overflow: hidden; padding: 44px 48px 38px; background: #17212b; color: #fff; }
+.elkeeper-logo { display: flex; align-items: center; gap: 14px; width: fit-content; color: #243b53; }
+.login-brand .elkeeper-logo { color: #00b894; }
+.login-brand .elkeeper-logo__wordmark strong { color: #fff; }
+.elkeeper-logo__mark { flex: 0 0 auto; width: 48px; height: 48px; }
+.elkeeper-logo__wordmark { display: grid; gap: 3px; }
+.elkeeper-logo__wordmark strong { color: inherit; font-size: 19px; line-height: 1.1; letter-spacing: 0; }
+.elkeeper-logo__wordmark span { color: #aebdca; font-size: 12px; line-height: 1.3; }
+.elkeeper-logo.is-compact { gap: 10px; }
+.elkeeper-logo.is-compact .elkeeper-logo__mark { width: 38px; height: 38px; }
+.elkeeper-logo.is-compact .elkeeper-logo__wordmark strong { font-size: 16px; }
+.login-brand__signal { align-self: center; display: grid; gap: 18px; width: min(390px, 100%); padding: 52px 0; }
+.login-brand__signal > div { position: relative; display: flex; align-items: center; height: 30px; gap: 0; }
+.login-brand__signal > div::before { position: absolute; right: 0; left: 0; height: 1px; background: #52616f; content: ''; }
+.login-brand__signal span { position: relative; z-index: 1; display: block; width: 15px; height: 15px; margin-right: clamp(44px, 8vw, 96px); border: 3px solid #17212b; border-radius: 50%; background: #00b894; box-shadow: 0 0 0 1px #00b894; }
+.login-brand__signal > div:nth-child(2) { width: 82%; margin-left: 11%; }
+.login-brand__signal > div:nth-child(2) span { background: #4aa3ff; box-shadow: 0 0 0 1px #4aa3ff; }
+.login-brand__signal > div:nth-child(3) { width: 64%; margin-left: 24%; }
+.login-brand__signal > div:nth-child(3) span { background: #f5a623; box-shadow: 0 0 0 1px #f5a623; }
+.login-brand__footer { display: flex; align-items: center; gap: 9px; color: #aebdca; font-size: 12px; }
+.login-brand__status { width: 8px; height: 8px; border-radius: 50%; background: #00b894; }
+.login-auth { display: grid; min-width: 0; align-items: center; padding: 56px clamp(48px, 8vw, 120px); background: #fff; }
+.login-auth__content { width: min(420px, 100%); }
+.login-auth__content > .euiText:first-of-type strong { color: #52616f; font-size: 12px; }
+.login-auth__content .euiTitle h1 { color: #17212b; font-size: 38px; line-height: 1.1; letter-spacing: 0; }
+.login-auth__content .euiText p { margin: 0; }
+.login-auth__mobile-logo { display: none; }
+.login-panel { width: 100%; background: transparent; }
+.login-panel .euiFormRow { max-width: none; }
+.login-panel .euiFormControlLayout, .login-panel .euiFieldText, .login-panel .euiFieldPassword { min-height: 44px; }
+.login-panel .euiButton { min-height: 44px; }
+.login-auth__notice { margin: 28px 0 0; color: #7b8794; font-size: 12px; text-align: center; }
 
 @media (max-width: 1100px) {
   .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -221,4 +252,10 @@ button, input, select, textarea { letter-spacing: 0; }
   .controller-key-summary { display: grid; gap: 12px; }
   .action-console { left: 0; }
   .action-console__bar .euiFlexItem:nth-of-type(n+4) { display: none; }
+  .login-page { grid-template-columns: 1fr; background: #fff; }
+  .login-brand { display: none; }
+  .login-auth { min-height: 100vh; align-items: start; padding: 32px 24px 48px; }
+  .login-auth__content { width: 100%; max-width: 420px; margin: 0 auto; }
+  .login-auth__mobile-logo { display: block; margin-bottom: 72px; }
+  .login-auth__content .euiTitle h1 { font-size: 34px; }
 }

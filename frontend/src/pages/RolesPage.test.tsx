@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ConsoleContext } from '../app-context';
-import type { Cluster } from '../types';
+import type { Cluster } from '../features/clusters';
 import { managedWorkloadColumns, RolesPage, workloadImageVersion } from './RolesPage';
 
 const state = vi.hoisted(() => ({
@@ -25,10 +25,34 @@ const state = vi.hoisted(() => ({
   }),
 }));
 
-vi.mock('../api', () => ({
-  api: state.api,
-  jsonBody: vi.fn((value) => ({ body: JSON.stringify(value), headers: { 'Content-Type': 'application/json' } })),
-  queries: { nodes: vi.fn().mockResolvedValue([]), runs: vi.fn().mockResolvedValue([]) },
+vi.mock('../features/versions', () => ({
+  versionsApi: { list: vi.fn(() => Promise.resolve(state.versionResponse)) },
+}));
+
+vi.mock('../features/workloads', () => ({
+  workloadsApi: {
+    storage: (nodeId: number) => state.api(`/api/nodes/${nodeId}/storage`),
+    removeAssignment: (assignmentId: number, mode: string) => state.api(`/api/assignments/${assignmentId}?mode=${mode}`, { method: 'DELETE' }),
+    applyChanges: (clusterId: number, payload: unknown) => state.api(`/api/clusters/${clusterId}/workload-changes/apply`, { method: 'POST', body: JSON.stringify(payload) }),
+    topology: (clusterId: number) => state.api(`/api/clusters/${clusterId}/topology`),
+    roles: () => state.api('/api/health'),
+  },
+}));
+
+vi.mock('../features/hosts', () => ({
+  hostApi: { list: () => Promise.resolve([]) },
+}));
+
+vi.mock('../features/clusters', () => ({
+  clusterApi: {
+    addMember: (clusterId: number, input: unknown) => state.api(`/api/clusters/${clusterId}/members`, { method: 'POST', body: JSON.stringify(input) }),
+    updateMember: (clusterId: number, nodeId: number, input: unknown) => state.api(`/api/clusters/${clusterId}/members/${nodeId}`, { method: 'PUT', body: JSON.stringify(input) }),
+    removeMember: (clusterId: number, nodeId: number) => state.api(`/api/clusters/${clusterId}/members/${nodeId}`, { method: 'DELETE' }),
+  },
+}));
+
+vi.mock('../features/runs', () => ({
+  runsApi: { list: () => state.api('/api/runs') },
 }));
 
 const cluster: Cluster = {
