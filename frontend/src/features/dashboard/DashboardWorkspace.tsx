@@ -8,7 +8,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { dashboardApi } from './index';
 import { useConsole } from '../../app-context';
 import { bytes, formatDateTime, formatTime, percent, timeAgo } from '../../shared/format';
-import type { ClusterMetrics, ClusterSummary, ContainerMetric, ControllerSettings, CrossClusterHostUsage, DashboardSnapshot, Health, HostResourceSample, LogMonitoring, NodeBreakdown, TopologyResponse, ZoneBreakdown } from './types';
+import type { ClusterMetrics, ClusterSummary, ContainerMetric, ControllerSettings, CrossClusterHostUsage, DashboardSnapshot, Health, HostResourceSample, LogMonitoring, NodeBreakdown, TopologyResponse } from './types';
 
 const healthColor: Record<Health, 'success' | 'warning' | 'danger' | 'subdued'> = {
   green: 'success', yellow: 'warning', red: 'danger', unknown: 'subdued', awaiting_data: 'subdued',
@@ -57,6 +57,54 @@ function rate(value: number | null | undefined) {
 
 function usagePercent(used: number, total: number) {
   return total > 0 ? percent(used, total) : undefined;
+}
+
+interface CapacitySummary {
+  nodes: number;
+  shards: number;
+  disk_total_bytes: number;
+  disk_available_bytes: number;
+  disk_used_bytes: number;
+  heap_used_bytes: number;
+  heap_max_bytes: number;
+}
+
+interface CapacityGroup extends CapacitySummary {
+  scope: string;
+}
+
+function safeNumber(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function isDataTierNode(node: NodeBreakdown) {
+  return (Array.isArray(node.roles) ? node.roles : []).some((role) => {
+    if (typeof role !== 'string') return false;
+    const normalized = role.trim().toLowerCase();
+    return normalized === 'data' || normalized.startsWith('data_');
+  });
+}
+
+function summarizeNodes(nodes: NodeBreakdown[]): CapacitySummary {
+  return nodes.reduce<CapacitySummary>((summary, node) => ({
+    nodes: summary.nodes + 1,
+    shards: summary.shards + safeNumber(node.shards),
+    disk_total_bytes: summary.disk_total_bytes + safeNumber(node.disk_total_bytes),
+    disk_available_bytes: summary.disk_available_bytes + safeNumber(node.disk_available_bytes),
+    disk_used_bytes: summary.disk_used_bytes + safeNumber(node.disk_used_bytes),
+    heap_used_bytes: summary.heap_used_bytes + safeNumber(node.heap_used_bytes),
+    heap_max_bytes: summary.heap_max_bytes + safeNumber(node.heap_max_bytes),
+  }), { nodes: 0, shards: 0, disk_total_bytes: 0, disk_available_bytes: 0, disk_used_bytes: 0, heap_used_bytes: 0, heap_max_bytes: 0 });
+}
+
+function groupNodeCapacity(nodes: NodeBreakdown[], scopeFor: (node: NodeBreakdown) => string): CapacityGroup[] {
+  const groups = new Map<string, NodeBreakdown[]>();
+  for (const node of nodes) {
+    const scope = scopeFor(node);
+    groups.set(scope, [...(groups.get(scope) || []), node]);
+  }
+  return Array.from(groups, ([scope, groupedNodes]) => ({ scope, ...summarizeNodes(groupedNodes) }))
+    .sort((left, right) => left.scope.localeCompare(right.scope));
 }
 
 function hostChartAxis(history: HostResourceSample[], timezone: string) {
@@ -186,8 +234,13 @@ export function DashboardWorkspace() {
   const metrics: ClusterMetrics = cluster?.metrics || { cluster_id: selectedClusterId || 0, status: 'unknown' };
   const alerts = data.alerts.filter((alert) => alert.source === 'cluster' ? alert.source_id === selectedClusterId : memberIds.has(alert.source_id));
   const history = cluster?.history || [];
+  const hasNodeBreakdown = Array.isArray(metrics.node_breakdown);
   const nodeBreakdown = metrics.node_breakdown || [];
-  const zoneBreakdown = metrics.zone_breakdown || [];
+  const dataTierNodes = nodeBreakdown.filter(isDataTierNode);
+  const dataTierCapacity = summarizeNodes(dataTierNodes);
+  const dataTierBreakdown = groupNodeCapacity(dataTierNodes, (node) => node.node_type || 'Data node');
+  const dataTierZoneBreakdown = groupNodeCapacity(dataTierNodes, (node) => node.zone || 'unassigned');
+  const allElasticsearchNodeCount = Math.max(safeNumber(metrics.nodes), nodeBreakdown.length);
   const accessUrls = topology?.access_urls || [];
   const logMonitoring = cluster?.log_monitoring || selectedCluster?.log_monitoring;
   const logsState = monitoringState(logMonitoring);
@@ -224,12 +277,19 @@ export function DashboardWorkspace() {
     { field: 'disk_used_bytes', name: 'Disk used', render: (value: number, row: NodeBreakdown) => `${bytes(value)} / ${bytes(row.disk_total_bytes)} (${percent(value, row.disk_total_bytes)}%)` },
     { field: 'heap_used_bytes', name: 'JVM heap', render: (value: number, row: NodeBreakdown) => `${bytes(value)} / ${bytes(row.heap_max_bytes)}` },
   ];
-  const zoneColumns = [
-    { field: 'zone', name: 'Availability zone', render: (value: string) => <EuiBadge color={value === 'unassigned' ? 'warning' : 'hollow'}>{value}</EuiBadge> },
+  const capacityColumns = [
+    { field: 'scope', name: 'Data tier', render: (value: string) => <EuiBadge color="hollow">{value}</EuiBadge> },
     { field: 'nodes', name: 'Nodes' },
     { field: 'shards', name: 'Shards' },
-    { field: 'disk_used_bytes', name: 'Disk used', render: (value: number, row: ZoneBreakdown) => `${bytes(value)} / ${bytes(row.disk_total_bytes)} (${percent(value, row.disk_total_bytes)}%)` },
-    { field: 'heap_used_bytes', name: 'JVM heap', render: (value: number, row: ZoneBreakdown) => `${bytes(value)} / ${bytes(row.heap_max_bytes)}` },
+    { field: 'disk_used_bytes', name: 'Disk used', render: (value: number, row: CapacityGroup) => `${bytes(value)} / ${bytes(row.disk_total_bytes)} (${percent(value, row.disk_total_bytes)}%)` },
+    { field: 'heap_used_bytes', name: 'JVM heap', render: (value: number, row: CapacityGroup) => `${bytes(value)} / ${bytes(row.heap_max_bytes)}` },
+  ];
+  const zoneColumns = [
+    { field: 'scope', name: 'Availability zone', render: (value: string) => <EuiBadge color={value === 'unassigned' ? 'warning' : 'hollow'}>{value}</EuiBadge> },
+    { field: 'nodes', name: 'Nodes' },
+    { field: 'shards', name: 'Shards' },
+    { field: 'disk_used_bytes', name: 'Disk used', render: (value: number, row: CapacityGroup) => `${bytes(value)} / ${bytes(row.disk_total_bytes)} (${percent(value, row.disk_total_bytes)}%)` },
+    { field: 'heap_used_bytes', name: 'JVM heap', render: (value: number, row: CapacityGroup) => `${bytes(value)} / ${bytes(row.heap_max_bytes)}` },
   ];
   const accessColumns = [
     { field: 'label', name: 'Service' },
@@ -283,20 +343,33 @@ export function DashboardWorkspace() {
             </EuiPanel>
             <EuiPanel hasBorder paddingSize="m">
               <EuiTitle size="xs"><h3>Capacity</h3></EuiTitle><EuiSpacer />
-              <EuiText size="s">Disk used</EuiText>
-              <EuiProgress value={percent((metrics.disk_total_bytes || 0) - (metrics.disk_available_bytes || 0), metrics.disk_total_bytes)} max={100} color="primary" size="l" label={`${bytes((metrics.disk_total_bytes || 0) - (metrics.disk_available_bytes || 0))} / ${bytes(metrics.disk_total_bytes)}`} valueText />
+              <EuiText size="s">Data-tier disk used</EuiText>
+              {hasNodeBreakdown ? <>
+                <EuiProgress value={percent(dataTierCapacity.disk_used_bytes, dataTierCapacity.disk_total_bytes)} max={100} color="primary" size="l" label={`${bytes(dataTierCapacity.disk_used_bytes)} / ${bytes(dataTierCapacity.disk_total_bytes)}`} valueText />
+                <EuiText size="xs" color="subdued">{dataTierCapacity.nodes} data-tier nodes. Includes roles named <code>data</code> or <code>data_*</code>; node-reported filesystems can double-count shared storage.</EuiText>
+              </> : <EuiCallOut size="s" color="warning" title="Data-tier disk capacity unavailable">The latest telemetry did not include the per-node role and filesystem breakdown required for this value.</EuiCallOut>}
               <EuiSpacer />
-              <EuiText size="s">JVM heap used</EuiText>
+              <EuiText size="s">All Elasticsearch JVM heap used</EuiText>
               <EuiProgress value={percent(metrics.heap_used_bytes, metrics.heap_max_bytes)} max={100} color="accent" size="l" label={`${bytes(metrics.heap_used_bytes)} / ${bytes(metrics.heap_max_bytes)}`} valueText />
+              <EuiText size="xs" color="subdued">{allElasticsearchNodeCount} Elasticsearch nodes. This is configured JVM heap, not host RAM.</EuiText>
               {metrics.last_error && <><EuiSpacer /><EuiCallOut size="s" color="warning" title="Metrics degraded">{metrics.last_error}</EuiCallOut></>}
             </EuiPanel>
           </div>
           {nodeBreakdown.length > 0 && <div className="node-breakdown">
             <div className="node-breakdown__heading">
-              <div><EuiTitle size="xs"><h3>Node capacity and shard breakdown</h3></EuiTitle><EuiText size="s" color="subdued">Tier classification, allocated shards, disk, and JVM heap for each Elasticsearch node.</EuiText></div>
+              <div><EuiTitle size="xs"><h3>Capacity and shard details</h3></EuiTitle><EuiText size="s" color="subdued">Review data-tier capacity first, then the complete Elasticsearch node diagnostics.</EuiText></div>
               <EuiButtonEmpty size="s" iconType={nodeDetailsOpen ? 'arrowUp' : 'arrowDown'} aria-expanded={nodeDetailsOpen} aria-controls="node-breakdown-table" aria-label={nodeDetailsOpen ? 'Hide node details' : 'Show node details'} onClick={() => setNodeDetailsOpen((open) => !open)}>{nodeDetailsOpen ? 'Hide details' : 'Details'}</EuiButtonEmpty>
             </div>
-            {nodeDetailsOpen && <div id="node-breakdown-table" className="node-breakdown__table"><EuiBasicTable items={nodeBreakdown} columns={nodeColumns} tableLayout="auto" />{zoneBreakdown.length > 0 && <><EuiSpacer size="l" /><EuiTitle size="xs"><h3>Zone capacity and shard distribution</h3></EuiTitle><EuiSpacer size="s" /><EuiBasicTable items={zoneBreakdown} columns={zoneColumns} tableLayout="auto" /></>}</div>}
+            {nodeDetailsOpen && <div id="node-breakdown-table" className="node-breakdown__table">
+              <EuiTitle size="xs"><h3>Data-tier capacity and shard breakdown</h3></EuiTitle>
+              <EuiSpacer size="s" />
+              {dataTierBreakdown.length > 0 ? <EuiBasicTable items={dataTierBreakdown} columns={capacityColumns} tableLayout="auto" /> : <EuiCallOut size="s" color="warning" title="No data-tier nodes reported">No Elasticsearch node advertises a <code>data</code> or <code>data_*</code> role in the latest observation.</EuiCallOut>}
+              {dataTierZoneBreakdown.length > 0 && <><EuiSpacer size="l" /><EuiTitle size="xs"><h3>Data-tier zone capacity and shard distribution</h3></EuiTitle><EuiSpacer size="s" /><EuiBasicTable items={dataTierZoneBreakdown} columns={zoneColumns} tableLayout="auto" /></>}
+              <EuiSpacer size="l" />
+              <EuiTitle size="xs"><h3>All Elasticsearch node diagnostics</h3></EuiTitle>
+              <EuiSpacer size="s" />
+              <EuiBasicTable items={nodeBreakdown} columns={nodeColumns} tableLayout="auto" />
+            </div>}
           </div>}</>}
         </section>
         <section className="section-band">

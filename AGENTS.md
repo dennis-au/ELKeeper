@@ -47,6 +47,79 @@ module's tables directly. Keep compatibility callbacks temporary, test them at
 the HTTP boundary, and retire them only after the owning repository/service is
 green under the strict table check.
 
+## Application Development Guidelines
+
+### Module Contract
+
+Each module must own one cohesive responsibility and expose a small public
+contract. The contract may include DTOs, interfaces, repository/service
+methods, router builders, commands, or events. Internal helpers, SQL details,
+Ansible variables, and provider-specific implementation files are private.
+Other modules may import only package exports and documented public contract
+files.
+
+The owning module is responsible for its persistence boundary. It owns table
+creation and migrations, SQL writes, repository invariants, and module-level
+read projections. A cross-owner read must be explicit and narrow; a
+cross-owner write must call the owner's public service or repository. Never
+solve a boundary violation by adding a broad exception to the checker.
+
+### Backend Implementation
+
+- Keep `app.main` limited to application assembly, dependency injection,
+  lifecycle wiring, route registration, and temporary compatibility delegates.
+- Keep route functions thin: parse and authorize input, invoke an owning
+  service, and return the established response DTO.
+- Put all remote effects behind orchestration adapters. Do not assemble raw
+  SSH, Podman, Ansible, or Elasticsearch commands in domain routes.
+- Mutations must use platform run creation/status/events, audit where needed,
+  redacted output, and an explicit recovery or rollback path for partial work.
+- Prefer immutable DTOs at module boundaries and validate values before any
+  persistence or remote side effect.
+- Keep provider-specific behavior behind provider capability contracts; do not
+  let a native, imported, or ECK-managed resource fall through to Podman
+  mutation code.
+
+### Frontend Implementation
+
+- A feature owns its API client, DTOs, query keys, hooks, components, forms,
+  and tests under `frontend/src/features/<feature>`.
+- Route pages are composition layers. They may coordinate feature state, but
+  must not construct feature URLs, call unrelated feature internals, or own
+  domain validation.
+- `frontend/src/shared` may contain only dependency-light transport, UI,
+  formatting, clipboard, and query helpers that are genuinely reusable.
+- Use the existing in-page dialogs and run drawer for operations. Do not add
+  browser-native dialogs or direct managed-service connections.
+- Preserve accessible focus behavior, loading/error/degraded states,
+  responsive layouts, secret masking, and SSE reconnect behavior during an
+  extraction.
+
+### Testing A Module
+
+Every module change requires:
+
+1. Unit tests for validation, transformation, and failure/rollback rules.
+2. Module integration tests through the public contract, without importing
+   private implementation files.
+3. Boundary checks for route ownership, private imports, and table ownership.
+4. Redaction tests for commands, run context, URLs, telemetry, and fixtures
+   whenever secrets or remote operations are involved.
+5. The smallest named regression profile that covers the changed backend,
+   frontend, migration, Ansible, or packaging surface.
+
+Compatibility tests must remain until the old route/import/DTO seam is retired.
+When retiring a seam, remove the implementation only after the owning module
+tests and a full regression profile pass.
+
+### Adding Or Moving Code
+
+Before editing, record the responsibility, owner, public contract, table
+owner, provider boundary, and compatibility plan. Add the public contract and
+focused tests before moving private code. Move one vertical slice at a time,
+keep imports pointed inward toward public contracts, and run the boundary
+checker after each slice. Update the module map when ownership changes.
+
 ## Verification
 
 Run the complete local gate from `controller_snapshot/`:

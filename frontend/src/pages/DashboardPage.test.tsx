@@ -12,7 +12,7 @@ const state = vi.hoisted(() => {
   clusters: [{
     id: 1, name: 'Production', slug: 'production', theme_color: '#0077CC', health: 'green', node_count: 3, workload_count: 3,
     metrics: {
-      cluster_id: 1, status: 'green', nodes: 3, data_nodes: 2, active_shards: 12, unassigned_shards: 0,
+      cluster_id: 1, status: 'green', nodes: 3, data_nodes: 2, active_shards: 12, unassigned_shards: 0, heap_used_bytes: 600, heap_max_bytes: 1800,
       node_breakdown: [
         { id: 'hot-id', name: 'hot-1', node_type: 'Hot data', roles: ['master', 'data_hot'], zone: 'zone-a', shards: 7, disk_used_bytes: 600, disk_total_bytes: 1000, disk_available_bytes: 400, heap_used_bytes: 300, heap_max_bytes: 600 },
         { id: 'warm-id', name: 'warm-1', node_type: 'Warm data', roles: ['data_warm'], zone: 'zone-b', shards: 4, disk_used_bytes: 800, disk_total_bytes: 2000, disk_available_bytes: 1200, heap_used_bytes: 200, heap_max_bytes: 800 },
@@ -184,7 +184,7 @@ describe('DashboardPage', () => {
     expect(link.getAttribute('href')).toContain('elkeeper.production');
   });
 
-  it('reveals node tier, capacity, and shard details on demand', async () => {
+  it('shows data-tier disk capacity alongside all-node JVM heap and reveals scoped details on demand', async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const cluster: Cluster = {
       id: 1, name: 'Production', slug: 'production', theme_color: '#0077CC', desired_version: '8.19.0',
@@ -205,16 +205,109 @@ describe('DashboardPage', () => {
     );
 
     const button = await screen.findByRole('button', { name: 'Show node details' });
-    expect(screen.getByRole('heading', { name: 'Node capacity and shard breakdown' })).toBeInTheDocument();
+    expect(screen.getByText('Data-tier disk used')).toBeInTheDocument();
+    expect(screen.getByText(/^2 data-tier nodes\./)).toBeInTheDocument();
+    expect(screen.getByText('1 KiB / 3 KiB')).toBeInTheDocument();
+    expect(screen.getByText('All Elasticsearch JVM heap used')).toBeInTheDocument();
+    expect(screen.getByText(/^3 Elasticsearch nodes\. This is configured JVM heap/)).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Capacity and shard details' })).toBeInTheDocument();
     expect(screen.queryByText('Hot data')).not.toBeInTheDocument();
     fireEvent.click(button);
-    expect(screen.getByText('Hot data')).toBeInTheDocument();
-    expect(screen.getByText('Warm data')).toBeInTheDocument();
+    expect(screen.getAllByText('Hot data').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Warm data').length).toBeGreaterThan(0);
     expect(screen.getByText('Ingest')).toBeInTheDocument();
     expect(screen.getAllByText('Zone').length).toBeGreaterThan(0);
     expect(screen.getAllByText('zone-a').length).toBeGreaterThan(0);
-    expect(screen.getByRole('heading', { name: 'Zone capacity and shard distribution' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Data-tier capacity and shard breakdown' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Data-tier zone capacity and shard distribution' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'All Elasticsearch node diagnostics' })).toBeInTheDocument();
     expect(screen.getAllByText('7').length).toBeGreaterThan(0);
+  });
+
+  it('includes every Elasticsearch data role exactly once in data-tier capacity and excludes non-data roles', async () => {
+    state.data = {
+      ...state.data,
+      clusters: [{
+        ...state.data.clusters[0],
+        node_count: 7,
+        metrics: {
+          ...state.data.clusters[0].metrics,
+          nodes: 7,
+          heap_used_bytes: 1_050,
+          heap_max_bytes: 2_100,
+          node_breakdown: [
+            { id: 'hot-id', name: 'hot-1', node_type: 'Hot data', roles: ['master', 'data_hot'], zone: 'zone-a', shards: 1, disk_used_bytes: 100, disk_total_bytes: 1000, disk_available_bytes: 900, heap_used_bytes: 100, heap_max_bytes: 200 },
+            { id: 'warm-id', name: 'warm-1', node_type: 'Warm data', roles: ['data_warm'], zone: 'zone-b', shards: 1, disk_used_bytes: 100, disk_total_bytes: 1000, disk_available_bytes: 900, heap_used_bytes: 100, heap_max_bytes: 200 },
+            { id: 'cold-id', name: 'cold-1', node_type: 'Cold data', roles: ['data_cold'], zone: 'zone-a', shards: 1, disk_used_bytes: 100, disk_total_bytes: 1000, disk_available_bytes: 900, heap_used_bytes: 100, heap_max_bytes: 200 },
+            { id: 'frozen-id', name: 'frozen-1', node_type: 'Frozen data', roles: ['data_frozen'], zone: 'zone-b', shards: 1, disk_used_bytes: 100, disk_total_bytes: 1000, disk_available_bytes: 900, heap_used_bytes: 100, heap_max_bytes: 200 },
+            { id: 'content-id', name: 'content-1', node_type: 'Content data', roles: ['data_content'], zone: 'zone-a', shards: 1, disk_used_bytes: 100, disk_total_bytes: 1000, disk_available_bytes: 900, heap_used_bytes: 100, heap_max_bytes: 200 },
+            { id: 'data-id', name: 'data-1', node_type: 'Data', roles: ['data'], zone: 'zone-b', shards: 1, disk_used_bytes: 100, disk_total_bytes: 1000, disk_available_bytes: 900, heap_used_bytes: 100, heap_max_bytes: 200 },
+            { id: 'ingest-id', name: 'ingest-1', node_type: 'Ingest', roles: ['ingest'], zone: 'zone-c', shards: 0, disk_used_bytes: 900, disk_total_bytes: 9000, disk_available_bytes: 8100, heap_used_bytes: 450, heap_max_bytes: 900 },
+          ],
+        },
+      }],
+    };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const cluster: Cluster = {
+      id: 1, name: 'Production', slug: 'production', theme_color: '#0077CC', desired_version: '8.19.0',
+      ports: { elasticsearch_http: 9200, elasticsearch_transport: 9300, kibana: 5601, fleet: 8220, logstash_api: 9600 },
+      network_defaults: { mode: 'shared' as const },
+      elasticsearch_settings: {
+        allocation_enable: 'all', rebalance_enable: 'all', disk_watermark_low: '85%', disk_watermark_high: '90%',
+        disk_watermark_flood_stage: '95%', recovery_max_bytes_per_sec: '40mb',
+      },
+      members: [], assignments: [],
+    };
+    render(
+      <QueryClientProvider client={client}>
+        <ConsoleContext.Provider value={{ clusters: [cluster], selectedCluster: cluster, selectedClusterId: 1, setSelectedClusterId: () => undefined, watchRun: () => undefined, refreshAll: async () => undefined }}>
+          <DashboardPage />
+        </ConsoleContext.Provider>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText(/^6 data-tier nodes\./)).toBeInTheDocument();
+    expect(screen.getByText('600 B / 6 KiB')).toBeInTheDocument();
+    expect(screen.getByText(/^7 Elasticsearch nodes\. This is configured JVM heap/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Show node details' }));
+    expect(screen.getByRole('heading', { name: 'Data-tier capacity and shard breakdown' })).toBeInTheDocument();
+    expect(screen.getAllByText('Cold data')).toHaveLength(2);
+    expect(screen.getAllByText('Frozen data')).toHaveLength(2);
+    expect(screen.getAllByText('Content data')).toHaveLength(2);
+    expect(screen.getAllByText('Ingest')).toHaveLength(1);
+    expect(screen.getByRole('heading', { name: 'Data-tier zone capacity and shard distribution' })).toBeInTheDocument();
+  });
+
+  it('marks data-tier disk capacity unavailable when per-node telemetry is absent', async () => {
+    state.data = {
+      ...state.data,
+      clusters: [{
+        ...state.data.clusters[0],
+        metrics: { cluster_id: 1, status: 'green', nodes: 2, heap_used_bytes: 500, heap_max_bytes: 1000 },
+      }],
+    };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const cluster: Cluster = {
+      id: 1, name: 'Production', slug: 'production', theme_color: '#0077CC', desired_version: '8.19.0',
+      ports: { elasticsearch_http: 9200, elasticsearch_transport: 9300, kibana: 5601, fleet: 8220, logstash_api: 9600 },
+      network_defaults: { mode: 'shared' as const },
+      elasticsearch_settings: {
+        allocation_enable: 'all', rebalance_enable: 'all', disk_watermark_low: '85%', disk_watermark_high: '90%',
+        disk_watermark_flood_stage: '95%', recovery_max_bytes_per_sec: '40mb',
+      },
+      members: [], assignments: [],
+    };
+    render(
+      <QueryClientProvider client={client}>
+        <ConsoleContext.Provider value={{ clusters: [cluster], selectedCluster: cluster, selectedClusterId: 1, setSelectedClusterId: () => undefined, watchRun: () => undefined, refreshAll: async () => undefined }}>
+          <DashboardPage />
+        </ConsoleContext.Provider>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText('Data-tier disk capacity unavailable')).toBeInTheDocument();
+    expect(screen.getByText(/^2 Elasticsearch nodes\. This is configured JVM heap/)).toBeInTheDocument();
+    expect(screen.queryByText(/NaN/)).not.toBeInTheDocument();
   });
 
   it('explains the selected cluster health status on hover and focus', async () => {
