@@ -346,12 +346,12 @@ export function DashboardWorkspace() {
               <EuiText size="s">Data-tier disk used</EuiText>
               {hasNodeBreakdown ? <>
                 <EuiProgress value={percent(dataTierCapacity.disk_used_bytes, dataTierCapacity.disk_total_bytes)} max={100} color="primary" size="l" label={`${bytes(dataTierCapacity.disk_used_bytes)} / ${bytes(dataTierCapacity.disk_total_bytes)}`} valueText />
-                <EuiText size="xs" color="subdued">{dataTierCapacity.nodes} data-tier nodes. Includes roles named <code>data</code> or <code>data_*</code>; node-reported filesystems can double-count shared storage.</EuiText>
+                <EuiText size="xs" color="subdued">{dataTierCapacity.nodes} data-tier nodes. Shared filesystems may count more than once.</EuiText>
               </> : <EuiCallOut size="s" color="warning" title="Data-tier disk capacity unavailable">The latest telemetry did not include the per-node role and filesystem breakdown required for this value.</EuiCallOut>}
               <EuiSpacer />
               <EuiText size="s">All Elasticsearch JVM heap used</EuiText>
               <EuiProgress value={percent(metrics.heap_used_bytes, metrics.heap_max_bytes)} max={100} color="accent" size="l" label={`${bytes(metrics.heap_used_bytes)} / ${bytes(metrics.heap_max_bytes)}`} valueText />
-              <EuiText size="xs" color="subdued">{allElasticsearchNodeCount} Elasticsearch nodes. This is configured JVM heap, not host RAM.</EuiText>
+              <EuiText size="xs" color="subdued">{allElasticsearchNodeCount} nodes. JVM heap, not host RAM.</EuiText>
               {metrics.last_error && <><EuiSpacer /><EuiCallOut size="s" color="warning" title="Metrics degraded">{metrics.last_error}</EuiCallOut></>}
             </EuiPanel>
           </div>

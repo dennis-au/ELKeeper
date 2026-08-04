@@ -209,7 +209,7 @@ describe('DashboardPage', () => {
     expect(screen.getByText(/^2 data-tier nodes\./)).toBeInTheDocument();
     expect(screen.getByText('1 KiB / 3 KiB')).toBeInTheDocument();
     expect(screen.getByText('All Elasticsearch JVM heap used')).toBeInTheDocument();
-    expect(screen.getByText(/^3 Elasticsearch nodes\. This is configured JVM heap/)).toBeInTheDocument();
+    expect(screen.getByText(/^3 nodes\. JVM heap, not host RAM\./)).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Capacity and shard details' })).toBeInTheDocument();
     expect(screen.queryByText('Hot data')).not.toBeInTheDocument();
     fireEvent.click(button);
@@ -268,7 +268,7 @@ describe('DashboardPage', () => {
 
     expect(await screen.findByText(/^6 data-tier nodes\./)).toBeInTheDocument();
     expect(screen.getByText('600 B / 6 KiB')).toBeInTheDocument();
-    expect(screen.getByText(/^7 Elasticsearch nodes\. This is configured JVM heap/)).toBeInTheDocument();
+    expect(screen.getByText(/^7 nodes\. JVM heap, not host RAM\./)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Show node details' }));
     expect(screen.getByRole('heading', { name: 'Data-tier capacity and shard breakdown' })).toBeInTheDocument();
     expect(screen.getAllByText('Cold data')).toHaveLength(2);
@@ -306,7 +306,7 @@ describe('DashboardPage', () => {
     );
 
     expect(await screen.findByText('Data-tier disk capacity unavailable')).toBeInTheDocument();
-    expect(screen.getByText(/^2 Elasticsearch nodes\. This is configured JVM heap/)).toBeInTheDocument();
+    expect(screen.getByText(/^2 nodes\. JVM heap, not host RAM\./)).toBeInTheDocument();
     expect(screen.queryByText(/NaN/)).not.toBeInTheDocument();
   });
 
