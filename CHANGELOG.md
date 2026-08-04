@@ -2,6 +2,17 @@
 
 All notable changes to ELKeeper are documented in this file.
 
+## [1.3.1] - 2026-08-04
+
+### Reviewed changes
+
+- fix: clarify dashboard capacity labels
+
+### Verification
+
+- Scheduled review checks passed for changes since `v1.3.0`.
+- No live controller deployment or replacement is performed by this workflow.
+
 ## [1.3.0] - 2026-08-04
 
 ### Reviewed changes
