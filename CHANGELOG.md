@@ -2,6 +2,18 @@
 
 All notable changes to ELKeeper are documented in this file.
 
+## [1.3.0] - 2026-08-04
+
+### Reviewed changes
+
+- ci: schedule guarded release reviews
+- feat: improve dashboard capacity telemetry
+
+### Verification
+
+- Scheduled review checks passed for changes since `v1.2.0`.
+- No live controller deployment or replacement is performed by this workflow.
+
 ## [1.2.0] - 2026-08-04
 
 ### Changed

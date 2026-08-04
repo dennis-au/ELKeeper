@@ -63,6 +63,14 @@ def replace_versions(path: Path, old: str, new: str, count: int) -> None:
     path.write_text(updated, encoding="utf-8")
 
 
+def package_version(path: Path) -> str:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    version = data.get("version")
+    if not isinstance(version, str):
+        raise RuntimeError(f"missing package version in {path}")
+    return version
+
+
 def changelog_entry(version: str, tag: str, subjects: list[str]) -> str:
     bullets = "\n".join(f"- {subject}" for subject in dict.fromkeys(subjects[:8]))
     return (
@@ -101,9 +109,14 @@ def main() -> int:
     new_tuple = next_version(current, subjects)
     old_version = ".".join(str(part) for part in current)
     new_version = ".".join(str(part) for part in new_tuple)
-    replace_versions(root / "frontend" / "package.json", old_version, new_version, 1)
-    replace_versions(root / "frontend" / "package-lock.json", old_version, new_version, 2)
-    update_changelog(root / "CHANGELOG.md", changelog_entry(new_version, tag, subjects))
+    package_path = root / "frontend" / "package.json"
+    lock_path = root / "frontend" / "package-lock.json"
+    if package_version(package_path) == old_version:
+        replace_versions(package_path, old_version, new_version, 1)
+        replace_versions(lock_path, old_version, new_version, 2)
+        update_changelog(root / "CHANGELOG.md", changelog_entry(new_version, tag, subjects))
+    elif package_version(package_path) != new_version or f"## [{new_version}]" not in (root / "CHANGELOG.md").read_text(encoding="utf-8"):
+        raise RuntimeError(f"release metadata does not match {tag} or prepared {new_version}")
     args.notes_path.write_text(
         f"# ELKeeper v{new_version}\n\n"
         + changelog_entry(new_version, tag, subjects),
