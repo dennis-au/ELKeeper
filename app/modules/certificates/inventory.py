@@ -34,6 +34,8 @@ class CertificateInventoryService:
                 "source": master["node_name"],
                 "node": node,
                 "path": f"{base}/ca/ca.key",
+                "reveal_deprecated": True,
+                "value_access": "metadata_only",
             },
         ]
 
@@ -59,6 +61,8 @@ class CertificateInventoryService:
                 "source": assignment["node_name"],
                 "node": node,
                 "path": f"{base}/certs/node.key",
+                "reveal_deprecated": True,
+                "value_access": "metadata_only",
             },
         ]
         token_paths = {

@@ -18,6 +18,14 @@ export interface ControllerSettings {
   timezone: string;
 }
 
+export interface HostKeyRecord {
+  node_id: number;
+  name: string;
+  address: string;
+  ssh_port: number;
+  fingerprint: string;
+}
+
 export interface SensitiveItem {
   id: string;
   label: string;
@@ -28,4 +36,6 @@ export interface SensitiveItem {
   fingerprint?: string;
   expires_at?: string;
   storage_path?: string;
+  reveal_deprecated?: boolean;
+  value_access?: 'metadata_only';
 }

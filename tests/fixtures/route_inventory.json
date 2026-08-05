@@ -42,6 +42,41 @@
     "path": "/api/auth/reveal-grants"
   },
   {
+    "file": "app/modules/certificates/http.py",
+    "handler": "certificate_operation",
+    "method": "GET",
+    "owner": "certificates",
+    "path": "/api/certificate-operations/{operation_id}"
+  },
+  {
+    "file": "app/modules/certificates/http.py",
+    "handler": "execute_certificate_operation",
+    "method": "POST",
+    "owner": "certificates",
+    "path": "/api/certificate-operations/{operation_id}/execute"
+  },
+  {
+    "file": "app/modules/certificates/http.py",
+    "handler": "certificate_operation_report",
+    "method": "GET",
+    "owner": "certificates",
+    "path": "/api/certificate-operations/{operation_id}/report"
+  },
+  {
+    "file": "app/modules/certificates/http.py",
+    "handler": "certificate_detail",
+    "method": "GET",
+    "owner": "certificates",
+    "path": "/api/certificates/{certificate_id}"
+  },
+  {
+    "file": "app/modules/certificates/http.py",
+    "handler": "renewal_preview",
+    "method": "POST",
+    "owner": "certificates",
+    "path": "/api/certificates/{certificate_id}/renewal-preview"
+  },
+  {
     "file": "app/modules/clusters/http.py",
     "handler": "clusters",
     "method": "GET",
@@ -82,6 +117,69 @@
     "method": "POST",
     "owner": "workloads",
     "path": "/api/clusters/{cluster_id}/assignments"
+  },
+  {
+    "file": "app/modules/certificates/http.py",
+    "handler": "ca_rotation_preview",
+    "method": "POST",
+    "owner": "certificates",
+    "path": "/api/clusters/{cluster_id}/ca-rotation-preview"
+  },
+  {
+    "file": "app/modules/certificates/http.py",
+    "handler": "certificate_compatibility",
+    "method": "GET",
+    "owner": "certificates",
+    "path": "/api/clusters/{cluster_id}/certificate-compatibility"
+  },
+  {
+    "file": "app/modules/certificates/http.py",
+    "handler": "certificate_operations",
+    "method": "GET",
+    "owner": "certificates",
+    "path": "/api/clusters/{cluster_id}/certificate-operations"
+  },
+  {
+    "file": "app/modules/certificates/http.py",
+    "handler": "certificate_policy",
+    "method": "GET",
+    "owner": "certificates",
+    "path": "/api/clusters/{cluster_id}/certificate-policy"
+  },
+  {
+    "file": "app/modules/certificates/http.py",
+    "handler": "update_certificate_policy",
+    "method": "PUT",
+    "owner": "certificates",
+    "path": "/api/clusters/{cluster_id}/certificate-policy"
+  },
+  {
+    "file": "app/modules/certificates/http.py",
+    "handler": "certificate_trust_consumers",
+    "method": "GET",
+    "owner": "certificates",
+    "path": "/api/clusters/{cluster_id}/certificate-trust-consumers"
+  },
+  {
+    "file": "app/modules/certificates/http.py",
+    "handler": "declare_certificate_trust_consumer",
+    "method": "POST",
+    "owner": "certificates",
+    "path": "/api/clusters/{cluster_id}/certificate-trust-consumers"
+  },
+  {
+    "file": "app/modules/certificates/http.py",
+    "handler": "list_certificates",
+    "method": "GET",
+    "owner": "certificates",
+    "path": "/api/clusters/{cluster_id}/certificates"
+  },
+  {
+    "file": "app/modules/certificates/http.py",
+    "handler": "refresh_certificates",
+    "method": "POST",
+    "owner": "certificates",
+    "path": "/api/clusters/{cluster_id}/certificates/refresh"
   },
   {
     "file": "app/modules/clusters/http.py",
@@ -315,6 +413,13 @@
     "path": "/api/hosts/initialize"
   },
   {
+    "file": "app/modules/hosts/http.py",
+    "handler": "host_key_records",
+    "method": "GET",
+    "owner": "hosts",
+    "path": "/api/hosts/ssh-host-keys"
+  },
+  {
     "file": "app/modules/maintenance/http.py",
     "handler": "maintenance_capabilities",
     "method": "GET",
@@ -488,6 +593,13 @@
     "method": "GET",
     "owner": "observability",
     "path": "/api/nodes/{node_id}/runtime"
+  },
+  {
+    "file": "app/modules/hosts/http.py",
+    "handler": "remove_host_key_record",
+    "method": "DELETE",
+    "owner": "hosts",
+    "path": "/api/nodes/{node_id}/ssh-host-key"
   },
   {
     "file": "app/modules/hosts/http.py",

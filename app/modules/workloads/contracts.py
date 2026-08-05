@@ -15,6 +15,8 @@ class ResourceInput(BaseModel):
     cpu: str = Field(min_length=1, max_length=32)
     memory: str = Field(min_length=2, max_length=32)
     storage_path: str = Field(min_length=2, max_length=512)
+    jvm_heap: str | None = Field(default=None, max_length=32)
+    node_heap: str | None = Field(default=None, max_length=32)
 
 
 class Targets(BaseModel):

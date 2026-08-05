@@ -98,6 +98,45 @@ class WorkloadChangeWorker:
             config_overrides=config_overrides,
         )
 
+    def ordered_executable_changes(self, plan: dict) -> list[dict]:
+        """Start a new cluster's bootstrap data node before extra masters.
+
+        The initial master must start first so it can create the cluster CA and
+        coordinator.  A Hot data-content role is then required before joining
+        masters, which prevents a fresh batch from attempting master discovery
+        against a coordinator that has no data-bearing node yet.
+        """
+
+        executable = [change for change in plan["changes"] if change["kind"] in {"create", "resources"}]
+        master = next((change for change in executable if change["role"] == "master"), None)
+        if master is None:
+            executable.sort(key=self._sort_key)
+            return executable
+
+        with self._db() as connection:
+            payload = self.workload_payload(connection, master, plan)
+        bootstrap = payload.get("bootstrap") or {}
+        bootstrap_id = bootstrap.get("assignment_id")
+        bootstrap_created = any(
+            change["kind"] == "create" and change["assignment_id"] == bootstrap_id
+            for change in executable
+        )
+        if not bootstrap_created:
+            executable.sort(key=self._sort_key)
+            return executable
+
+        def key(change: dict) -> tuple:
+            if change["assignment_id"] == bootstrap_id:
+                return (0, *self._sort_key(change))
+            if change["kind"] == "create" and change["role"] == "hot":
+                return (1, *self._sort_key(change))
+            if change["role"] == "master":
+                return (2, *self._sort_key(change))
+            return (3, *self._sort_key(change))
+
+        executable.sort(key=key)
+        return executable
+
     async def rollback(self, run_id: int, inventory_path: Path, plan: dict, completed: list[dict]) -> bool:
         rolled_back = True
         for index, item in enumerate(reversed(completed)):
@@ -195,8 +234,7 @@ class WorkloadChangeWorker:
         try:
             with self._db() as connection:
                 plan = self.batch_plan(connection, run_id)
-            executable = [change for change in plan["changes"] if change["kind"] in {"create", "resources"}]
-            executable.sort(key=self._sort_key)
+            executable = self.ordered_executable_changes(plan)
             for index, item in enumerate(executable):
                 completed.append(item)
                 with self._db() as connection:

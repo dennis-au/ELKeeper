@@ -80,7 +80,7 @@ class WorkloadChangeValidatorTests(unittest.TestCase):
             validate_final_ports=lambda _cluster, _assignments: None,
         )
 
-    def test_validator_builds_master_create_with_recommended_version(self):
+    def test_validator_rejects_initial_master_without_hot_data_content(self):
         change_set = WorkloadChangeSet(
             changes=[
                 WorkloadChange(
@@ -93,11 +93,58 @@ class WorkloadChangeValidatorTests(unittest.TestCase):
             ]
         )
 
+        with self.assertRaisesRegex(HTTPException, "Hot data-content"):
+            self._validator().validate(object(), 1, change_set)
+
+    def test_validator_accepts_initial_master_with_hot_data_content_regardless_of_stage_order(self):
+        change_set = WorkloadChangeSet(
+            changes=[
+                WorkloadChange(
+                    client_id="hot-1",
+                    kind="create",
+                    node_id=1,
+                    role="hot",
+                    config={"cpu": "1", "memory": "2g", "storage_path": "/srv/elastic/hot"},
+                ),
+                WorkloadChange(
+                    client_id="master-1",
+                    kind="create",
+                    node_id=1,
+                    role="master",
+                    config={"cpu": "1", "memory": "2g", "storage_path": "/srv/elastic/master"},
+                ),
+            ]
+        )
+
         cluster, planned = self._validator().validate(object(), 1, change_set)
 
         self.assertEqual(cluster["name"], "lab")
-        self.assertEqual(planned[0]["node_name"], "node-a")
-        self.assertEqual(planned[0]["image_version"], "8.20.0")
+        self.assertEqual([item["role"] for item in planned], ["hot", "master"])
+        self.assertTrue(all(item["node_name"] == "node-a" for item in planned))
+        self.assertTrue(all(item["image_version"] == "8.20.0" for item in planned))
+
+    def test_validator_rejects_initial_master_with_warm_only_data_role(self):
+        change_set = WorkloadChangeSet(
+            changes=[
+                WorkloadChange(
+                    client_id="master-1",
+                    kind="create",
+                    node_id=1,
+                    role="master",
+                    config={"cpu": "1", "memory": "2g", "storage_path": "/srv/elastic/master"},
+                ),
+                WorkloadChange(
+                    client_id="warm-1",
+                    kind="create",
+                    node_id=1,
+                    role="warm",
+                    config={"cpu": "1", "memory": "2g", "storage_path": "/srv/elastic/warm"},
+                ),
+            ]
+        )
+
+        with self.assertRaisesRegex(HTTPException, "Hot data-content"):
+            self._validator().validate(object(), 1, change_set)
 
     def test_validator_rejects_non_master_create_without_a_master(self):
         change_set = WorkloadChangeSet(

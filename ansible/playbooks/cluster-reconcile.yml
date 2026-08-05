@@ -37,6 +37,8 @@
           - desired_state in ['present', 'purge']
           - assignment.config.cpu is match('^[0-9]+([.][0-9]+)?$')
           - assignment.config.memory is match('^[1-9][0-9]*([.][0-9]+)?[kKmMgGtT]$')
+          - assignment.config.jvm_heap | default('') == '' or assignment.config.jvm_heap is match('^[1-9][0-9]*([.][0-9]+)?[kKmMgGtT]$')
+          - assignment.config.node_heap | default('') == '' or assignment.config.node_heap is match('^[1-9][0-9]*([.][0-9]+)?[kKmMgGtT]$')
           - assignment.config.storage_path.startswith('/')
           - not assignment.config.storage_path.startswith('/etc/')
           - not assignment.config.storage_path.startswith('/usr/')
@@ -46,7 +48,7 @@
           - assignment.role != 'fleet-server' or assignment.ports.fleet | default(0) | int > 0
           - assignment.role != 'logstash' or assignment.ports.logstash_api | default(0) | int > 0
           - assignment.role != 'logstash' or assignment.config.pipeline | default('') | length > 0
-          - membership.zone_id | default('') == '' or membership.zone_id is match('^[a-z0-9][a-z0-9._-]{0,63}$')
+          - membership.zone_id | default('', true) == '' or membership.zone_id is match('^[a-z0-9][a-z0-9._-]{0,63}$')
         fail_msg: Invalid cluster workload request.
 
     - name: Validate data and user NIC bindings before changes
@@ -73,6 +75,60 @@
         executable: /bin/bash
       changed_when: false
       when: desired_state == 'present'
+
+    - name: Refuse a listener collision before changing the requested workload
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          service={{ workload | quote }}.service
+          case {{ assignment.role | quote }} in
+            master|hot|warm|ml|ingest|coordinating)
+              ports=({{ assignment.ports.elasticsearch_http | default(0) | quote }} {{ assignment.ports.elasticsearch_transport | default(0) | quote }})
+              ;;
+            kibana) ports=({{ assignment.ports.kibana | default(0) | quote }}) ;;
+            fleet-server) ports=({{ assignment.ports.fleet | default(0) | quote }}) ;;
+            logstash) ports=({{ assignment.ports.logstash_api | default(0) | quote }}) ;;
+            *) ports=() ;;
+          esac
+          if systemctl is-active --quiet "$service"; then
+            exit 0
+          fi
+          for port in "${ports[@]}"; do
+            if ss -H -ltn "sport = :$port" | grep -q .; then
+              echo "ECP_PORT_CONFLICT=$port workload={{ workload }}"
+              exit 24
+            fi
+          done
+        executable: /bin/bash
+      changed_when: false
+      when: desired_state == 'present'
+
+    - name: Verify the selected bootstrap workload identity before dependent changes
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          bootstrap_service={{ bootstrap.workload | quote }}.service
+          test -s {{ ca_root | quote }}/ca.crt
+          systemctl is-active --quiet "$bootstrap_service" || {
+            echo "ECP_BOOTSTRAP_WORKLOAD_INACTIVE=$bootstrap_service"
+            exit 25
+          }
+          code=$(curl --silent --show-error --noproxy '*' --max-time 5 \
+            --cacert {{ ca_root | quote }}/ca.crt -o /dev/null -w '%{http_code}' \
+            https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}/ || true)
+          case "$code" in
+            200|401|503) ;;
+            *)
+              echo "ECP_BOOTSTRAP_TLS_IDENTITY_MISMATCH=$code"
+              exit 26
+              ;;
+          esac
+        executable: /bin/bash
+      delegate_to: "{{ bootstrap.node_name }}"
+      changed_when: false
+      when:
+        - desired_state == 'present'
+        - assignment.id != bootstrap.assignment_id
 
     - name: Install workload dependencies
       ansible.builtin.package:
@@ -223,19 +279,25 @@
         - { dest: "{{ cert_root }}/node.key", content: "{{ certificate_blobs.results[2].content }}", mode: '0600' }
       when: desired_state == 'present'
 
-    - name: Verify bootstrap coordinator is reachable before joining or serving
-      ansible.builtin.shell:
-        cmd: |
-          set -Eeuo pipefail
-          code=$(curl --silent --show-error --max-time 5 --cacert {{ cert_root | quote }}/ca.crt \
-            -o /dev/null -w '%{http_code}' https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}/ || true)
-          [[ "$code" == 200 || "$code" == 401 ]]
-        executable: /bin/bash
-      no_log: true
+    - name: Wait until bootstrap coordinator serves verified HTTPS
+      ansible.builtin.uri:
+        url: "https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}/"
+        method: GET
+        ca_path: "{{ cert_root }}/ca.crt"
+        validate_certs: true
+        use_proxy: false
+        follow_redirects: none
+        return_content: false
+        status_code: [200, 401, 503]
+        timeout: 5
+      register: bootstrap_response
+      until: bootstrap_response.status | default(-1) in [200, 401]
+      retries: 18
+      delay: 5
       changed_when: false
       when:
         - desired_state == 'present'
-        - assignment.role != 'master'
+        - assignment.id != bootstrap.assignment_id
 
     - name: Back up existing workload unit
       ansible.builtin.copy:
@@ -397,6 +459,9 @@
           Volume={{ cert_root }}:/usr/share/kibana/config/certs:ro,Z
           Volume={{ assignment.config.storage_path }}:/usr/share/kibana/data:Z
           PodmanArgs=--cpus={{ assignment.config.cpu }} --memory={{ assignment.config.memory }}
+          {% if assignment.config.node_heap_mib | default(0) | int > 0 %}
+          Environment=NODE_OPTIONS=--max-old-space-size={{ assignment.config.node_heap_mib }}
+          {% endif %}
           [Service]
           Restart=always
           TimeoutStartSec=900
@@ -428,6 +493,9 @@
             ECP_ELASTICSEARCH_CA=/usr/share/logstash/config/certs/ca.crt
             ECP_ELASTICSEARCH_USERNAME=elastic
             ECP_ELASTICSEARCH_PASSWORD={{ credentials.elastic_password }}
+            {% if assignment.config.jvm_heap | default('', true) %}
+            LS_JAVA_OPTS=-Xms{{ assignment.config.jvm_heap }} -Xmx{{ assignment.config.jvm_heap }}
+            {% endif %}
       no_log: true
       when: desired_state == 'present' and assignment.role == 'logstash'
 
@@ -678,16 +746,47 @@
           trap 'rm -f "$auth"' EXIT
           chmod 0600 "$auth"
           printf 'user = "elastic:%s"\n' "$ECP_ELASTIC_PASSWORD" > "$auth"
-          local_uuid=$(curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" https://{{ membership.user_address }}:{{ assignment.ports.elasticsearch_http }}/ | python3 -c 'import json,sys; print(json.load(sys.stdin)["cluster_uuid"])')
-          bootstrap_uuid=$(curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}/ | python3 -c 'import json,sys; print(json.load(sys.stdin)["cluster_uuid"])')
-          test "$local_uuid" = "$bootstrap_uuid"
-          curl --fail --silent --show-error --cacert {{ cert_root | quote }}/ca.crt --config "$auth" https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}/_cat/nodes?h=name | grep -Fx {{ workload | quote }}
+          cluster_uuid() {
+            curl --fail --silent --show-error --noproxy '*' --max-time 5 \
+              --cacert {{ cert_root | quote }}/ca.crt --config "$auth" "$1" 2>/dev/null \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("cluster_uuid", ""))' 2>/dev/null
+          }
+          for attempt in $(seq 1 60); do
+            local_uuid=$(cluster_uuid https://{{ membership.user_address }}:{{ assignment.ports.elasticsearch_http }}/ || true)
+            bootstrap_uuid=$(cluster_uuid https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}/ || true)
+            if [[ -n "$local_uuid" && "$local_uuid" == "$bootstrap_uuid" ]]; then
+              nodes=$(curl --fail --silent --show-error --noproxy '*' --max-time 5 \
+                --cacert {{ cert_root | quote }}/ca.crt --config "$auth" \
+                "https://{{ bootstrap.user_address }}:{{ bootstrap.ports.elasticsearch_http }}/_nodes/_all/http?filter_path=nodes.*.name" 2>/dev/null || true)
+              python3 -c 'import json,sys; nodes=json.load(sys.stdin).get("nodes", {}); names=[item.get("name") for item in nodes.values()]; raise SystemExit(0 if sys.argv[1] in names else 1)' \
+                {{ workload | quote }} <<< "$nodes" && exit 0
+            fi
+            sleep 2
+          done
+          exit 1
         executable: /bin/bash
       environment:
         ECP_ELASTIC_PASSWORD: "{{ credentials.elastic_password }}"
       no_log: true
+      register: cluster_membership_check
+      failed_when: false
       changed_when: false
-      when: desired_state == 'present' and assignment.role in elasticsearch_data_roles
+      when:
+        - desired_state == 'present'
+        - assignment.role in elasticsearch_roles
+        - assignment.id != bootstrap.assignment_id
+
+    - name: Report a timed out Elasticsearch cluster join without exposing credentials
+      ansible.builtin.assert:
+        that: cluster_membership_check.rc == 0
+        fail_msg: >-
+          ECP_CLUSTER_JOIN_TIMEOUT: {{ workload }} did not join the bootstrap
+          Elasticsearch cluster with a matching cluster UUID before the timeout.
+      changed_when: false
+      when:
+        - desired_state == 'present'
+        - assignment.role in elasticsearch_roles
+        - assignment.id != bootstrap.assignment_id
 
     - name: Synchronize the Metricbeat monitoring service credential
       ansible.builtin.shell:
@@ -911,6 +1010,9 @@
           systemctl disable --now {{ filebeat_workload | quote }}.service 2>/dev/null || true
           systemctl disable --now {{ metricbeat_workload | quote }}.service 2>/dev/null || true
           systemctl disable --now {{ workload | quote }}.service 2>/dev/null || true
+          systemctl reset-failed {{ filebeat_workload | quote }}.service 2>/dev/null || true
+          systemctl reset-failed {{ metricbeat_workload | quote }}.service 2>/dev/null || true
+          systemctl reset-failed {{ workload | quote }}.service 2>/dev/null || true
           rm -f {{ filebeat_unit_file | quote }} {{ metricbeat_unit_file | quote }} {{ unit_file | quote }} {{ unit_file | quote }}.elastic-control-backup
           systemctl daemon-reload
           podman rm -f {{ filebeat_workload | quote }} 2>/dev/null || true

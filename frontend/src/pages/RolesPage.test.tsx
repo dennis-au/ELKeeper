@@ -8,7 +8,7 @@ import { managedWorkloadColumns, RolesPage, workloadImageVersion, workloadRuntim
 const state = vi.hoisted(() => ({
   versionResponse: { available_versions: ['8.20.0', '8.19.0'], recommended_version: '8.20.0', assignments: [] },
   api: vi.fn((path: string, _options?: RequestInit) => {
-    if (path === '/api/health') return Promise.resolve({ roles: [{ id: 'master', label: 'Master' }] });
+    if (path === '/api/health') return Promise.resolve({ roles: [{ id: 'master', label: 'Master' }, { id: 'kibana', label: 'Kibana' }] });
     if (path === '/api/clusters/1/topology') return Promise.resolve({ topology: '', access_urls: [] });
     if (path === '/api/clusters/1/versions?role=master') return Promise.resolve(state.versionResponse);
     if (path === '/api/runs') return Promise.resolve([]);
@@ -137,6 +137,24 @@ describe('RolesPage storage selection', () => {
     );
 
     await waitFor(() => expect(screen.getByLabelText('Image version')).toHaveValue('8.19.0'));
+  });
+
+  it('uses a Node.js heap field for Kibana instead of mislabeling it as JVM memory', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <ConsoleContext.Provider value={{ clusters: [cluster], selectedCluster: cluster, selectedClusterId: 1, setSelectedClusterId: () => undefined, watchRun: () => undefined, refreshAll: async () => undefined }}>
+          <RolesPage />
+        </ConsoleContext.Provider>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByLabelText('JVM heap')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('Role'), { target: { value: 'kibana' } });
+    const heap = await screen.findByLabelText('Node.js heap');
+    fireEvent.change(heap, { target: { value: '12g' } });
+    expect(heap).toHaveValue('12g');
+    expect(screen.queryByLabelText('JVM heap')).not.toBeInTheDocument();
   });
 
   it('shows the observed running image version immediately after the workload role', async () => {

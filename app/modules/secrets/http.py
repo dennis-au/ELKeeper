@@ -49,6 +49,9 @@ def build_router(
             if item["category"] in {"Certificates", "Private keys"}:
                 public["storage_path"] = item["path"]
             public["masked_value"] = "********"
+            if item.get("reveal_deprecated"):
+                public["reveal_deprecated"] = True
+                public["value_access"] = "metadata_only"
             public_items.append(public)
         return {"items": public_items}
 
@@ -88,6 +91,14 @@ def build_router(
         item = next((entry for entry in catalog if entry["id"] == item_id), None)
         if not item:
             raise HTTPException(404, "Sensitive item not found")
+        if item.get("reveal_deprecated"):
+            raise HTTPException(
+                410,
+                {
+                    "code": "private_key_reveal_deprecated",
+                    "message": "Private-key reveal and copy are unavailable. Use certificate lifecycle operations instead.",
+                },
+            )
         if item.get("db_key"):
             value = credentials.get(item["db_key"], "")
         else:

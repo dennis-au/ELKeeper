@@ -80,8 +80,10 @@ class WorkloadPayloadService:
                 self._require_zone(cluster_details, current)
         config_overrides = config_overrides or {}
         config = dict(config_overrides.get(int(row["id"]), self._open_config(row["config_json"])))
-        if row["role"] in self._elasticsearch_roles:
+        if row["role"] in self._elasticsearch_roles and not str(config.get("jvm_heap", "")).strip():
             config["jvm_heap"] = f"{max(1024, self._memory_mebibytes(str(config['memory'])) // 2)}m"
+        if row["role"] == "kibana" and str(config.get("node_heap", "")).strip():
+            config["node_heap_mib"] = self._memory_mebibytes(str(config["node_heap"]))
 
         assignments = self._workloads.from_connection(connection).payload_assignments_in_connection(
             connection, cluster_id, included_ids=tuple(int(value) for value in batch_assignment_ids)

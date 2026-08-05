@@ -100,13 +100,21 @@ class HostLifecycleOperations:
         return self._workload_repository_type(self._db_factory).has_assignments_for_node(node_id)
 
     def launch_action(self, node: dict, action: str) -> int:
-        playbook = self._playbooks / f"host-{action}.yml"
+        playbook_names = {
+            "initialize": "host-init.yml",
+            "reboot": "host-reboot.yml",
+            "deinitialize": "host-deinit.yml",
+        }
+        playbook_name = playbook_names.get(action)
+        if playbook_name is None:
+            raise ValueError(f"Unsupported host lifecycle action: {action}")
+        run_kind = "host-init" if action == "initialize" else f"host-{action}"
         return self._launch(
-            f"host-{action}",
+            run_kind,
             node["name"],
             lambda inventory, _variables: self._playbook_command(
                 inventory,
-                playbook,
+                self._playbooks / playbook_name,
                 node["name"],
                 self._active_key_path(),
             ),

@@ -40,6 +40,29 @@ class WorkloadPolicyService:
             raise HTTPException(422, "Storage path must be a safe absolute non-system path")
         if role in {"master", "hot", "warm", "ml", "ingest", "coordinating"} and self.memory_mebibytes(str(config["memory"])) < 2048:
             raise HTTPException(422, "Elasticsearch workloads require at least 2g of memory")
+        memory_mib = self.memory_mebibytes(str(config["memory"]))
+        jvm_heap = str(config.get("jvm_heap", "")).strip()
+        node_heap = str(config.get("node_heap", "")).strip()
+        if jvm_heap:
+            if role not in {"master", "hot", "warm", "ml", "ingest", "coordinating", "logstash"}:
+                raise HTTPException(422, "JVM heap is supported only by Elasticsearch and Logstash workloads")
+            if not self._memory_pattern.fullmatch(jvm_heap):
+                raise HTTPException(422, "JVM heap must be a positive size such as 8g")
+            heap_mib = self.memory_mebibytes(jvm_heap)
+            if heap_mib < 512:
+                raise HTTPException(422, "JVM heap must be at least 512m")
+            if heap_mib > memory_mib // 2:
+                raise HTTPException(422, "JVM heap may not exceed 50% of the container memory limit")
+        if node_heap:
+            if role != "kibana":
+                raise HTTPException(422, "Node.js heap is supported only by Kibana")
+            if not self._memory_pattern.fullmatch(node_heap):
+                raise HTTPException(422, "Node.js heap must be a positive size such as 12g")
+            heap_mib = self.memory_mebibytes(node_heap)
+            if heap_mib < 512:
+                raise HTTPException(422, "Node.js heap must be at least 512m")
+            if heap_mib > memory_mib * 3 // 4:
+                raise HTTPException(422, "Node.js heap may not exceed 75% of the container memory limit")
         if role == "logstash" and not str(config.get("pipeline", "")).strip():
             raise HTTPException(422, "A Logstash pipeline is required")
 

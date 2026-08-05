@@ -171,7 +171,8 @@ class ClusterLifecycleService:
         try:
             with self._db() as connection:
                 clusters = ClusterRepository.from_connection(connection)
-                if not clusters.record_in_connection(connection, cluster_id):
+                record = clusters.record_in_connection(connection, cluster_id)
+                if not record:
                     raise HTTPException(404, "Cluster not found")
                 self._require_no_maintenance_conflict(connection, cluster_id=cluster_id)
                 self._require_cluster_capability(
@@ -187,7 +188,10 @@ class ClusterLifecycleService:
                 if not clusters.update_in_connection(
                     connection,
                     cluster_id,
-                    self._values(input, slug=self._slugify(input.name), color=color),
+                    # The slug owns remote unit names, certificate paths, and
+                    # persistent data markers. It is an immutable namespace;
+                    # the display name can change without renaming a live stack.
+                    self._values(input, slug=record["slug"], color=color),
                 ):
                     raise HTTPException(404, "Cluster not found")
             return {"updated": True}

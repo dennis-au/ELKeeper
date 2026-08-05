@@ -132,6 +132,18 @@ class WorkloadChangeValidator:
         if initial_master and initial_master["id"] in detached and final_assignments:
             raise HTTPException(409, "Detach the dependent cluster roles before removing the initial master")
         final_roles = {item["role"] for item in final_assignments}
+        initial_master_create = not active_masters and any(
+            item["kind"] == "create" and item["role"] == "master"
+            for item in planned
+        )
+        if initial_master_create and not any(
+            item["kind"] == "create" and item["role"] == "hot"
+            for item in planned
+        ):
+            raise HTTPException(
+                422,
+                "The first master must be applied in a staged change set with a Hot data-content workload",
+            )
         if any(item["kind"] == "create" and item["role"] != "master" for item in planned) and "master" not in final_roles:
             raise HTTPException(422, "Deploy a master before this workload")
         if "fleet-server" in final_roles and "kibana" not in final_roles:

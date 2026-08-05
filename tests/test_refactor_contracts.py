@@ -151,6 +151,12 @@ class RefactorContractTests(unittest.TestCase):
     def test_route_owner_leaves_new_route_unregistered(self):
         self.assertIsNone(route_owner("GET", "/api/new-feature/endpoint"))
 
+    def test_certificate_ca_rotation_preview_is_owned_by_certificates(self):
+        self.assertEqual(
+            route_owner("POST", "/api/clusters/{cluster_id}/ca-rotation-preview"),
+            "certificates",
+        )
+
     def test_golden_dto_fixtures_are_complete_and_non_secret(self):
         fixtures = load_all_fixtures(ROOT / "tests" / "fixtures" / "golden")
         self.assertEqual(set(fixtures), set(GOLDEN_DTO_CONTRACTS))

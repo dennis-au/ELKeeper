@@ -97,9 +97,10 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(runtime.status_code, 200)
         self.assertFalse(runtime.json()["initialized"])
 
-        with patch.object(self.main, "launch", return_value=81):
+        with patch.object(self.main, "launch", return_value=81) as launch:
             initialized = self.client.post(f"/api/nodes/{node_id}/initialize", headers=headers)
         self.assertEqual(initialized.json()["run_id"], 81)
+        self.assertEqual(launch.call_args.args[:2], ("host-init", "node-a"))
 
         cluster_id = self.cluster(headers)
         self.client.post(f"/api/clusters/{cluster_id}/members", headers=headers, json={
@@ -221,6 +222,39 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(private_key["storage_path"], "/etc/elastic-control/clusters/lab-a/ca/ca.key")
         self.assertNotIn("storage_path", credential)
         self.assertNotIn("value", certificate)
+
+    def test_certificate_lifecycle_inventory_and_preview_are_registered_without_mutation(self):
+        headers = self.login()
+        node_id = self.node(headers)
+        cluster_id = self.cluster(headers)
+        self.client.post(f"/api/clusters/{cluster_id}/members", headers=headers, json={
+            "node_id": node_id,
+            "network_mode": "shared",
+            "data_interface": "ens18",
+            "data_address": "192.0.2.102",
+            "user_interface": "ens18",
+            "user_address": "192.0.2.102",
+        })
+        self.client.post(f"/api/clusters/{cluster_id}/assignments", headers=headers, json={
+            "node_id": node_id,
+            "role": "master",
+            "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/elastic/lab-a/master"},
+        })
+
+        inventory = self.client.get(f"/api/clusters/{cluster_id}/certificates", headers=headers)
+        self.assertEqual(inventory.status_code, 200)
+        payload = inventory.json()
+        self.assertEqual(payload["compatibility"]["format"], "PEM")
+        self.assertFalse(payload["compatibility"]["mutation_enabled"])
+        self.assertTrue(any(item["purpose"] == "elasticsearch_transport" for item in payload["items"]))
+        asset = next(item for item in payload["items"] if item["purpose"] == "elasticsearch_transport")
+
+        preview = self.client.post(
+            f"/api/certificates/{asset['id']}/renewal-preview", headers=headers
+        )
+        self.assertEqual(preview.status_code, 200)
+        self.assertFalse(preview.json()["execution_enabled"])
+        self.assertIn("rolling_restart_capability_disabled", preview.json()["blockers"])
 
     def test_dashboard_snapshot_isolated_failure_states(self):
         headers = self.login()
@@ -764,8 +798,11 @@ class ConsoleApiTests(unittest.TestCase):
             "state": "running",
             "status": "Up 1 minute",
             "labels": {
+                "io.elastic-control.cluster-id": str(cluster_id),
+                "io.elastic-control.cluster-slug": "lab-a",
                 "io.elastic-control.assignment-id": str(assignment_id),
                 "io.elastic-control.role": "master",
+                "io.elastic-control.node-id": str(node_id),
             },
         }])
 
@@ -780,6 +817,43 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(observation["running"], 1)
         self.assertEqual(observation["cached"], 1)
         self.assertEqual(observation["error"], "")
+
+    def test_host_telemetry_rejects_a_container_from_another_cluster_namespace(self):
+        headers = self.login()
+        node_id = self.node(headers)
+        cluster_id = self.cluster(headers)
+        with self.main.db() as con:
+            assignment_id = con.execute(
+                "INSERT INTO cluster_assignments(cluster_id,node_id,role,config_json,image_version,state) VALUES (?,?,?,?,?,'active')",
+                (cluster_id, node_id, "master", "{}", "9.9.9"),
+            ).lastrowid
+
+        manager = self.main.console.TelemetryManager()
+        manager._record_workload_runtime(node_id, [{
+            "name": f"ecp-foreign-master-{node_id}",
+            "image": "docker.elastic.co/elasticsearch/elasticsearch:8.19.1",
+            "digest": "sha256:foreign-image",
+            "state": "running",
+            "status": "Up 1 minute",
+            "labels": {
+                "io.elastic-control.cluster-id": str(cluster_id),
+                "io.elastic-control.cluster-slug": "foreign",
+                "io.elastic-control.assignment-id": str(assignment_id),
+                "io.elastic-control.role": "master",
+                "io.elastic-control.node-id": str(node_id),
+            },
+        }])
+
+        with self.main.db() as con:
+            observation = dict(con.execute(
+                "SELECT running,cached,error FROM workload_observations WHERE assignment_id=?",
+                (assignment_id,),
+            ).fetchone())
+        self.assertEqual(observation, {
+            "running": 0,
+            "cached": 0,
+            "error": "Managed workload container not found",
+        })
 
     def test_dashboard_stream_requires_a_scoped_token(self):
         headers = self.login()
@@ -814,6 +888,7 @@ class ConsoleApiTests(unittest.TestCase):
         reconcile = (playbooks / "cluster-reconcile.yml").read_text()
         settings = (playbooks / "cluster-settings.yml").read_text()
         zoning = (playbooks / "cluster-zoning-settings.yml").read_text()
+        identity_recovery = (playbooks / "cluster-identity-recovery.yml").read_text()
         self.assertIn("podman.socket", host_init)
         self.assertIn("elastic-control-host-init", host_init)
         self.assertIn("SELINUX=disabled", host_init)
@@ -831,10 +906,44 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertIn("coordinating: \"[]\"", reconcile)
         self.assertIn("_cluster/settings", settings)
         self.assertIn("cluster.routing.allocation.disk.watermark.flood_stage", settings)
+        self.assertIn("membership.zone_id | default('', true) == ''", reconcile)
+        self.assertIn("ansible.builtin.uri", reconcile)
+        self.assertIn("ca_path: \"{{ cert_root }}/ca.crt\"", reconcile)
+        self.assertIn("validate_certs: true", reconcile)
+        self.assertIn("use_proxy: false", reconcile)
+        self.assertIn("status_code: [200, 401, 503]", reconcile)
+        self.assertIn("until: bootstrap_response.status | default(-1) in [200, 401]", reconcile)
+        self.assertIn("retries: 18", reconcile)
+        self.assertIn("Refuse a listener collision before changing the requested workload", reconcile)
+        self.assertIn("ECP_PORT_CONFLICT", reconcile)
+        self.assertIn("Verify the selected bootstrap workload identity before dependent changes", reconcile)
+        self.assertIn("ECP_BOOTSTRAP_TLS_IDENTITY_MISMATCH", reconcile)
+        self.assertIn("assignment.id != bootstrap.assignment_id", reconcile)
+        membership_check = reconcile.split("- name: Verify Elasticsearch cluster UUID and node membership", 1)[1]
+        self.assertIn("assignment.role in elasticsearch_roles", membership_check)
+        self.assertIn("assignment.id != bootstrap.assignment_id", membership_check)
+        self.assertIn("for attempt in $(seq 1 60)", membership_check)
+        self.assertIn("cluster_membership_check", membership_check)
+        self.assertIn("ECP_CLUSTER_JOIN_TIMEOUT", membership_check)
+        self.assertIn("--noproxy '*'", membership_check)
+        self.assertIn("/_nodes/_all/http?filter_path=nodes.*.name", membership_check)
+        self.assertNotIn("_cat/nodes", membership_check)
+        self.assertLess(
+            reconcile.index("Wait for Elasticsearch security index readiness after starting a data role"),
+            reconcile.index("Verify Elasticsearch cluster UUID and node membership"),
+        )
         self.assertIn("ES_SETTING_NODE_ATTR_ZONE={{ membership.zone_id }}", reconcile)
         self.assertIn("cluster.routing.allocation.awareness.attributes", zoning)
         self.assertIn("cluster.routing.allocation.awareness.force.zone.values", zoning)
         self.assertIn("Restore previous zoning settings", zoning)
+        self.assertIn("identity_recovery_cluster_id", identity_recovery)
+        self.assertIn("io.elastic-control.managed=true", identity_recovery)
+        self.assertIn("io.elastic-control.cluster-slug", identity_recovery)
+        self.assertIn("Remove only marker-protected selected workload data", identity_recovery)
+        self.assertIn("Clear failed state only for selected managed workload units", identity_recovery)
+        self.assertIn("systemctl", identity_recovery)
+        self.assertIn("reset-failed", identity_recovery)
+        self.assertIn("systemctl reset-failed {{ workload | quote }}.service", reconcile)
 
 
 if __name__ == "__main__":

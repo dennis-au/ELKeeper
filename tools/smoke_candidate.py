@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import os
 from pathlib import Path
 import re
+import secrets
 import subprocess
 import tempfile
 import time
@@ -15,13 +17,12 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 
-def env_values(path: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line and not line.lstrip().startswith("#") and "=" in line:
-            key, value = line.split("=", 1)
-            values[key] = value
-    return values
+def isolated_credentials() -> dict[str, str]:
+    return {
+        "APP_SECRET_KEY": secrets.token_urlsafe(32),
+        "ADMIN_USERNAME": "smoke-operator",
+        "ADMIN_PASSWORD": secrets.token_urlsafe(24),
+    }
 
 
 def request(url: str, *, token: str = "", payload: dict | None = None) -> tuple[int, bytes]:
@@ -54,9 +55,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=18083)
     args = parser.parse_args(argv)
     root = args.root.resolve()
-    values = env_values(root / ".env")
-    if not values.get("ADMIN_USERNAME") or not values.get("ADMIN_PASSWORD"):
-        parser.error("the isolated smoke requires ADMIN_USERNAME and ADMIN_PASSWORD in .env")
+    credentials = isolated_credentials()
+    container_env = os.environ.copy()
+    container_env.update(credentials)
     name = f"ecp-smoke-{args.port}"
     base = f"http://127.0.0.1:{args.port}"
     with tempfile.TemporaryDirectory(prefix="ecp-smoke-") as temporary:
@@ -65,7 +66,8 @@ def main(argv: list[str] | None = None) -> int:
             (temporary_path / directory).mkdir()
         subprocess.run(["podman", "rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         command = [
-            "podman", "run", "-d", "--name", name, "--env-file", str(root / ".env"),
+            "podman", "run", "-d", "--name", name,
+            "-e", "APP_SECRET_KEY", "-e", "ADMIN_USERNAME", "-e", "ADMIN_PASSWORD",
             "-e", "APP_DATA_DIR=/var/lib/elastic-control", "-e", "APP_CONFIG_DIR=/config",
             "-e", "APP_RUNTIME_DIR=/run/elastic-control", "-p", f"127.0.0.1:{args.port}:8080",
             "-v", f"{temporary_path / 'data'}:/var/lib/elastic-control:Z",
@@ -73,14 +75,17 @@ def main(argv: list[str] | None = None) -> int:
             args.image,
         ]
         try:
-            subprocess.run(command, stdout=subprocess.DEVNULL, check=True)
+            subprocess.run(command, stdout=subprocess.DEVNULL, check=True, env=container_env)
             for _ in range(30):
                 if request(f"{base}/api/health")[0] == 200:
                     break
                 time.sleep(1)
             if request(f"{base}/api/health")[0] != 200:
                 raise RuntimeError("candidate health endpoint did not become ready")
-            status, body = request(f"{base}/api/auth/login", payload={"username": values["ADMIN_USERNAME"], "password": values["ADMIN_PASSWORD"]})
+            status, body = request(
+                f"{base}/api/auth/login",
+                payload={"username": credentials["ADMIN_USERNAME"], "password": credentials["ADMIN_PASSWORD"]},
+            )
             token = json.loads(body).get("token", "") if status == 200 else ""
             if not token or request(f"{base}/api/clusters", token=token)[0] != 200 or request(f"{base}/api/runs", token=token)[0] != 200:
                 raise RuntimeError("candidate authentication or authenticated API check failed")

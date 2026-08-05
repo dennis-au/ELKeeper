@@ -12,6 +12,8 @@ import { copyText } from '../../shared/clipboard';
 import { formatDateTime } from '../../shared/format';
 import type { ControllerSettings, SensitiveItem } from './types';
 import { ControllerIdentityPanel } from './components/ControllerIdentityPanel';
+import { HostKeyRecordsPanel } from './components/HostKeyRecordsPanel';
+import { CertificatesPanel } from '../certificates';
 
 interface RevealState { item: SensitiveItem; purpose: 'reveal' | 'copy' }
 interface CopyReadyState { item: SensitiveItem; value: string }
@@ -27,7 +29,7 @@ export function AdvancedWorkspace() {
   const copyInputRef = useRef<HTMLInputElement>(null);
   const [visible, setVisible] = useState<Record<string, string>>({});
   const [error, setError] = useState('');
-  const [tab, setTab] = useState<'sensitive' | 'controller'>('sensitive');
+  const [tab, setTab] = useState<'sensitive' | 'controller' | 'hostKeys' | 'certificates'>('sensitive');
   const { data, isLoading, refetch } = useQuery({
     queryKey: ['sensitive-items', selectedCluster?.id], enabled: Boolean(selectedCluster),
     queryFn: () => advancedApi.sensitiveItems(selectedCluster!.id),
@@ -78,9 +80,11 @@ export function AdvancedWorkspace() {
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Re-authentication failed'); }
   };
   return <div className="page-stack">
-    <div className="page-heading"><div><EuiTitle><h1>Advance</h1></EuiTitle><EuiText color="subdued">Controller identity and cluster-scoped credentials, certificates, keys, and enrollment material.</EuiText></div>{tab === 'sensitive' && selectedCluster && <EuiButtonEmpty iconType="refresh" onClick={() => refetch()} isLoading={isLoading}>Refresh inventory</EuiButtonEmpty>}</div>
-    <EuiTabs><EuiTab isSelected={tab === 'sensitive'} onClick={() => setTab('sensitive')}>Elastic Stack Secret</EuiTab><EuiTab isSelected={tab === 'controller'} onClick={() => setTab('controller')}>Controller</EuiTab></EuiTabs>
+    <div className="page-heading"><div><EuiTitle><h1>Advance</h1></EuiTitle><EuiText color="subdued">Controller identity, host-key pins, and cluster-scoped credentials and certificates.</EuiText></div>{tab === 'sensitive' && selectedCluster && <EuiButtonEmpty iconType="refresh" onClick={() => refetch()} isLoading={isLoading}>Refresh inventory</EuiButtonEmpty>}</div>
+    <EuiTabs><EuiTab isSelected={tab === 'sensitive'} onClick={() => setTab('sensitive')}>Elastic Stack Secret</EuiTab><EuiTab isSelected={tab === 'controller'} onClick={() => setTab('controller')}>Controller</EuiTab><EuiTab isSelected={tab === 'hostKeys'} onClick={() => setTab('hostKeys')}>SSH Host Keys</EuiTab><EuiTab isSelected={tab === 'certificates'} onClick={() => setTab('certificates')}>Certificates</EuiTab></EuiTabs>
     {tab === 'controller' && <ControllerIdentityPanel />}
+    {tab === 'hostKeys' && <HostKeyRecordsPanel />}
+    {tab === 'certificates' && <CertificatesPanel />}
     {tab === 'sensitive' && !selectedCluster && <EuiCallOut title="Select or create a cluster" iconType="cluster" />}
     {tab === 'sensitive' && selectedCluster && <>
     <EuiCallOut title="Sensitive access is audited" color="warning" iconType="lock">Values are masked by default. Re-authentication grants access to this cluster for 60 seconds; revealed values hide after 30 seconds.</EuiCallOut>
@@ -90,9 +94,7 @@ export function AdvancedWorkspace() {
         <div className="sensitive-row__identity"><strong>{item.label}</strong><small>{item.source}</small>{item.storage_path && <small className="sensitive-row__path">{item.storage_path}</small>}</div>
         <EuiBadge color={item.available ? 'success' : 'warning'}>{item.available ? 'available' : 'unavailable'}</EuiBadge>
         <div className="sensitive-row__metadata">{item.fingerprint && <span title={item.fingerprint}>SHA-256 {item.fingerprint.slice(0, 23)}…</span>}{item.expires_at && <span>Expires {formatDateTime(item.expires_at, timezone)}</span>}</div>
-        <EuiFieldText className="secret-value" readOnly value={visible[item.id] || item.masked_value} aria-label={`${item.label} value`} />
-        <EuiToolTip content={visible[item.id] ? 'Hide value' : 'Reveal value'}><EuiButtonEmpty iconType={visible[item.id] ? 'eyeClosed' : 'eye'} onClick={() => visible[item.id] ? setVisible((current) => { const next = { ...current }; delete next[item.id]; return next; }) : requestAccess(item, 'reveal')} disabled={!item.available}>{visible[item.id] ? 'Hide' : 'Reveal'}</EuiButtonEmpty></EuiToolTip>
-        <EuiToolTip content="Copy with an audited access event"><EuiButtonEmpty iconType="copyClipboard" onClick={() => requestAccess(item, 'copy')} disabled={!item.available}>Copy</EuiButtonEmpty></EuiToolTip>
+        {item.reveal_deprecated ? <EuiText size="s" color="subdued">Metadata only</EuiText> : <><EuiFieldText className="secret-value" readOnly value={visible[item.id] || item.masked_value} aria-label={`${item.label} value`} /><EuiToolTip content={visible[item.id] ? 'Hide value' : 'Reveal value'}><EuiButtonEmpty iconType={visible[item.id] ? 'eyeClosed' : 'eye'} onClick={() => visible[item.id] ? setVisible((current) => { const next = { ...current }; delete next[item.id]; return next; }) : requestAccess(item, 'reveal')} disabled={!item.available}>{visible[item.id] ? 'Hide' : 'Reveal'}</EuiButtonEmpty></EuiToolTip><EuiToolTip content="Copy with an audited access event"><EuiButtonEmpty iconType="copyClipboard" onClick={() => requestAccess(item, 'copy')} disabled={!item.available}>Copy</EuiButtonEmpty></EuiToolTip></>}
       </div>)}</div>
     </section>)}
     {!isLoading && !data?.items.length && <EuiCallOut title="No sensitive material is configured" iconType="lock" />}

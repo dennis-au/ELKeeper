@@ -53,16 +53,21 @@ class HostsModuleTests(unittest.TestCase):
         operations.require_no_conflict(7)
         self.assertTrue(operations.has_assignments(9))
         self.assertFalse(operations.has_assignments(8))
-        self.assertEqual(operations.launch_action({"name": "node-a"}, "reboot"), 1)
-        self.assertEqual(operations.launch_initialize("node-b"), 2)
+        self.assertEqual(operations.launch_action({"name": "node-a"}, "initialize"), 1)
+        self.assertEqual(operations.launch_action({"name": "node-a"}, "reboot"), 2)
+        self.assertEqual(operations.launch_initialize("node-b"), 3)
         self.assertEqual(
             commands,
             [
+                ("/tmp/inventory", Path("/playbooks/host-init.yml"), "node-a", "/run/controller-key"),
                 ("/tmp/inventory", Path("/playbooks/host-reboot.yml"), "node-a", "/run/controller-key"),
                 ("/tmp/inventory", Path("/playbooks/host-init.yml"), "node-b", "/run/controller-key"),
             ],
         )
-        self.assertEqual([item[:2] for item in launches], [("host-reboot", "node-a"), ("host-init", "node-b")])
+        self.assertEqual(
+            [item[:2] for item in launches],
+            [("host-init", "node-a"), ("host-reboot", "node-a"), ("host-init", "node-b")],
+        )
 
     def test_lifecycle_operations_builds_stable_lifecycle_and_batch_routes(self):
         conflicts = []
@@ -126,7 +131,7 @@ class HostsModuleTests(unittest.TestCase):
         self.assertEqual(conflicts, [("connection", 1), ("connection", 2), ("connection", 3), ("connection", 1)])
         self.assertEqual(
             launches,
-            [("host-initialize", "node-1"), ("host-init", "node-c"), ("host-init", "node-a")],
+            [("host-init", "node-1"), ("host-init", "node-c"), ("host-init", "node-a")],
         )
 
     def test_ssh_error_summary_redacts_transport_noise_into_stable_diagnoses(self):

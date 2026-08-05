@@ -1,5 +1,5 @@
 import { api, jsonBody } from '../../shared/api';
-import type { ControllerSettings, SensitiveItem } from './types';
+import type { ControllerSettings, HostKeyRecord, SensitiveItem } from './types';
 
 export const advancedApi = {
   sensitiveItems: (clusterId: number) => api<{ items: SensitiveItem[] }>(`/api/clusters/${clusterId}/sensitive-items`),
@@ -7,6 +7,8 @@ export const advancedApi = {
   reveal: (clusterId: number, itemId: string, grantToken: string, purpose: 'reveal' | 'copy') => api<{ value: string; hide_after: number }>(`/api/clusters/${clusterId}/sensitive-items/${encodeURIComponent(itemId)}/reveal`, { method: 'POST', ...jsonBody({ grant_token: grantToken, purpose }), suppressAuthExpiry: true }),
   controllerSettings: () => api<ControllerSettings>('/api/controller/settings'),
   updateControllerSettings: (timezone: string) => api<ControllerSettings>('/api/controller/settings', { method: 'PUT', ...jsonBody({ timezone }) }),
+  hostKeyRecords: () => api<{ items: HostKeyRecord[] }>('/api/hosts/ssh-host-keys'),
+  removeHostKeyRecord: (nodeId: number) => api<{ updated: boolean }>(`/api/nodes/${nodeId}/ssh-host-key`, { method: 'DELETE' }),
   controllerKey: () => api('/api/controller/ssh-key'),
   controllerKeyAction: (action: 'generate' | 'import' | 'activate', payload: unknown) => api(`/api/controller/ssh-key/${action}`, { method: 'POST', ...jsonBody(payload) }),
 };

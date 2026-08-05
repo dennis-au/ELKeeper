@@ -135,13 +135,15 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(versions, ["8.20.0", "8.19.0"])
         self.assertEqual(registry.call_args.args[0], "kibana/kibana")
 
-    def test_role_version_discovery_keeps_the_current_version_beside_newer_releases(self):
+    def test_role_version_discovery_returns_all_compatible_stable_releases(self):
         assignments = [{"role": "master", "image_version": "8.19.0", "observation": None}]
-        releases = {f"9.4.{patch}" for patch in range(11)} | {"8.19.0", "8.18.0"}
+        releases = {f"9.4.{patch}" for patch in range(25)} | {"8.19.0", "8.18.0"}
         with patch.object(self.main, "registry_listing_tags", return_value=releases):
             versions = self.main.available_role_versions("master", assignments)
-        self.assertEqual(len(versions), self.main.REGISTRY_TAG_RESULT_LIMIT + 1)
+        self.assertEqual(len(versions), 26)
         self.assertIn("8.19.0", versions)
+        self.assertIn("9.4.0", versions)
+        self.assertIn("9.4.24", versions)
         self.assertNotIn("8.18.0", versions)
 
     def test_log_monitoring_defaults_migrate_safely_and_start_a_tracked_reconcile(self):
@@ -420,6 +422,36 @@ class ApiTests(unittest.TestCase):
         with self.main.db() as con:
             audit = con.execute("SELECT action FROM audit_events ORDER BY id DESC LIMIT 1").fetchone()
         self.assertEqual(audit["action"], "host_records_only_deletion")
+
+    def test_host_key_records_expose_only_fingerprints_and_can_be_removed(self):
+        headers = self.login()
+        node_id = self.node(headers)
+        host_key = ed25519.Ed25519PrivateKey.generate().public_key().public_bytes(
+            serialization.Encoding.OpenSSH,
+            serialization.PublicFormat.OpenSSH,
+        ).decode()
+        updated = self.client.put(f"/api/nodes/{node_id}", headers=headers, json={
+            "name": "node-a", "address": "192.0.2.102", "ssh_port": 22, "ssh_user": "root", "enabled": True,
+            "ssh_host_key": host_key,
+        })
+        self.assertEqual(updated.status_code, 200)
+
+        records = self.client.get("/api/hosts/ssh-host-keys", headers=headers)
+        self.assertEqual(records.status_code, 200)
+        self.assertEqual(records.json()["items"][0]["node_id"], node_id)
+        self.assertTrue(records.json()["items"][0]["fingerprint"].startswith("SHA256:"))
+        self.assertNotIn(host_key, records.text)
+
+        removed = self.client.delete(f"/api/nodes/{node_id}/ssh-host-key", headers=headers)
+        self.assertEqual(removed.status_code, 200)
+        self.assertEqual(removed.json(), {"updated": True})
+        with self.main.db() as con:
+            node = con.execute("SELECT ssh_host_key FROM nodes WHERE id=?", (node_id,)).fetchone()
+            audit = con.execute("SELECT action,detail FROM audit_events ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(node["ssh_host_key"], "")
+        self.assertEqual(audit["action"], "host_ssh_host_key_removed")
+        self.assertTrue(audit["detail"].startswith("SHA256:"))
+        self.assertEqual(self.client.get("/api/hosts/ssh-host-keys", headers=headers).json(), {"items": []})
 
     def test_command_streamer_uses_blocking_popen_pipes(self):
         process = Mock()
@@ -736,9 +768,14 @@ class ApiTests(unittest.TestCase):
 
     def test_workload_batch_keeps_new_roles_out_of_managed_workloads_until_it_succeeds(self):
         headers = self.login()
-        node_id = self.node(headers)
+        master_node_id = self.node(headers, "master-node", "192.0.2.102")
+        hot_node_id = self.node(headers, "hot-node", "192.0.2.103")
         cluster_id = self.cluster(headers)
-        self.assertEqual(self.membership(headers, cluster_id, node_id).status_code, 201)
+        self.assertEqual(self.membership(headers, cluster_id, master_node_id).status_code, 201)
+        self.assertEqual(
+            self.membership(headers, cluster_id, hot_node_id, "192.0.2.103", "198.51.100.103").status_code,
+            201,
+        )
 
         def stop_task(coroutine):
             coroutine.close()
@@ -746,21 +783,29 @@ class ApiTests(unittest.TestCase):
 
         with patch.object(self.main.asyncio, "create_task", side_effect=stop_task):
             result = self.client.post(f"/api/clusters/{cluster_id}/workload-changes/apply", headers=headers, json={
-                "changes": [{
-                    "client_id": "new-master", "kind": "create", "node_id": node_id, "role": "master",
-                    "image_version": "8.20.0",
-                    "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/batch/master"},
-                }],
+                "changes": [
+                    {
+                        "client_id": "new-master", "kind": "create", "node_id": master_node_id, "role": "master",
+                        "image_version": "8.20.0",
+                        "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/batch/master"},
+                    },
+                    {
+                        "client_id": "new-hot", "kind": "create", "node_id": hot_node_id, "role": "hot",
+                        "image_version": "8.20.0",
+                        "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/batch/hot"},
+                    },
+                ],
             })
         self.assertEqual(result.status_code, 200)
         run_id = result.json()["run_id"]
         self.assertEqual(self.client.get(f"/api/clusters/{cluster_id}", headers=headers).json()["assignments"], [])
         with self.main.db() as con:
-            applying = con.execute("SELECT state,operation_run_id,image_version FROM cluster_assignments").fetchone()
+            applying = con.execute("SELECT state,operation_run_id,image_version FROM cluster_assignments ORDER BY id").fetchall()
             plan = con.execute("SELECT plan_encrypted FROM workload_change_batches WHERE run_id=?", (run_id,)).fetchone()["plan_encrypted"]
-        self.assertEqual((applying["state"], applying["operation_run_id"]), ("applying", run_id))
-        self.assertEqual(applying["image_version"], "8.20.0")
+        self.assertEqual([(row["state"], row["operation_run_id"]) for row in applying], [("applying", run_id), ("applying", run_id)])
+        self.assertEqual([row["image_version"] for row in applying], ["8.20.0", "8.20.0"])
         self.assertNotIn("/srv/batch/master", plan)
+        self.assertNotIn("/srv/batch/hot", plan)
 
     def test_workload_batch_rejects_an_invalid_image_version(self):
         headers = self.login()
@@ -790,6 +835,7 @@ class ApiTests(unittest.TestCase):
             result = self.client.post(f"/api/clusters/{cluster_id}/workload-changes/apply", headers=headers, json={
                 "changes": [
                     {"client_id": "new-kibana", "kind": "create", "node_id": node_id, "role": "kibana", "config": {"cpu": "1", "memory": "2g", "storage_path": "/srv/batch/kibana"}},
+                    {"client_id": "new-hot", "kind": "create", "node_id": node_id, "role": "hot", "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/batch/hot"}},
                     {"client_id": "new-master", "kind": "create", "node_id": node_id, "role": "master", "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/batch/master"}},
                 ],
             })
@@ -802,10 +848,72 @@ class ApiTests(unittest.TestCase):
 
         with patch.object(self.main, "execute_workload_change_reconcile", side_effect=reconcile):
             asyncio.run(self.main.run_workload_change_batch(run_id, self.main.INVENTORIES / f"run-{run_id}.yaml"))
-        self.assertEqual(invoked, ["master", "kibana"])
+        self.assertEqual(invoked, ["master", "hot", "kibana"])
         assigned = self.client.get(f"/api/clusters/{cluster_id}", headers=headers).json()["assignments"]
-        self.assertEqual([item["role"] for item in assigned], ["kibana", "master"])
+        self.assertEqual([item["role"] for item in assigned], ["hot", "kibana", "master"])
         self.assertTrue(all(item["state"] == "active" for item in assigned))
+
+    def test_initial_cluster_runs_hot_before_additional_masters(self):
+        """A new cluster needs a data node before its extra masters join it."""
+
+        headers = self.login()
+        first_node = self.node(headers, "bootstrap", "192.0.2.101")
+        second_node = self.node(headers, "joining-master", "192.0.2.102")
+        third_node = self.node(headers, "hot-data", "192.0.2.103")
+        cluster_id = self.cluster(headers, "ordered-bootstrap")
+        self.assertEqual(
+            self.membership(headers, cluster_id, first_node, "192.0.2.101", "198.51.100.101").status_code,
+            201,
+        )
+        self.assertEqual(
+            self.membership(headers, cluster_id, second_node, "192.0.2.102", "198.51.100.102").status_code,
+            201,
+        )
+        self.assertEqual(
+            self.membership(headers, cluster_id, third_node, "192.0.2.103", "198.51.100.103").status_code,
+            201,
+        )
+
+        def stop_task(coroutine):
+            coroutine.close()
+            return None
+
+        with patch.object(self.main.asyncio, "create_task", side_effect=stop_task):
+            result = self.client.post(f"/api/clusters/{cluster_id}/workload-changes/apply", headers=headers, json={
+                "changes": [
+                    {"client_id": "bootstrap-master", "kind": "create", "node_id": first_node, "role": "master", "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/ordered/master-a"}},
+                    {"client_id": "joining-master", "kind": "create", "node_id": second_node, "role": "master", "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/ordered/master-b"}},
+                    {"client_id": "bootstrap-hot", "kind": "create", "node_id": third_node, "role": "hot", "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/ordered/hot"}},
+                ],
+            })
+        self.assertEqual(result.status_code, 200)
+        run_id = result.json()["run_id"]
+        invoked = []
+
+        async def reconcile(_run_id, _inventory, payload, name, _suffix):
+            invoked.append((payload["assignment"]["role"], name))
+            return True
+
+        with patch.object(self.main, "execute_workload_change_reconcile", side_effect=reconcile):
+            asyncio.run(self.main.run_workload_change_batch(run_id, self.main.INVENTORIES / f"run-{run_id}.yaml"))
+
+        self.assertEqual(invoked, [("master", "bootstrap"), ("hot", "hot-data"), ("master", "joining-master")])
+
+    def test_direct_initial_master_apply_requires_staged_hot_bootstrap(self):
+        headers = self.login()
+        node_id = self.node(headers)
+        cluster_id = self.cluster(headers)
+        self.assertEqual(self.membership(headers, cluster_id, node_id).status_code, 201)
+        assignment_id = self.client.post(f"/api/clusters/{cluster_id}/assignments", headers=headers, json={
+            "node_id": node_id,
+            "role": "master",
+            "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/bootstrap/master"},
+        }).json()["id"]
+
+        result = self.client.post(f"/api/assignments/{assignment_id}/apply", headers=headers)
+
+        self.assertEqual(result.status_code, 422)
+        self.assertIn("Hot data-content", result.json()["detail"])
 
     def test_workload_batch_rolls_back_resource_edits_and_new_roles(self):
         headers = self.login()
@@ -903,6 +1011,22 @@ class ApiTests(unittest.TestCase):
             "node_id": node_id, "role": "hot",
             "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/elastic/lab-b/hot"},
         }).status_code, 409)
+
+    def test_cluster_rename_preserves_the_remote_workload_namespace(self):
+        headers = self.login()
+        cluster_id = self.cluster(headers, "test")
+        node_id = self.node(headers)
+        self.assertEqual(self.membership(headers, cluster_id, node_id).status_code, 201)
+        self.assertEqual(self.client.post(f"/api/clusters/{cluster_id}/assignments", headers=headers, json={
+            "node_id": node_id, "role": "master",
+            "config": {"cpu": "2", "memory": "4g", "storage_path": "/srv/elastic/test/master"},
+        }).status_code, 201)
+
+        result = self.client.put(f"/api/clusters/{cluster_id}", headers=headers, json={"name": "lab"})
+        self.assertEqual(result.status_code, 200)
+        cluster = self.client.get(f"/api/clusters/{cluster_id}", headers=headers).json()
+        self.assertEqual(cluster["name"], "lab")
+        self.assertEqual(cluster["slug"], "test")
 
     def test_role_port_associations_suggest_distinct_ports_for_colocated_roles(self):
         headers = self.login()

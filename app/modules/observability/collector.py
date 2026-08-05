@@ -215,20 +215,27 @@ class TelemetryManager:
         return sample
 
     def _record_workload_runtime(self, node_id, containers):
-        by_name = {item["name"]: item for item in containers}
-        by_assignment = {}
+        by_identity = {}
         for item in containers:
             labels = item.get("labels") or {}
+            cluster_id = labels.get("io.elastic-control.cluster-id")
+            cluster_slug = labels.get("io.elastic-control.cluster-slug")
             assignment_id = labels.get("io.elastic-control.assignment-id")
             role = labels.get("io.elastic-control.role")
-            if assignment_id and role:
-                by_assignment[(str(assignment_id), str(role))] = item
+            container_node_id = labels.get("io.elastic-control.node-id")
+            if cluster_id and cluster_slug and assignment_id and role and container_node_id:
+                by_identity[(
+                    str(cluster_id), str(cluster_slug), str(assignment_id), str(role), str(container_node_id),
+                )] = item
         assignments = self._deps.workload_repository(self._deps.db_factory).active_for_node(node_id)
         clusters = self._deps.cluster_repository(self._deps.db_factory)
         versions = self._deps.version_repository(self._deps.db_factory)
         for assignment in assignments:
-            name = self._deps.workload_name({"slug": clusters.slug(assignment["cluster_id"])}, assignment)
-            container = by_assignment.get((str(assignment["id"]), str(assignment["role"]))) or by_name.get(name)
+            cluster_slug = clusters.slug(assignment["cluster_id"])
+            container = by_identity.get((
+                str(assignment["cluster_id"]), cluster_slug, str(assignment["id"]),
+                str(assignment["role"]), str(node_id),
+            ))
             image = container.get("image", "") if container else ""
             digest = container.get("digest", "") if container else ""
             version = self._deps.image_version(image)

@@ -51,6 +51,7 @@ def build_mutation_router(
     assignment_record: Callable,
     open_config: Callable,
     require_ready_membership: Callable,
+    require_initial_master_batch: Callable,
     cluster_payload: Callable,
     launch_workload_change_batch: Callable,
     launch: Callable,
@@ -112,7 +113,7 @@ def build_mutation_router(
         input: resource_model,
         _: str = Depends(user_dependency),
     ):
-        update = input.model_dump()
+        update = input.model_dump(exclude_none=True)
         with db_factory() as connection:
             repository = repository_factory(connection)
             row = assignment_record(connection, assignment_id)
@@ -158,6 +159,7 @@ def build_mutation_router(
             if not node_enabled(connection, row["node_id"]):
                 raise HTTPException(422, "Enable the host before applying a role")
             payload = cluster_payload(connection, row)
+            require_initial_master_batch(connection, row)
             target = f"{row['cluster_name']}:{row['node_name']}:{row['role']}"
             name = row["node_name"]
             cluster_id = row["cluster_id"]

@@ -1,0 +1,96 @@
+---
+- name: Remove only managed resources from an explicitly approved identity drift recovery
+  hosts: all
+  become: true
+  vars:
+    identity_recovery_cluster_id: 0
+    identity_recovery_slugs: []
+    identity_recovery_data_paths: []
+  tasks:
+    - name: Validate the scoped identity recovery request
+      ansible.builtin.assert:
+        that:
+          - identity_recovery_cluster_id | int > 0
+          - identity_recovery_slugs | length > 0
+          - identity_recovery_slugs | select('match', '^[a-z0-9][a-z0-9_-]{0,63}$') | list | length == identity_recovery_slugs | length
+          - identity_recovery_data_paths | selectattr('node_name', 'defined') | list | length == identity_recovery_data_paths | length
+          - identity_recovery_data_paths | selectattr('storage_path', 'match', '^/') | list | length == identity_recovery_data_paths | length
+        fail_msg: Invalid identity recovery request.
+
+    - name: Find only the selected managed Quadlet definitions
+      ansible.builtin.find:
+        paths: /etc/containers/systemd
+        patterns: "{{ identity_recovery_slugs | map('regex_replace', '^(.*)$', 'ecp-\\1-*.container') | list }}"
+        file_type: file
+        recurse: false
+      register: identity_recovery_units
+
+    - name: Stop only the selected managed workload services
+      ansible.builtin.systemd:
+        name: "{{ item.path | basename | regex_replace('\\.container$', '.service') }}"
+        enabled: false
+        state: stopped
+      loop: "{{ identity_recovery_units.files }}"
+      failed_when: false
+
+    - name: Remove only the selected managed Quadlet definitions
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ identity_recovery_units.files }}"
+
+    - name: Remove residual containers with the selected managed identity
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          allowed_slugs=" {% for slug in identity_recovery_slugs %}{{ slug }} {% endfor %}"
+          for container in $(podman ps -aq --filter label=io.elastic-control.managed=true); do
+            labels=$(podman inspect "$container" | python3 -c '
+          import json, sys
+          value = json.load(sys.stdin)[0].get("Config", {}).get("Labels", {})
+          print(value.get("io.elastic-control.cluster-id", "") + "|" + value.get("io.elastic-control.cluster-slug", ""))
+          ')
+            cluster_id=${labels%%|*}
+            slug=${labels#*|}
+            if [[ "$cluster_id" == "{{ identity_recovery_cluster_id }}" && " $allowed_slugs " == *" $slug "* ]]; then
+              podman rm -f "$container"
+            fi
+          done
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Remove only marker-protected selected workload data
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          path={{ item.storage_path | quote }}
+          test -d "$path" || exit 0
+          {% for slug in identity_recovery_slugs %}
+          if test -f "$path/.elastic-control-managed-{{ slug }}-{{ item.role }}-{{ item.node_id }}"; then
+            rm -rf -- "$path"
+            exit 0
+          fi
+          {% endfor %}
+        executable: /bin/bash
+      loop: "{{ identity_recovery_data_paths }}"
+      when: item.node_name == inventory_hostname
+
+    - name: Remove only selected remote workload configuration trees
+      ansible.builtin.file:
+        path: "/etc/elastic-control/clusters/{{ item }}"
+        state: absent
+      loop: "{{ identity_recovery_slugs }}"
+
+    - name: Reload Quadlet definitions after scoped identity recovery
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Clear failed state only for selected managed workload units
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - reset-failed
+          - "{{ item.path | basename | regex_replace('\\.container$', '.service') }}"
+      loop: "{{ identity_recovery_units.files }}"
+      changed_when: false
+      failed_when: false

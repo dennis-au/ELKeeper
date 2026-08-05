@@ -58,17 +58,37 @@ function managedStoragePath(mountPoint: string, clusterSlug: string, role: strin
 }
 
 function assignmentFormFromPendingChange(change: Extract<PendingChange, { kind: 'create' }>) {
-  const { cpu = '2', memory = '4g', storage_path = '', pipeline, ...advanced } = change.config;
+  const { cpu = '2', memory = '4g', storage_path = '', pipeline, jvm_heap, node_heap, ...advanced } = change.config;
   return {
     node_id: change.nodeId,
     role: change.role,
     image_version: change.imageVersion,
     cpu: String(cpu),
     memory: String(memory),
+    runtime_heap: String(jvm_heap || node_heap || ''),
     storage_path: String(storage_path),
     pipeline: String(pipeline || 'input { beats { port => 5044 } }\noutput { stdout { codec => rubydebug } }'),
     advanced: JSON.stringify(advanced),
   };
+}
+
+function runtimeHeapField(role: string) {
+  if (['master', 'hot', 'warm', 'ml', 'ingest', 'coordinating', 'logstash'].includes(role)) {
+    return { key: 'jvm_heap', label: 'JVM heap', help: 'Optional. Elasticsearch and Logstash heaps may use at most 50% of the container memory.' };
+  }
+  if (role === 'kibana') {
+    return { key: 'node_heap', label: 'Node.js heap', help: 'Kibana uses Node.js, not a JVM. Optional; up to 75% of the container memory.' };
+  }
+  return undefined;
+}
+
+function configWithRuntimeHeap(config: Record<string, string>, role: string, value: string) {
+  const next = { ...config };
+  delete next.jvm_heap;
+  delete next.node_heap;
+  const field = runtimeHeapField(role);
+  if (field) next[field.key] = value.trim();
+  return next;
 }
 
 function pendingChangeSummary(item: PendingChange) {
@@ -149,13 +169,14 @@ function WorkloadModal({ state, close, completed, stageChange }: {
   const resourceAssignment = state.type === 'resources' ? state.assignment : undefined;
   const [cpu, setCpu] = useState(resourceAssignment?.config.cpu || '');
   const [memory, setMemory] = useState(resourceAssignment?.config.memory || '');
+  const [runtimeHeap, setRuntimeHeap] = useState(resourceAssignment?.config.jvm_heap || resourceAssignment?.config.node_heap || '');
   const [storage, setStorage] = useState(resourceAssignment?.config.storage_path || '');
   const [network, setNetwork] = useState(state.type === 'network' ? { ...state.member } : undefined);
   const submit = async () => {
     setBusy(true); setError('');
     try {
       if (state.type === 'resources') {
-        stageChange('resources', state.assignment, { cpu, memory, storage_path: storage });
+        stageChange('resources', state.assignment, configWithRuntimeHeap({ ...state.assignment.config, cpu, memory, storage_path: storage }, state.assignment.role, runtimeHeap));
       } else if (state.type === 'network' && network) {
         await clusterApi.updateMember(network.cluster_id, network.node_id, {
           node_id: network.node_id,
@@ -179,10 +200,11 @@ function WorkloadModal({ state, close, completed, stageChange }: {
     finally { setBusy(false); }
   };
   const title = state.type === 'resources' ? `Resources: ${state.assignment.role}` : state.type === 'network' ? `Network: ${state.member.name}` : `${state.type === 'purge' ? 'Purge' : 'Detach'} ${state.assignment.role}`;
+  const heapField = resourceAssignment && runtimeHeapField(resourceAssignment.role);
   return <EuiOverlayMask><EuiModal onClose={close} initialFocus="[data-autofocus]">
     <EuiModalHeader><EuiModalHeaderTitle>{title}</EuiModalHeaderTitle></EuiModalHeader>
     <EuiModalBody>
-      {state.type === 'resources' && <div className="form-grid"><EuiFormRow label="CPU cores"><EuiFieldText data-autofocus value={cpu} onChange={(event) => setCpu(event.target.value)} /></EuiFormRow><EuiFormRow label="Memory"><EuiFieldText value={memory} onChange={(event) => setMemory(event.target.value)} /></EuiFormRow><StoragePathPicker nodeId={state.assignment.node_id} clusterSlug={selectedCluster?.slug || 'cluster'} role={state.assignment.role} value={storage} onChange={setStorage} /></div>}
+      {state.type === 'resources' && <div className="form-grid"><EuiFormRow label="CPU cores"><EuiFieldText data-autofocus value={cpu} onChange={(event) => setCpu(event.target.value)} /></EuiFormRow><EuiFormRow label="Memory"><EuiFieldText value={memory} onChange={(event) => setMemory(event.target.value)} /></EuiFormRow>{heapField && <EuiFormRow label={heapField.label} helpText={heapField.help}><EuiFieldText value={runtimeHeap} placeholder={resourceAssignment.role === 'kibana' ? 'e.g. 12g' : 'Auto / e.g. 8g'} onChange={(event) => setRuntimeHeap(event.target.value)} /></EuiFormRow>}<StoragePathPicker nodeId={state.assignment.node_id} clusterSlug={selectedCluster?.slug || 'cluster'} role={state.assignment.role} value={storage} onChange={setStorage} /></div>}
       {state.type === 'network' && network && <div className="form-grid">
         <EuiFormRow label="Traffic mode"><EuiSelect value={network.network_mode} onChange={(event) => { const mode = event.target.value as Membership['network_mode']; setNetwork({ ...network, network_mode: mode, ...(mode === 'shared' ? { data_interface: network.user_interface, data_address: network.user_address } : {}) }); }} options={[{ value: 'shared', text: 'Shared NIC' }, { value: 'dedicated', text: 'Dedicated NICs' }]} /></EuiFormRow>
         <EuiFormRow label="User NIC"><EuiFieldText data-autofocus value={network.user_interface} onChange={(event) => setNetwork({ ...network, user_interface: event.target.value, ...(network.network_mode === 'shared' ? { data_interface: event.target.value } : {}) })} /></EuiFormRow>
@@ -205,7 +227,7 @@ export function RolesWorkspace() {
   const { data: health } = useQuery({ queryKey: ['health'], queryFn: workloadsApi.roles });
   const { data: topology } = useQuery({ queryKey: ['topology', selectedCluster?.id], enabled: Boolean(selectedCluster), queryFn: () => workloadsApi.topology(selectedCluster!.id) });
   const [member, setMember] = useState<MembershipInput>({ node_id: 0, network_mode: 'shared', user_interface: 'ens18', user_address: '', data_interface: 'ens18', data_address: '' });
-  const [assignment, setAssignment] = useState({ node_id: 0, role: 'master', image_version: '', cpu: '2', memory: '4g', storage_path: '', pipeline: 'input { beats { port => 5044 } }\noutput { stdout { codec => rubydebug } }', advanced: '{}' });
+  const [assignment, setAssignment] = useState({ node_id: 0, role: 'master', image_version: '', cpu: '2', memory: '4g', runtime_heap: '', storage_path: '', pipeline: 'input { beats { port => 5044 } }\noutput { stdout { codec => rubydebug } }', advanced: '{}' });
   const [pendingChanges, setPendingChanges] = useState<PendingChange[]>([]);
   const [applyingRunId, setApplyingRunId] = useState<number>();
   const [modal, setModal] = useState<ModalState>();
@@ -301,7 +323,7 @@ export function RolesWorkspace() {
       const change: Extract<PendingChange, { kind: 'create' }> = {
         clientId: clientChangeId(), kind: 'create', nodeId: node.node_id, nodeName: node.name, role: assignment.role,
         imageVersion: assignment.image_version,
-        config: { ...advanced, cpu: assignment.cpu, memory: assignment.memory, storage_path: assignment.storage_path, ...(assignment.role === 'logstash' ? { pipeline: assignment.pipeline } : {}) },
+        config: configWithRuntimeHeap({ ...advanced, cpu: assignment.cpu, memory: assignment.memory, storage_path: assignment.storage_path, ...(assignment.role === 'logstash' ? { pipeline: assignment.pipeline } : {}) }, assignment.role, assignment.runtime_heap),
       };
       setPendingChanges((current) => editingChangeId
         ? current.map((item) => item.clientId === editingChangeId ? { ...change, clientId: editingChangeId } : item)
@@ -422,7 +444,7 @@ export function RolesWorkspace() {
             <EuiTitle size="xxs"><h3>Placement</h3></EuiTitle>
             <div className="workload-stage-grid workload-stage-grid--placement">
               <EuiFormRow label="Host"><EuiSelect value={assignment.node_id} onChange={(event) => setAssignment({ ...assignment, node_id: Number(event.target.value), storage_path: '' })} options={[{ value: 0, text: 'Select cluster host' }, ...selectedCluster.members.map((item) => ({ value: item.node_id, text: item.name }))]} /></EuiFormRow>
-              <EuiFormRow label="Role"><EuiSelect value={assignment.role} onChange={(event) => setAssignment({ ...assignment, role: event.target.value, image_version: '', storage_path: '' })} options={roles.map((role) => ({ value: role.id, text: role.label }))} /></EuiFormRow>
+              <EuiFormRow label="Role"><EuiSelect value={assignment.role} onChange={(event) => setAssignment({ ...assignment, role: event.target.value, image_version: '', runtime_heap: '', storage_path: '' })} options={roles.map((role) => ({ value: role.id, text: role.label }))} /></EuiFormRow>
               <EuiFormRow label="Image version" helpText={versionsQuery.data?.registry_error || 'Current cluster version is selected when available.'}><EuiSelect isLoading={versionsQuery.isLoading} value={assignment.image_version} onChange={(event) => setAssignment({ ...assignment, image_version: event.target.value })} options={imageVersions.length ? imageVersions.map((version) => ({ value: version, text: version })) : [{ value: '', text: versionsQuery.isLoading ? 'Loading versions' : 'No versions available' }]} /></EuiFormRow>
             </div>
           </div>
@@ -431,6 +453,7 @@ export function RolesWorkspace() {
             <div className="workload-stage-grid workload-stage-grid--resources">
               <EuiFormRow label="CPU cores"><EuiFieldText value={assignment.cpu} onChange={(event) => setAssignment({ ...assignment, cpu: event.target.value })} /></EuiFormRow>
               <EuiFormRow label="Memory"><EuiFieldText value={assignment.memory} onChange={(event) => setAssignment({ ...assignment, memory: event.target.value })} /></EuiFormRow>
+              {runtimeHeapField(assignment.role) && <EuiFormRow label={runtimeHeapField(assignment.role)?.label} helpText={runtimeHeapField(assignment.role)?.help}><EuiFieldText value={assignment.runtime_heap} placeholder={assignment.role === 'kibana' ? 'e.g. 12g' : 'Auto / e.g. 8g'} onChange={(event) => setAssignment({ ...assignment, runtime_heap: event.target.value })} /></EuiFormRow>}
             </div>
           </div>
         </div>

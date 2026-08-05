@@ -186,6 +186,23 @@ def build_management_router(
 
     router = APIRouter()
 
+    @router.get("/api/hosts/ssh-host-keys")
+    async def host_key_records(_: str = Depends(user_dependency)):
+        with db_factory() as connection:
+            records = HostRepository.from_connection(connection).host_key_records_in_connection(connection)
+        return {
+            "items": [
+                {
+                    "node_id": record["id"],
+                    "name": record["name"],
+                    "address": record["address"],
+                    "ssh_port": record["ssh_port"],
+                    "fingerprint": fingerprint(record["ssh_host_key"]),
+                }
+                for record in records
+            ]
+        }
+
     @router.post("/api/nodes/test-password")
     async def test_node_password(input: password_test_model, username: str = Depends(user_dependency)):
         node = {
@@ -347,6 +364,27 @@ def build_management_router(
                 detail="legacy host-key trust disabled for this host",
             )
         return {"updated": True, "legacy_known_hosts_disabled": True}
+
+    @router.delete("/api/nodes/{node_id}/ssh-host-key")
+    async def remove_host_key_record(node_id: int, username: str = Depends(user_dependency)):
+        with db_factory() as connection:
+            repository = HostRepository.from_connection(connection)
+            node = repository.get(node_id)
+            if not node:
+                raise HTTPException(404, "Node not found")
+            require_no_conflict(connection, node_id)
+            host_key = node["ssh_host_key"]
+            if not host_key:
+                raise HTTPException(404, "No recorded SSH host key for this node")
+            repository.clear_host_key_in_connection(connection, node_id)
+            write_event_in_connection(
+                connection,
+                username,
+                "host_ssh_host_key_removed",
+                item_id=str(node_id),
+                detail=fingerprint(host_key),
+            )
+        return {"updated": True}
 
     @router.delete("/api/nodes/{node_id}")
     async def delete_node(

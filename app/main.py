@@ -104,7 +104,7 @@ from app.modules.hosts.orchestration import HostEnrollmentOrchestrator
 from app.modules.controller_identity import ControllerIdentityOperations, ControllerIdentityRepository, ControllerKeyImportInput, ControllerPasswordInput, ControllerSettingsInput, KeyInstall, key_algorithm, normalize_ssh_host_key, parse_imported_private_key, public_key_fingerprint as identity_fingerprint, serialize_private_key
 from app.modules.controller_identity.http import build_key_router, build_router as build_identity_router
 from app.modules.workloads import WorkloadOperations, render_topology as workload_render_topology
-from app.modules.workloads import AssignmentInput, ResourceInput, Targets, WorkloadChange, WorkloadChangeSet, WorkloadChangeValidator, WorkloadPayloadService, WorkloadPolicyService, WorkloadProjectionService, WorkloadRepository
+from app.modules.workloads import AssignmentInput, ResourceInput, Targets, WorkloadChange, WorkloadChangeSet, WorkloadChangeValidator, WorkloadPayloadService, WorkloadPolicyService, WorkloadProjectionService, WorkloadRepository, WorkloadService
 from app.modules.clusters import membership_ready as cluster_membership_ready
 from app.modules.clusters import validate_membership_network as cluster_validate_membership_network
 from app.modules.clusters import valid_ipv4 as cluster_valid_ipv4
@@ -124,7 +124,12 @@ from app.modules.versions.registry import repositories as registry_repositories
 from app.modules.versions.registry import version_cursor as registry_version_cursor_value
 from app.modules.observability.http import build_router as build_observability_router
 from app.modules.observability import runtime_observation
-from app.modules.certificates import CertificateInventoryService
+from app.modules.certificates import (
+    CertificateInventoryService,
+    CertificateLifecycleService,
+    install_certificate_schema,
+)
+from app.modules.certificates.http import build_router as build_certificates_router
 from app.modules.secrets import SecretsCatalogService, build_router as build_secrets_router
 from app.modules.hosts import build_inventory_router as build_host_inventory_router, build_management_router, build_router as build_host_router
 from app.modules.clusters import build_settings_router
@@ -200,7 +205,7 @@ VERSION_OBSERVATION_MAX_AGE = 900
 REGISTRY_CACHE_SECONDS = 900
 REGISTRY_TAG_PAGE_SIZE = 100
 REGISTRY_TAG_PAGE_LIMIT = 20
-REGISTRY_TAG_RESULT_LIMIT = 10
+REGISTRY_TAG_RESULT_LIMIT = 1000
 REGISTRY_REQUEST_TIMEOUT = 45
 REGISTRY_LISTING_TIMEOUT = 10
 REGISTRY_CACHE = {}
@@ -597,6 +602,10 @@ def workload_policy_service():
     )
 
 
+def workload_service():
+    return WorkloadService(db)
+
+
 def workload_payload_service():
     return WorkloadPayloadService(
         cluster_repository=ClusterRepository,
@@ -731,7 +740,7 @@ def init():
         repository = workload_repository.from_connection(connection)
         return complete_controller_bootstrap(
             connection,
-            maintenance_migrations=(install_maintenance_schema,),
+            maintenance_migrations=(install_maintenance_schema, install_certificate_schema),
             prepare_maintenance_recovery=MaintenanceStore(connection).prepare_startup_recovery,
             set_workload_batch_phase=repository.set_batch_phase,
             mark_recovery_required=platform_mark_recovery_required_in_connection,
@@ -1468,6 +1477,18 @@ secrets_catalog_service = SecretsCatalogService(
     certificate_inventory=CertificateInventoryService(HostRepository(db).get),
 )
 
+certificate_lifecycle_service = CertificateLifecycleService(
+    db_factory=db,
+    cluster_provider=_get_cluster_for_router,
+    audit_event=lambda username, action, cluster_id, item_id, detail: audit_cluster_event(
+        username, action, cluster_id, item_id, json.dumps(detail, sort_keys=True)
+    ),
+    rolling_restart_capability=lambda: bool(MAINTENANCE_CAPABILITIES["rolling_restart"]),
+    completed_run=lambda kind, target, message, context=None: completed_run(kind, target, message, context),
+    node_provider=HostRepository(db).get,
+    remote_file_reader=lambda node, path: console.remote_command(node, "cat", "--", path),
+)
+
 
 app.include_router(
     build_versions_router(
@@ -1531,6 +1552,7 @@ app.include_router(
         assignment_record=lambda *args, **kwargs: assignment_record(*args, **kwargs),
         open_config=lambda *args, **kwargs: open_config(*args, **kwargs),
         require_ready_membership=lambda *args, **kwargs: require_ready_membership(*args, **kwargs),
+        require_initial_master_batch=lambda *args, **kwargs: workload_service().require_initial_master_batch(*args, **kwargs),
         cluster_payload=lambda *args, **kwargs: cluster_payload(*args, **kwargs),
         launch_workload_change_batch=lambda *args, **kwargs: launch_workload_change_batch(*args, **kwargs),
         launch=lambda *args, **kwargs: launch(*args, **kwargs),
@@ -1646,6 +1668,7 @@ app.include_router(
         user_dependency=user,
     )
 )
+app.include_router(build_certificates_router(service=certificate_lifecycle_service, user_dependency=user))
 app.include_router(
     build_host_router(
         host_provider=HostRepository(db).get,

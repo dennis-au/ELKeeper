@@ -115,6 +115,24 @@ class HostRepository:
     def disable_legacy_known_hosts_in_connection(self, connection, node_id: int) -> None:
         connection.execute("UPDATE nodes SET legacy_known_hosts_disabled=1 WHERE id=?", (node_id,))
 
+    def host_key_records_in_connection(self, connection) -> list[dict]:
+        """Return the non-secret inventory needed to display pinned host keys."""
+
+        rows = connection.execute(
+            "SELECT id,name,address,ssh_port,ssh_host_key FROM nodes "
+            "WHERE ssh_host_key<>'' ORDER BY name,id"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def clear_host_key_in_connection(self, connection, node_id: int) -> bool:
+        """Remove one controller-recorded SSH host-key pin."""
+
+        cursor = connection.execute(
+            "UPDATE nodes SET ssh_host_key='' WHERE id=? AND ssh_host_key<>''",
+            (node_id,),
+        )
+        return bool(cursor.rowcount)
+
     def delete_in_connection(self, connection, node_id: int) -> bool:
         cursor = connection.execute("DELETE FROM nodes WHERE id=?", (node_id,))
         return bool(cursor.rowcount)
