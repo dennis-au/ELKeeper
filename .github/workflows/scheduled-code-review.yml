@@ -88,4 +88,4 @@ jobs:
           git commit -m "chore: release $tag"
           git tag -a "$tag" -m "ELKeeper $tag"
           git push origin main "$tag"
-          gh release create "$tag" --title "ELKeeper $tag" --notes-file "${{ steps.release.outputs.notes_path }}" --target "$tag"
+          gh release create "$tag" --title "ELKeeper $tag" --notes-file "${{ steps.release.outputs.notes_path }}"
