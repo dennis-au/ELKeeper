@@ -39,3 +39,57 @@ export interface MaintenancePolicyResponse {
   updated_by?: string | null;
   updated_at?: string | null;
 }
+
+export type MaintenancePreviewOperation =
+  | 'reboot'
+  | 'manual_maintenance'
+  | 'resource_change'
+  | 'cluster_settings'
+  | 'zoning'
+  | 'apply'
+  | 'detach'
+  | 'purge'
+  | 'download'
+  | 'upgrade';
+
+export interface MaintenancePlanListFilters {
+  node_id?: number;
+  host_id?: number;
+  cluster_id?: number;
+  state?: string;
+  limit?: number;
+}
+
+export interface ManualMaintenanceMode {
+  node_id: number;
+  state: 'available' | 'planning' | 'maintenance' | 'recovery_required';
+  state_revision: number;
+  plan_id: string | null;
+  run_id: number | null;
+  expires_at: string | null;
+  lifecycle_state: string | null;
+}
+
+export interface MaintenancePlanHistoryItem {
+  plan_id: string;
+  lifecycle_state: string;
+  view: {
+    header: {
+      planId: string;
+      state: string;
+      target: { kind: string; name: string };
+      operation: string;
+      reason: string;
+      requester: string;
+      createdAt: string;
+      freshness: { state: string; observedAt?: string; expiresAt?: string; detail?: string };
+      policy: { name: string; revision: number; availabilityMode: string };
+    };
+    [key: string]: unknown;
+  };
+}
+
+export interface MaintenancePlanHistoryResponse {
+  items: MaintenancePlanHistoryItem[];
+  count: number;
+}

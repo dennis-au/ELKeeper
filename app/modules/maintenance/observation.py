@@ -426,3 +426,92 @@ def collect_host_reboot_planning_data(
         assignment_revisions=tuple(revisions),
         conflicting_operations=conflicting_operations,
     )
+
+
+def collect_generic_preview_data(
+    connection: sqlite3.Connection,
+    telemetry: Any,
+    *,
+    node_ids: tuple[int, ...],
+    capability_revision: str,
+    additional_cluster_ids: tuple[int, ...] = (),
+    additional_assignment_ids: tuple[int, ...] = (),
+    node_shutdown_backend_enabled: bool = False,
+    clock=utc_now,
+) -> HostRebootPlanningData:
+    """Collect a merged, read-only observation for a generic preview target.
+
+    The existing host collector remains the authoritative observation path. A
+    generic target is anchored on every affected host so assignments spanning
+    more than one host are represented without adding a second SQL/telemetry
+    implementation. No locks, runs, or remote calls are created here.
+    """
+
+    anchors = set(int(item) for item in node_ids)
+    cluster_ids = tuple(sorted(set(int(item) for item in additional_cluster_ids)))
+    assignment_ids = tuple(sorted(set(int(item) for item in additional_assignment_ids)))
+    if assignment_ids:
+        placeholders = ",".join("?" for _ in assignment_ids)
+        rows = connection.execute(
+            "SELECT id,node_id,cluster_id FROM cluster_assignments "
+            "WHERE id IN (" + placeholders + ") AND state='active'",
+            assignment_ids,
+        ).fetchall()
+        if len(rows) != len(assignment_ids):
+            raise ValueError("One or more assignment targets were not found or are inactive")
+        anchors.update(int(row["node_id"]) for row in rows)
+    if cluster_ids:
+        placeholders = ",".join("?" for _ in cluster_ids)
+        existing = connection.execute(
+            "SELECT id FROM clusters WHERE id IN (" + placeholders + ")", cluster_ids,
+        ).fetchall()
+        if len(existing) != len(cluster_ids):
+            raise ValueError("One or more cluster targets were not found")
+        rows = connection.execute(
+            "SELECT node_id FROM cluster_assignments WHERE cluster_id IN (" + placeholders + ") "
+            "AND state='active'",
+            cluster_ids,
+        ).fetchall()
+        anchors.update(int(row["node_id"]) for row in rows)
+        if not rows:
+            rows = connection.execute(
+                "SELECT node_id FROM memberships WHERE cluster_id IN (" + placeholders + ")",
+                cluster_ids,
+            ).fetchall()
+            anchors.update(int(row["node_id"]) for row in rows)
+    if not anchors:
+        raise ValueError("The preview target has no enrolled host observation to inspect")
+
+    repository = MaintenanceRepository.from_connection(connection)
+    observations = []
+    for node_id in sorted(anchors):
+        conflicts = repository.observe_conflicts_in_connection(connection, node_id)
+        observations.append(collect_host_reboot_planning_data(
+            connection,
+            telemetry,
+            node_id=node_id,
+            capability_revision=capability_revision,
+            conflicting_operations=conflicts.conflict_identifiers,
+            node_shutdown_backend_enabled=node_shutdown_backend_enabled,
+            clock=clock,
+        ))
+    first = observations[0]
+    def merge(items, key):
+        merged = {}
+        for observation in observations:
+            for item in items(observation):
+                merged[key(item)] = item
+        return tuple(merged[item] for item in sorted(merged))
+    return HostRebootPlanningData(
+        target_node_id=first.target_node_id,
+        captured_at=max(item.captured_at for item in observations),
+        capability_revision=capability_revision,
+        sources=merge(lambda item: item.sources, lambda item: item.source),
+        hosts=merge(lambda item: item.hosts, lambda item: item.node_id),
+        clusters=merge(lambda item: item.clusters, lambda item: item.cluster_id),
+        workloads=merge(lambda item: item.workloads, lambda item: item.assignment_id),
+        assignment_revisions=merge(lambda item: item.assignment_revisions, lambda item: item.assignment_id),
+        conflicting_operations=tuple(sorted({
+            conflict for item in observations for conflict in item.conflicting_operations
+        })),
+    )

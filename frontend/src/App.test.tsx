@@ -40,7 +40,7 @@ describe('console entry', () => {
       refreshAll: async () => undefined,
     };
     const roles = render(<QueryClientProvider client={client}><ConsoleContext.Provider value={context}><RolesPage /></ConsoleContext.Provider></QueryClientProvider>);
-    expect(screen.getByRole('heading', { name: 'Role Assignment' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Workload Placement' })).toBeInTheDocument();
     roles.unmount();
     render(<QueryClientProvider client={client}><ConsoleContext.Provider value={context}><AdvancedPage /></ConsoleContext.Provider></QueryClientProvider>);
     expect(screen.getByRole('heading', { name: 'Advance' })).toBeInTheDocument();

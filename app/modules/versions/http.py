@@ -32,7 +32,7 @@ def build_router(
     probe_command: Callable,
     record_observation: Callable,
     download_command: Callable,
-    launch_upgrade: Callable,
+    plan_upgrade: Callable,
     active_operation_checker: Callable[[str], bool],
     require_no_maintenance_conflict: Callable,
     require_cluster_capability: Callable,
@@ -140,6 +140,7 @@ def build_router(
     ):
         with db_factory() as connection:
             cluster = cluster_record(connection, cluster_id)
+            require_no_maintenance_conflict(connection, cluster_id=cluster_id)
             require_cluster_capability(connection, cluster_id, workload_mutation_capability)
             require_cluster_capability(connection, cluster_id, lifecycle_capability)
         candidates = await asyncio.to_thread(
@@ -147,6 +148,21 @@ def build_router(
             cluster["assignments"],
             cluster["log_monitoring"]["filebeat_enabled"],
         )
-        return {"run_id": launch_upgrade(cluster_id, input.target_version, candidates)}
+        # The registry lookup intentionally happens outside the SQLite scope.
+        # Re-open and re-check immediately before persisting so a conflict that
+        # began during discovery cannot race into a maintenance plan.
+        with db_factory() as connection:
+            cluster = cluster_record(connection, cluster_id)
+            require_no_maintenance_conflict(connection, cluster_id=cluster_id)
+            dispatch = plan_upgrade(
+                connection,
+                cluster,
+                input.target_version,
+                candidates,
+                requested_by=str(_),
+            )
+        # ``run_id`` remains the established response contract.  The extra
+        # planning identifiers let newer clients inspect the fail-closed plan.
+        return dispatch.model_dump(mode="json")
 
     return router

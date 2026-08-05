@@ -101,6 +101,50 @@ class MaintenanceApiTests(unittest.TestCase):
                 (node_id, 1, 1, 1, "Test Linux", "5.8.5", observed_at, ""),
             )
 
+    def evacuation_inventory(self, headers, *, provider="native_podman", same_zone=False):
+        """Create durable preview evidence without invoking any managed host."""
+
+        cluster_id = self.cluster(headers)
+        source_id = self.node(headers, "evacuation-source")
+        replacement_id = self.node(headers, "evacuation-replacement")
+        source_network = {"ens18": ["192.0.2.101"]}
+        replacement_network = {"ens18": ["192.0.2.102"]}
+        with self.main.db() as connection:
+            connection.execute("UPDATE clusters SET provider_type=? WHERE id=?", (provider, cluster_id))
+            connection.execute("UPDATE nodes SET zone_id=? WHERE id=?", ("zone-a", source_id))
+            connection.execute(
+                "UPDATE nodes SET zone_id=? WHERE id=?",
+                ("zone-a" if same_zone else "zone-b", replacement_id),
+            )
+            for node_id, address in ((source_id, "192.0.2.101"), (replacement_id, "192.0.2.102")):
+                connection.execute(
+                    "INSERT INTO memberships(cluster_id,node_id,network_mode,data_interface,data_address,user_interface,user_address) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (cluster_id, node_id, "shared", "ens18", address, "ens18", address),
+                )
+            assignment_id = connection.execute(
+                "INSERT INTO cluster_assignments(cluster_id,node_id,role,config_json,state) VALUES(?,?,?,?, 'active')",
+                (
+                    cluster_id,
+                    source_id,
+                    "hot",
+                    self.main.seal_config('{"cpu":"1","memory":"2g","storage_path":"/srv/elastic/evacuation"}'),
+                ),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO workload_observations(assignment_id,image,digest,version,running,cached,error) VALUES(?,?,?,?,?,?,?)",
+                (assignment_id, "docker.elastic.co/elasticsearch/elasticsearch:8.19.0", "sha256:" + "a" * 64, "8.19.0", 1, 1, ""),
+            )
+            observed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            for node_id, interfaces in ((source_id, source_network), (replacement_id, replacement_network)):
+                connection.execute(
+                    "INSERT INTO host_runtime_observations("
+                    "node_id,initialized,reachable,podman_socket_active,os_name,podman_version,observed_at,last_error,network_interfaces_json"
+                    ") VALUES(?,?,?,?,?,?,?,?,?)",
+                    (node_id, 1, 1, 1, "Test Linux", "5.8.5", observed_at, "", __import__("json").dumps(interfaces)),
+                )
+        return cluster_id, source_id, replacement_id
+
     def test_capabilities_are_authenticated_and_disabled_by_default(self):
         self.assertEqual(self.client.get("/api/maintenance/capabilities").status_code, 401)
         response = self.client.get("/api/maintenance/capabilities", headers=self.login())
@@ -241,6 +285,84 @@ class MaintenanceApiTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM maintenance_plans").fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM maintenance_locks").fetchone()[0], 0)
+
+    def test_generic_preview_is_gated_idempotent_and_listable(self):
+        headers = self.login()
+        node_id = self.node(headers)
+        self.observe_empty_host(node_id)
+        request = {
+            "operation": "manual_maintenance",
+            "node_id": node_id,
+            "reason": "Operator inspection",
+            "availability_mode": "zero-impact",
+            "idempotency_key": "generic-preview-1",
+        }
+        disabled = self.client.post("/api/maintenance/plans/preview", headers=headers, json=request)
+        self.assertEqual(disabled.status_code, 409)
+
+        self.main.MAINTENANCE_CAPABILITIES["planning"] = True
+        first = self.client.post("/api/maintenance/plans/preview", headers=headers, json=request)
+        self.assertEqual(first.status_code, 201, first.text)
+        payload = first.json()
+        self.assertEqual(payload["lifecycle_state"], "ready")
+        self.assertEqual(payload["view"]["header"]["target"]["kind"], "host")
+        self.assertIn("Manual maintenance", payload["view"]["header"]["operation"])
+
+        second = self.client.post("/api/maintenance/plans/preview", headers=headers, json=request)
+        self.assertEqual(second.status_code, 201, second.text)
+        self.assertEqual(second.json()["plan_id"], payload["plan_id"])
+        listed = self.client.get(
+            f"/api/maintenance/plans?host_id={node_id}&state=ready", headers=headers,
+        )
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(listed.json()["count"], 1)
+        with self.main.db() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM maintenance_locks").fetchone()[0], 0)
+        stale_node_id = self.node(headers, name="node-stale")
+        stale = self.client.post(
+            "/api/maintenance/plans/preview",
+            headers=headers,
+            json={
+                "operation": "manual_maintenance",
+                "node_id": stale_node_id,
+                "reason": "Stale observation preview",
+                "idempotency_key": "generic-preview-stale",
+            },
+        )
+        self.assertEqual(stale.status_code, 201, stale.text)
+        self.assertEqual(stale.json()["lifecycle_state"], "blocked")
+        self.assertEqual(stale.json()["view"]["header"]["freshness"]["state"], "stale")
+
+    def test_generic_preview_rejects_bad_target_and_idempotency_conflict(self):
+        headers = self.login()
+        node_id = self.node(headers)
+        self.observe_empty_host(node_id)
+        self.main.MAINTENANCE_CAPABILITIES["planning"] = True
+        base = {
+            "operation": "manual_maintenance",
+            "node_id": node_id,
+            "reason": "Operator inspection",
+            "idempotency_key": "generic-preview-conflict",
+        }
+        first = self.client.post("/api/maintenance/plans/preview", headers=headers, json=base)
+        self.assertEqual(first.status_code, 201, first.text)
+        conflict = self.client.post(
+            "/api/maintenance/plans/preview",
+            headers=headers,
+            json={**base, "reason": "Different target intent"},
+        )
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+        missing = self.client.post(
+            "/api/maintenance/plans/preview",
+            headers=headers,
+            json={
+                "operation": "resource_change",
+                "assignment_ids": [9999],
+                "reason": "Resource preview",
+            },
+        )
+        self.assertEqual(missing.status_code, 422, missing.text)
 
     def test_idempotent_repeat_and_conflict_do_not_recollect_observations(self):
         headers = self.login()
@@ -427,6 +549,58 @@ class MaintenanceApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 409, response.text)
         self.assertIn("maintenance", response.text.lower())
+
+    def test_evacuation_preview_is_authenticated_read_only_and_fail_closed(self):
+        headers = self.login()
+        cluster_id, source_id, replacement_id = self.evacuation_inventory(headers)
+        payload = {"cluster_id": cluster_id, "source_node_id": source_id, "replacement_node_id": replacement_id}
+        self.assertEqual(self.client.post("/api/maintenance/evacuation/preview", json=payload).status_code, 401)
+        response = self.client.post("/api/maintenance/evacuation/preview", headers=headers, json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["provider"], "native_podman")
+        self.assertEqual(response.json()["required_capacity"], 1)
+        self.assertIsNone(response.json()["available_capacity"])
+        self.assertIn("replacement_capacity_unobserved", response.json()["blockers"])
+        self.assertFalse(response.json()["mutation_allowed"])
+        self.assertFalse(response.json()["execution_enabled"])
+        self.assertFalse(response.json()["capability_enabled"])
+        with self.main.db() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM maintenance_plans").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
+
+    def test_evacuation_preview_blocks_endpoint_provider_and_same_node(self):
+        headers = self.login()
+        cluster_id, source_id, _ = self.evacuation_inventory(headers, provider="eck_endpoint")
+        response = self.client.post(
+            "/api/maintenance/evacuation/preview",
+            headers=headers,
+            json={
+                "cluster_id": cluster_id,
+                "source_node_id": source_id,
+                "replacement_node_id": source_id,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        blockers = set(response.json()["blockers"])
+        self.assertIn("provider_read_only", blockers)
+        self.assertIn("replacement_must_differ_from_source", blockers)
+        self.assertFalse(response.json()["mutation_allowed"])
+
+    def test_evacuation_preview_rejects_browser_supplied_provider_and_capacity(self):
+        headers = self.login()
+        cluster_id, source_id, replacement_id = self.evacuation_inventory(headers)
+        response = self.client.post(
+            "/api/maintenance/evacuation/preview",
+            headers=headers,
+            json={
+                "cluster_id": cluster_id,
+                "source_node_id": source_id,
+                "replacement_node_id": replacement_id,
+                "provider": "eck_endpoint",
+                "available_capacity": 999,
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
 
 
 if __name__ == "__main__":

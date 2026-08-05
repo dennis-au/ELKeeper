@@ -117,7 +117,7 @@ export function ActionConsole({ collapseKey, watchedRunId, onWatch }: Props) {
           {tabs.map((run) => (
             <EuiFlexItem grow={false} key={run.id}>
               <button className={`run-tab ${selected?.id === run.id ? 'is-selected' : ''}`} onClick={() => { setSelectedId(run.id); onWatch(run.id); setOpen(true); }}>
-                #{run.id} {run.kind} <EuiBadge color={run.status === 'failed' ? 'danger' : run.status === 'succeeded' ? 'success' : 'primary'}>{run.status}</EuiBadge>
+                #{run.id} {run.kind} <EuiBadge color={run.status === 'failed' || run.status === 'recovery_required' ? 'danger' : run.status === 'succeeded' ? 'success' : 'primary'}>{run.status}</EuiBadge>
               </button>
             </EuiFlexItem>
           ))}

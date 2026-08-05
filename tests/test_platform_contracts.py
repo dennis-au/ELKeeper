@@ -102,6 +102,36 @@ class PlatformContractTests(unittest.TestCase):
         snapshot["planning"] = not snapshot["planning"]
         self.assertNotEqual(snapshot["planning"], MAINTENANCE_CAPABILITIES["planning"])
 
+    def test_mutation_environment_flags_do_not_bypass_release_approval(self):
+        import app.modules.platform.maintenance as maintenance
+
+        names = (
+            "MAINTENANCE_HOST_REBOOT_ENABLED",
+            "MAINTENANCE_ROLLING_RESTART_ENABLED",
+            "MAINTENANCE_UPGRADE_ENABLED",
+            "MAINTENANCE_EVACUATION_ENABLED",
+            "MAINTENANCE_NODE_SHUTDOWN_BACKEND_ENABLED",
+        )
+        previous = {name: os.environ.get(name) for name in names}
+        try:
+            os.environ.update({name: "1" for name in names})
+            self.assertTrue(all(
+                not maintenance._approved_environment_capability(capability, variable)
+                for capability, variable in (
+                    ("host_reboot", "MAINTENANCE_HOST_REBOOT_ENABLED"),
+                    ("rolling_restart", "MAINTENANCE_ROLLING_RESTART_ENABLED"),
+                    ("upgrade", "MAINTENANCE_UPGRADE_ENABLED"),
+                    ("evacuation", "MAINTENANCE_EVACUATION_ENABLED"),
+                    ("node_shutdown_backend", "MAINTENANCE_NODE_SHUTDOWN_BACKEND_ENABLED"),
+                )
+            ))
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
     def test_password_check_is_owned_by_platform_auth(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = os.path.join(temporary, "users.db")

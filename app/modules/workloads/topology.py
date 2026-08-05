@@ -65,6 +65,12 @@ def render_topology(cluster: dict, role_specs: dict, es_roles: dict, valid_ipv4,
             f"CPU      : {config.get('cpu', '?')} cores  Memory: {config.get('memory', '?')}",
             f"Storage  : {config.get('storage_path', '?')}",
         ]
+        maintenance = assignment.get("maintenance")
+        if isinstance(maintenance, dict):
+            state = maintenance.get("lifecycle_state", "unknown")
+            checkpoint = maintenance.get("checkpoint")
+            recovery = checkpoint.get("recovery_classification") if isinstance(checkpoint, dict) else None
+            details.append(f"Maintenance: {state}{f' ({recovery})' if recovery else ''}")
         lines.append("|  +" + "-" * (width - 6) + "+  |")
         for detail in details:
             lines.append("|  | " + fit(detail, inner_width).ljust(inner_width) + " |  |")

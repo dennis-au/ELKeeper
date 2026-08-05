@@ -9,7 +9,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
-from app.modules.platform import MigrationRegistry, table_exists, mark_recovery_required_in_connection, statuses_in_connection
+from app.modules.platform import (
+    MigrationRegistry,
+    finish_run_in_connection,
+    table_exists,
+    mark_recovery_required_in_connection,
+    statuses_in_connection,
+    update_run_status_in_connection,
+)
 from app.modules.platform import write_event_in_connection
 from .repository import ConflictObservation, MaintenanceRepository as MaintenanceReadRepository
 
@@ -31,7 +38,13 @@ from app.modules.maintenance.lifecycle import (
     validate_plan_transition,
     validate_step_transition,
 )
-from app.modules.maintenance.recovery import RecoveryDecision, RecoveryEvidence, classify_recovery
+from app.modules.maintenance.recovery import (
+    MaintenanceStartupRecoveryCoordinator,
+    RecoveryDecision,
+    RecoveryEvidence,
+    StartupRecoveryResult,
+    classify_recovery,
+)
 
 
 FOUNDATION_SCHEMA_VERSION = 1
@@ -260,6 +273,7 @@ class StartupRecovery:
     protected_run_ids: frozenset[int]
     discovered_plan_ids: tuple[str, ...]
     transitioned_plan_ids: tuple[str, ...]
+    classifications: tuple[StartupRecoveryResult, ...] = ()
 
 
 def _ensure_columns(connection: sqlite3.Connection, table: str, columns: Mapping[str, str]) -> None:
@@ -671,6 +685,24 @@ MAINTENANCE_MIGRATIONS = (
 )
 
 
+def _reconcile_installed_schema(connection: sqlite3.Connection) -> None:
+    """Repair legacy structural gaps without changing the migration ledger.
+
+    Registered migrations are transactional in current releases, but databases
+    created by earlier installers can carry a recorded version alongside an
+    incomplete table, index, or trigger set.  Re-running these idempotent
+    structural operations makes the durable schema safe to reopen after a
+    restore or interrupted legacy startup while preserving the recorded
+    migration history.
+    """
+
+    _create_tables(connection)
+    _repair_partial_schema(connection)
+    _create_indexes_and_triggers(connection)
+    _add_provider_ownership_columns(connection)
+    _add_observation_identity_columns(connection)
+
+
 def install_maintenance_schema(connection: sqlite3.Connection) -> int:
     connection.execute("SAVEPOINT maintenance_schema_install")
     try:
@@ -692,6 +724,7 @@ def install_maintenance_schema(connection: sqlite3.Connection) -> int:
                 continue
             apply_migration(connection)
             registry.record(version, name, checksum, iso_timestamp())
+        _reconcile_installed_schema(connection)
         connection.execute("RELEASE SAVEPOINT maintenance_schema_install")
         return SCHEMA_VERSION
     except Exception:
@@ -806,6 +839,24 @@ class MaintenanceRepository:
                 raise RevisionConflict("Maintenance policy revision changed")
         return self.get_policy(cluster_id)  # type: ignore[return-value]
 
+    def mark_run_status(
+        self,
+        run_id: int,
+        status: str,
+        *,
+        finished_at: str | None = None,
+        log_suffix: str = "",
+    ) -> None:
+        """Update a maintenance-attached run through the platform contract."""
+
+        update_run_status_in_connection(
+            self.connection,
+            run_id,
+            status,
+            finished_at=finished_at,
+            log_suffix=log_suffix,
+        )
+
     def create_plan(
         self,
         *,
@@ -899,6 +950,39 @@ class MaintenanceRepository:
         ).fetchone()
         return _plan_record(row) if row else None
 
+    def list_plans(
+        self,
+        *,
+        node_id: int | None = None,
+        cluster_id: int | None = None,
+        state: str | None = None,
+        limit: int = 100,
+    ) -> list[PlanRecord]:
+        """List redacted maintenance plans through the owned persistence boundary."""
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        clauses = []
+        parameters: list[object] = []
+        if node_id is not None:
+            clauses.append("target_node_id=?")
+            parameters.append(node_id)
+        if cluster_id is not None:
+            clauses.append("target_cluster_id=?")
+            parameters.append(cluster_id)
+        if state is not None:
+            try:
+                MaintenanceState(state)
+            except ValueError as error:
+                raise ValueError(f"Unsupported maintenance plan state: {state}") from error
+            clauses.append("lifecycle_state=?")
+            parameters.append(state)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self.connection.execute(
+            "SELECT * FROM maintenance_plans" + where + " ORDER BY created_at DESC,id DESC LIMIT ?",
+            (*parameters, limit),
+        ).fetchall()
+        return [_plan_record(row) for row in rows]
+
     def transition_plan(
         self,
         plan_id: str,
@@ -969,7 +1053,18 @@ class MaintenanceRepository:
         """).fetchall()
         return [_plan_record(row) for row in rows]
 
-    def prepare_startup_recovery(self) -> StartupRecovery:
+    def prepare_startup_recovery(
+        self,
+        coordinator: MaintenanceStartupRecoveryCoordinator | None = None,
+    ) -> StartupRecovery:
+        """Classify interrupted checkpoints before protecting startup artifacts.
+
+        The coordinator consumes only named, read-only projection contracts.
+        A checkpoint proven complete closes its plan/run locally; every other
+        interrupted operation remains protected and is fail-closed for an
+        operator recovery decision.  No host, workload, cluster, or remote
+        action is performed here.
+        """
         candidates = self.connection.execute("""
             SELECT * FROM maintenance_plans
             WHERE lifecycle_state IN ('executing','paused','recovery_required') OR run_id IS NOT NULL
@@ -984,11 +1079,35 @@ class MaintenanceRepository:
             if row["lifecycle_state"] in {'executing', 'paused', 'recovery_required'}
             or statuses.get(int(row["run_id"])) in {'queued', 'running', 'recovery_required'}
         ]
-        protected_run_ids = frozenset(row["run_id"] for row in rows if row["run_id"] is not None)
+        plans = [_plan_record(row) for row in rows]
+        classifications = (coordinator or MaintenanceStartupRecoveryCoordinator(self)).classify_plans(plans)
+        by_plan_id = {item.plan_id: item for item in classifications}
+        protected_run_ids = frozenset(
+            int(row["run_id"])
+            for row in rows
+            if row["run_id"] is not None
+            and by_plan_id[row["id"]].classification.value != "complete"
+        )
         transitioned_plan_ids = []
         for row in rows:
             state = MaintenanceState(row["lifecycle_state"])
-            if state in {MaintenanceState.EXECUTING, MaintenanceState.PAUSED}:
+            classification = by_plan_id[row["id"]].classification.value
+            if classification == "complete":
+                if state == MaintenanceState.PAUSED:
+                    resumed = self.transition_plan(row["id"], row["state_revision"], MaintenanceState.EXECUTING)
+                    state = resumed.lifecycle_state
+                    row = self.connection.execute("SELECT * FROM maintenance_plans WHERE id=?", (row["id"],)).fetchone()
+                if state in {MaintenanceState.EXECUTING, MaintenanceState.RECOVERY_REQUIRED}:
+                    completed = self.transition_plan(row["id"], row["state_revision"], MaintenanceState.SUCCEEDED)
+                    transitioned_plan_ids.append(completed.id)
+                if row["run_id"] is not None:
+                    finish_run_in_connection(
+                        self.connection,
+                        int(row["run_id"]),
+                        "succeeded",
+                        log_suffix="Maintenance checkpoint state was verified during controller startup.\n",
+                    )
+            elif state in {MaintenanceState.EXECUTING, MaintenanceState.PAUSED}:
                 transitioned = self.transition_plan(
                     row["id"], row["state_revision"], MaintenanceState.RECOVERY_REQUIRED,
                 )
@@ -1003,6 +1122,7 @@ class MaintenanceRepository:
             protected_run_ids=protected_run_ids,
             discovered_plan_ids=tuple(row["id"] for row in rows),
             transitioned_plan_ids=tuple(transitioned_plan_ids),
+            classifications=classifications,
         )
 
     def observe_conflicts(
@@ -1193,6 +1313,45 @@ class MaintenanceRepository:
         if result.rowcount != 1:
             raise RevisionConflict("Maintenance checkpoint classification revision changed")
         return self.get_checkpoint(checkpoint_id), decision
+
+    def persist_startup_classification(
+        self,
+        checkpoint_id: int,
+        *,
+        expected_revision: int,
+        classification: str,
+        reason_code: str,
+        resumable: bool,
+        evidence: Mapping[str, Any],
+        now: datetime | None = None,
+    ) -> CheckpointRecord:
+        """Persist redacted startup-only classification through maintenance ownership.
+
+        This is deliberately separate from ``classify_checkpoint`` because
+        startup adds the operator-facing ``recovery_required`` state while the
+        legacy recovery API retains its ``safe_to_resume`` compatibility enum.
+        """
+
+        allowed = {"complete", "incomplete", "ambiguous", "recovery_required"}
+        if classification not in allowed:
+            raise ValueError("Unsupported startup recovery classification")
+        checkpoint = self.get_checkpoint(checkpoint_id)
+        if checkpoint.classification_revision != expected_revision:
+            raise RevisionConflict("Maintenance checkpoint classification revision changed")
+        persisted_evidence = dict(checkpoint.recovery_evidence)
+        persisted_evidence["startup_reason_code"] = reason_code
+        persisted_evidence["startup"] = dict(evidence)
+        result = self.connection.execute("""
+            UPDATE maintenance_checkpoints SET recovery_evidence_json=?,recovery_classification=?,
+              recovery_reason_code=?,resumable=?,classification_revision=classification_revision+1,classified_at=?
+            WHERE id=? AND classification_revision=?
+        """, (
+            _json(persisted_evidence), classification, reason_code, int(resumable),
+            iso_timestamp(now), checkpoint_id, expected_revision,
+        ))
+        if result.rowcount != 1:
+            raise RevisionConflict("Maintenance checkpoint classification revision changed")
+        return self.get_checkpoint(checkpoint_id)
 
     def find_host_state(self, node_id: int) -> HostStateRecord | None:
         row = self.connection.execute("SELECT * FROM host_maintenance_state WHERE node_id=?", (node_id,)).fetchone()

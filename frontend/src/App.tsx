@@ -8,6 +8,7 @@ import { ClustersPage } from './pages/ClustersPage';
 import { HostsPage } from './pages/HostsPage';
 import { RolesPage } from './pages/RolesPage';
 import { AdvancedPage } from './pages/AdvancedPage';
+import { MaintenanceWorkspace } from './features/maintenance/MaintenanceWorkspace';
 
 function ElkeeperLogo({ compact = false }: { compact?: boolean }) {
   return (
@@ -132,6 +133,7 @@ export default function App() {
           <Route path="/clusters" element={<ClustersPage />} />
           <Route path="/hosts" element={<HostsPage />} />
           <Route path="/roles" element={<RolesPage />} />
+          <Route path="/maintenance" element={<MaintenanceWorkspace />} />
           <Route path="/advanced" element={<AdvancedPage />} />
         </Route>}
         <Route path="*" element={<Navigate to={authenticated ? '/dashboard' : '/'} replace />} />

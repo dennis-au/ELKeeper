@@ -399,6 +399,48 @@ class PlatformBootstrapTests(unittest.TestCase):
                     1,
                 )
 
+    def test_restored_database_reopens_with_the_same_additive_schema_and_configuration(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            source_path = base / "control.db"
+            restored_path = base / "restored.db"
+            with connect(source_path) as connection:
+                _create_oldest_supported_schema(connection)
+
+            source = ControllerBootstrapService(
+                runtime_paths=_runtime_paths(base / "source"),
+                database=lambda: connect(source_path),
+                bootstrap_schema=bootstrap_controller_schema,
+                apply_schema_upgrades=_apply_fixture_upgrades,
+                complete_bootstrap=_complete_fixture_bootstrap,
+            )
+            source.run()
+            with connect(source_path) as connection:
+                source_cluster = connection.execute(
+                    "SELECT desired_version,network_defaults_json,secrets_json FROM clusters WHERE id=1"
+                ).fetchone()
+                expected_cluster = tuple(source_cluster)
+            with sqlite3.connect(source_path) as original, sqlite3.connect(restored_path) as restored:
+                original.backup(restored)
+
+            restored_service = ControllerBootstrapService(
+                runtime_paths=_runtime_paths(base / "restored"),
+                database=lambda: connect(restored_path),
+                bootstrap_schema=bootstrap_controller_schema,
+                apply_schema_upgrades=_apply_fixture_upgrades,
+                complete_bootstrap=_complete_fixture_bootstrap,
+            )
+            self.assertEqual(restored_service.run(), frozenset())
+
+            with connect(restored_path) as connection:
+                self.assertEqual(
+                    tuple(connection.execute(
+                        "SELECT desired_version,network_defaults_json,secrets_json FROM clusters WHERE id=1"
+                    ).fetchone()),
+                    expected_cluster,
+                )
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM users").fetchone()[0], 1)
+
     def test_startup_recovers_interrupted_runs_and_keeps_only_protected_artifacts_across_restarts(self):
         with tempfile.TemporaryDirectory() as root:
             base = Path(root)

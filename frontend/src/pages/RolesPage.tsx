@@ -3,4 +3,5 @@ export {
   RolesWorkspace as RolesPage,
   managedWorkloadColumns,
   workloadImageVersion,
+  workloadRuntimeVersionLabel,
 } from '../features/workloads/RolesWorkspace';

@@ -32,6 +32,11 @@ from pydantic import Field
 from app.modules.maintenance.store import MaintenanceRepository as MaintenanceStore, install_maintenance_schema
 from app.modules.maintenance.repository import MaintenanceRepository as MaintenanceReadRepository
 from app.modules.maintenance.models import MaintenanceBackend, ProviderType
+from app.modules.maintenance import (
+    MaintenanceUpgradePlanningService,
+    Phase2RebootAdapterFactory,
+    workload_maintenance_progress_in_connection,
+)
 from app.modules.maintenance.provider import (
     OwnershipState,
     ProviderCapability,
@@ -452,6 +457,10 @@ def registry_listing_tags(repository):
     return _registry_client().listing_tags(repository)
 
 
+def registry_manifest_digest(repository, tag):
+    return _registry_client().manifest_digest(repository, tag)
+
+
 def cluster_repositories(assignments, filebeat_enabled=False):
     return registry_repositories(
         assignments, role_images=ROLE_IMAGES, metricbeat_roles=METRICBEAT_ROLES,
@@ -478,6 +487,27 @@ def available_versions(assignments, filebeat_enabled=False):
         default_version=DEFAULT_STACK_VERSION, registry_tags=registry_tags,
         result_limit=REGISTRY_TAG_RESULT_LIMIT, filebeat_enabled=filebeat_enabled,
     )
+
+
+def target_image_digests(assignments, target_version):
+    """Resolve one immutable registry digest per assignment image.
+
+    This read-only registry lookup is deliberately separate from download and
+    upgrade execution.  A maintenance plan must never persist a mutable tag as
+    its target identity.
+    """
+
+    resolved = {}
+    by_image = {}
+    for assignment in assignments:
+        image = image_for_role(assignment["role"], target_version)
+        repository, tag = image.removeprefix("docker.elastic.co/").rsplit(":", 1)
+        by_image.setdefault((repository, tag), []).append(int(assignment["id"]))
+    for (repository, tag), assignment_ids in by_image.items():
+        digest = registry_manifest_digest(repository, tag)
+        for assignment_id in assignment_ids:
+            resolved[assignment_id] = digest
+    return resolved
 
 
 def recommended_workload_version(assignments, candidates):
@@ -650,6 +680,7 @@ def cluster_record(con, cluster_id):
         provider_payload=provider_profile_payload,
         open_config=open_config,
         redacted_config=redacted_config,
+        workload_maintenance_progress=workload_maintenance_progress_in_connection,
     )
 
 
@@ -944,6 +975,29 @@ async def run_upgrade(run_id, cluster_id, target_version, inventory_path, assign
 
 def launch_upgrade(cluster_id, target_version, candidates=None):
     return _version_operations().launch_upgrade(cluster_id, target_version, candidates)
+
+
+def plan_maintenance_upgrade(connection, cluster, target_version, candidates, *, requested_by):
+    """Compatibility adapter for the legacy upgrade route.
+
+    Phase 4 is planning-only in this release.  The maintenance owner records
+    the immutable target and a run for the established action-console flow;
+    it does not invoke ``launch_upgrade`` or any remote mutation.
+    """
+
+    return MaintenanceUpgradePlanningService(
+        MaintenanceStore(connection),
+        image_for_role=image_for_role,
+        resolve_target_digests=target_image_digests,
+        preflight=upgrade_preflight,
+        upgrade_order=UPGRADE_ORDER,
+        execution_enabled=MAINTENANCE_CAPABILITIES["upgrade"],
+    ).create_legacy_upgrade_plan(
+        cluster,
+        target_version=target_version,
+        candidates=candidates,
+        requested_by=requested_by,
+    )
 
 
 def workload_change_sort_key(change):
@@ -1434,7 +1488,7 @@ app.include_router(
         probe_command=lambda *args, **kwargs: probe_command(*args, **kwargs),
         record_observation=lambda *args, **kwargs: record_observation(*args, **kwargs),
         download_command=lambda *args, **kwargs: download_command(*args, **kwargs),
-        launch_upgrade=lambda *args, **kwargs: launch_upgrade(*args, **kwargs),
+        plan_upgrade=lambda *args, **kwargs: plan_maintenance_upgrade(*args, **kwargs),
         active_operation_checker=lambda cluster_name: _active_cluster_operation_for_router(cluster_name),
         require_no_maintenance_conflict=lambda *args, **kwargs: require_no_maintenance_conflict(*args, **kwargs),
         require_cluster_capability=lambda *args, **kwargs: require_cluster_capability(*args, **kwargs),
@@ -1670,6 +1724,12 @@ def _host_lifecycle_operations():
         launch=lambda *args, **kwargs: launch(*args, **kwargs),
         playbook_command=lambda *args, **kwargs: orchestration_playbook(*args, **kwargs),
     )
+
+
+def phase2_reboot_adapter_factory(**dependencies):
+    """Expose inert Phase 2 reboot composition without registering an adapter."""
+
+    return Phase2RebootAdapterFactory(**dependencies)
 
 
 app.include_router(

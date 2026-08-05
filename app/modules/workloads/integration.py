@@ -15,6 +15,7 @@ from typing import Any, Callable
 from fastapi import HTTPException
 
 from app.modules.platform import RunDescriptor
+from app.modules.maintenance.contracts import LegacyBatchRecoveryDecision
 
 from .worker import WorkloadChangeWorker
 
@@ -45,6 +46,7 @@ class WorkloadOperations:
         run_descriptor: type = RunDescriptor,
         validate_change_set: Callable | None = None,
         schedule: Callable = asyncio.create_task,
+        batch_recovery_observer: Callable[[int, dict, list[dict]], Awaitable[LegacyBatchRecoveryDecision | None] | LegacyBatchRecoveryDecision | None] | None = None,
     ) -> None:
         self._db = db_factory
         self._variables = variables_dir
@@ -66,6 +68,7 @@ class WorkloadOperations:
         self._run_descriptor = run_descriptor
         self._validate_change_set = validate_change_set
         self._schedule = schedule
+        self._batch_recovery_observer = batch_recovery_observer
 
     def _worker(self, *, reconcile_runner: Callable | None = None) -> WorkloadChangeWorker:
         return WorkloadChangeWorker(
@@ -86,6 +89,7 @@ class WorkloadOperations:
             launch_filebeat_reconcile=self._launch_filebeat,
             recovery_required_ids=self._recovery_required_ids,
             reconcile_runner=reconcile_runner,
+            batch_recovery_observer=self._batch_recovery_observer,
         )
 
     def batch_plan(self, connection: Any, run_id: int) -> dict:

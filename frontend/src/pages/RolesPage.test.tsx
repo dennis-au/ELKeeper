@@ -1,9 +1,9 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ConsoleContext } from '../app-context';
 import type { Cluster } from '../features/clusters';
-import { managedWorkloadColumns, RolesPage, workloadImageVersion } from './RolesPage';
+import { managedWorkloadColumns, RolesPage, workloadImageVersion, workloadRuntimeVersionLabel } from './RolesPage';
 
 const state = vi.hoisted(() => ({
   versionResponse: { available_versions: ['8.20.0', '8.19.0'], recommended_version: '8.20.0', assignments: [] },
@@ -155,6 +155,19 @@ describe('RolesPage storage selection', () => {
     expect(managedWorkloadColumns[1].display).toBe('Image version');
     expect(workloadImageVersion(clusterWithAssignment.assignments[0])).toBe('8.19.1');
     expect(workloadImageVersion({ ...clusterWithAssignment.assignments[0], image_version: '8.19.0', observation: undefined })).toBe('not observed');
+    expect(workloadRuntimeVersionLabel(clusterWithAssignment.assignments[0])).toBe('8.19.1');
+    expect(workloadRuntimeVersionLabel({ ...clusterWithAssignment.assignments[0], image_version: '8.19.0', observation: undefined })).toBe('Version not observed');
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <ConsoleContext.Provider value={{ clusters: [clusterWithAssignment], selectedCluster: clusterWithAssignment, selectedClusterId: 1, setSelectedClusterId: () => undefined, watchRun: () => undefined, refreshAll: async () => undefined }}>
+          <RolesPage />
+        </ConsoleContext.Provider>
+      </QueryClientProvider>,
+    );
+    const matrix = await screen.findByLabelText('Cluster workload placement matrix');
+    expect(within(matrix).getByText('8.19.1')).toBeInTheDocument();
   });
 
   it('keeps a staged workload editable until the complete change set is applied', async () => {

@@ -2,16 +2,21 @@
 
 ## Document Status
 
-- Status: In progress
-- Date: 2026-08-03
+- Status: Planning, persistence, and guarded controller release complete; execution gates pending
+- Date: 2026-08-04
 - Audience: ELKeeper maintainers, reviewers, and regression-test operators
 - Scope: Phased implementation. Operator mutations remain disabled until their phase gates pass.
 
 ## Implementation Status
 
-- Phase 0 persistence, ownership, locking, redaction, and startup-recovery foundations are implemented behind disabled-by-default feature flags.
-- Phase 1 policy, observation, predicate, impact, plan compiler, API preview, and plan-preview UI foundations are implemented without enabling remote mutation.
-- Phase 2 Elasticsearch allocation guard, signed one-shot executor contract, reboot state machine, post-return verification, recovery status, and operation UI foundations are implemented or under integration.
+- Phase 0 persistence, ownership, locking, redaction, and startup recovery are implemented. Startup now invokes named host, workload, observability, and Elasticsearch projection contracts to classify persisted checkpoints as complete, incomplete, ambiguous, or recovery-required before transient artifacts are cleaned. The default startup adapter is local and read-only; it performs no SSH, Ansible, Podman, or Elasticsearch call.
+- Phase 1 policy, observation, predicate, impact, plan compiler, generic preview/list APIs, and the `/maintenance` workspace are implemented without enabling remote mutation. A preview persists only its plan, steps, and audit event; it never creates a run or lock. The workspace provides plan history, plan details, capability state, and in-page manual-maintenance controls.
+- Phase 2 manual maintenance mode is implemented as a controller-only state machine: it persists a plan, run, audit event, host state, lock, expiry, and fresh-health exit/recovery path without remote I/O. A production-shaped reboot composition factory now joins the CA-verified Elasticsearch, allocation guard, controller I/O, signed executor, reboot orchestration, and post-return contracts, but its orchestrator is always disabled and it remains unregistered.
+- Phase 3 now persists one-workload maintenance previews with ordered steps, role-specific readiness/disruption contracts, checkpoints, and durable recovery classification. Workload-batch recovery can consume an injected public observation decision rather than assuming the completed list is authoritative. Redacted checkpoint progress is projected into workload rows, the selected-cluster Dashboard, terminal topology role boxes, and the action console's recovery-required state. Stateless artifacts may later restore a compatible prior artifact; Elasticsearch becomes recovery-required if a new process may have opened its data path. No workload executor is registered or enabled.
+- Phase 4 now routes the legacy upgrade endpoint through a maintenance-owned, immutable digest plan. It persists an ordered per-assignment manifest, checkpoints, rollback policy, audit event, and closed planning run while preserving the established `run_id` response. It does not launch Ansible, Podman, or remote work until an approved executor is assembled; Elasticsearch remains recovery-required after a new process starts rather than being auto-downgraded.
+- Phase 5 now derives evacuation preview evidence only from controller-owned projections: provider/ownership, maintenance policy, host status and zones, memberships and NIC observations, active assignments, role ports, encrypted resource summaries, and image observations. Endpoint-only ECK/external providers remain read-only. Missing durable allocatable capacity is a fail-closed `replacement_capacity_unobserved` blocker, not an operator-supplied override. No drain, replacement, or provider mutation adapter exists.
+- Mutation flags are now a two-part gate: a runtime request plus an explicit release-artifact approval. The current release artifact approves no mutation capability.
+- The verified Phase 0-5 controller artifact is deployed on the controller host after a non-empty database backup, isolated candidate smoke, and authenticated post-release checks. The release changed no managed Elastic workload host and did not alter any execution capability.
 - Phase 2 live reboot execution remains disabled until runtime adapters, single-image packaging, controller-disconnect tests, redundant-topology live acceptance, cleanup evidence, and the full phase ledger pass.
 - The legacy host reboot endpoint remains on its existing path until the Phase 2 exit gate is complete.
 

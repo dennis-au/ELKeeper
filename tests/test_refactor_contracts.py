@@ -87,6 +87,12 @@ class RefactorContractTests(unittest.TestCase):
         self.assertNotIn("def host_has_assignments", source)
         self.assertNotIn("def launch_host_action", source)
 
+    def test_application_assembly_exposes_but_does_not_register_phase2_reboot_composition(self):
+        source = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
+        self.assertIn("Phase2RebootAdapterFactory", source)
+        self.assertIn("def phase2_reboot_adapter_factory", source)
+        self.assertNotIn("MAINTENANCE_ADAPTERS", source)
+
     def test_observability_collector_uses_narrow_dependencies_not_application_core(self):
         source = (ROOT / "app" / "modules" / "observability" / "collector.py").read_text(encoding="utf-8")
         self.assertNotIn("_deps.core", source)

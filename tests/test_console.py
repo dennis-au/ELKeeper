@@ -758,11 +758,15 @@ class ConsoleApiTests(unittest.TestCase):
 
         manager = self.main.console.TelemetryManager()
         manager._record_workload_runtime(node_id, [{
-            "name": f"ecp-lab-a-master-{node_id}",
+            "name": f"ecp-test-master-{node_id}",
             "image": "docker.elastic.co/elasticsearch/elasticsearch:8.19.1",
             "digest": "sha256:runtime-image",
             "state": "running",
             "status": "Up 1 minute",
+            "labels": {
+                "io.elastic-control.assignment-id": str(assignment_id),
+                "io.elastic-control.role": "master",
+            },
         }])
 
         with self.main.db() as con:

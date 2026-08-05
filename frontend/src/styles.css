@@ -134,13 +134,14 @@ button, input, select, textarea { letter-spacing: 0; }
 .workload-stage-status { display: flex; align-items: center; min-height: 32px; }
 .workload-stage-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 .role-matrix { display: grid; width: 100%; min-width: 0; grid-template-columns: minmax(140px, 1.2fr) repeat(10, minmax(105px, 1fr)); overflow-x: auto; border-top: 1px solid #d7dee7; border-left: 1px solid #d7dee7; }
-.role-matrix > div { min-height: 50px; padding: 10px; border-right: 1px solid #d7dee7; border-bottom: 1px solid #d7dee7; font-size: 12px; }
+.role-matrix > div { min-height: 56px; padding: 10px; border-right: 1px solid #d7dee7; border-bottom: 1px solid #d7dee7; font-size: 12px; }
 .role-matrix__header { background: #eef2f5; font-weight: 700; }
 .role-matrix__host { background: #f8fafb; font-weight: 700; }
-.role-cell { color: #8b96a3; }
+.role-cell { display: flex; flex-direction: column; justify-content: center; gap: 2px; color: #8b96a3; }
 .role-cell.is-assigned { border-left: 4px solid var(--cluster-accent); background: color-mix(in srgb, var(--cluster-accent) 11%, white); color: #17212b; font-weight: 600; }
 .role-cell.is-pending { outline: 2px dashed #d36014; outline-offset: -4px; color: #8d4307; font-weight: 600; }
 .role-cell.is-pending-removal { background: #fff4e5; color: #8d4307; text-decoration: line-through; }
+.role-cell__version { color: #536579; font-family: SFMono-Regular, Consolas, Liberation Mono, monospace; font-size: 10px; font-weight: 400; line-height: 1.2; white-space: nowrap; }
 .data-grid-band { min-width: 0; }
 .grid-actions { display: flex; align-items: center; min-width: 240px; }
 .image-version-value { font-family: SFMono-Regular, Consolas, Liberation Mono, monospace; font-variant-numeric: tabular-nums; }

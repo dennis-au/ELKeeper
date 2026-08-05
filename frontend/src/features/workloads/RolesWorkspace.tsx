@@ -32,6 +32,7 @@ export const managedWorkloadColumns = [
   { id: 'version', display: 'Image version', initialWidth: 140 },
   { id: 'host', display: 'Host', initialWidth: 150 },
   { id: 'state', display: 'Runtime', initialWidth: 140 },
+  { id: 'maintenance', display: 'Maintenance', initialWidth: 180 },
   { id: 'resources', display: 'Resources', initialWidth: 180 },
   { id: 'storage', display: 'Storage', initialWidth: 260 },
   { id: 'endpoint', display: 'Endpoint', initialWidth: 240 },
@@ -41,6 +42,11 @@ export const managedWorkloadColumns = [
 export function workloadImageVersion(assignment: Assignment) {
   if (assignment.observation?.running && assignment.observation.version) return assignment.observation.version;
   return assignment.observation?.version || 'not observed';
+}
+
+export function workloadRuntimeVersionLabel(assignment: Assignment) {
+  if (assignment.observation?.version) return assignment.observation.version;
+  return 'Version not observed';
 }
 
 function clientChangeId() {
@@ -355,6 +361,13 @@ export function RolesWorkspace() {
     if (columnId === 'version') return <span className="image-version-value" title={item.observation?.image}>{workloadImageVersion(item)}</span>;
     if (columnId === 'host') return item.node_name;
     if (columnId === 'state') return <EuiBadge color={item.observation?.running ? 'success' : 'default'}>{item.observation?.running ? 'running' : item.state}</EuiBadge>;
+    if (columnId === 'maintenance') {
+      const progress = item.maintenance;
+      if (!progress) return <span>none</span>;
+      const recovery = progress.checkpoint?.recovery_classification;
+      const color = progress.lifecycle_state === 'recovery_required' || recovery === 'recovery_required' ? 'danger' : progress.lifecycle_state === 'blocked' ? 'warning' : 'primary';
+      return <EuiToolTip content={`Plan ${progress.plan_id}: ${progress.verified_steps}/${progress.step_count} verified`}><EuiBadge color={color}>{recovery || progress.lifecycle_state}</EuiBadge></EuiToolTip>;
+    }
     if (columnId === 'resources') return `${item.config.cpu} CPU · ${item.config.memory}`;
     if (columnId === 'storage') return <span title={item.config.storage_path}>{item.config.storage_path}</span>;
     if (columnId === 'endpoint') return access.get(item.id) || 'Outbound/no listener';
@@ -367,17 +380,17 @@ export function RolesWorkspace() {
   };
   const matrix = useMemo(() => selectedCluster?.members.map((host) => ({
     host,
-    assigned: new Set(selectedCluster.assignments.filter((item) => item.node_id === host.node_id).map((item) => item.role)),
+    assigned: new Map<string, Assignment>(selectedCluster.assignments.filter((item) => item.node_id === host.node_id).map((item) => [item.role, item])),
     creating: new Set(pendingChanges.filter((item) => item.kind === 'create' && item.nodeId === host.node_id).map((item) => item.role)),
     detaching: new Set(pendingChanges.filter((item) => item.kind === 'detach' && item.nodeId === host.node_id).map((item) => item.role)),
   })) || [], [selectedCluster, pendingChanges]);
 
   if (!selectedCluster) return <div className="page-stack">
-    <div className="page-heading"><div><EuiTitle><h1>Role Assignment</h1></EuiTitle><EuiText color="subdued">Map cluster workloads to initialized Podman hosts and manage their persistent limits.</EuiText></div></div>
+    <div className="page-heading"><div><EuiTitle><h1>Workload Placement</h1></EuiTitle><EuiText color="subdued">Map cluster workloads to initialized Podman hosts and manage their persistent limits.</EuiText></div></div>
     <EuiCallOut title="Select or create a cluster" iconType="cluster" />
   </div>;
   return <div className="page-stack">
-    <div className="page-heading"><div><EuiTitle><h1>Role Assignment</h1></EuiTitle><EuiText color="subdued">Map cluster workloads to initialized Podman hosts and manage their persistent limits.</EuiText></div><EuiBadge color="hollow">{selectedCluster.name}</EuiBadge></div>
+    <div className="page-heading"><div><EuiTitle><h1>Workload Placement</h1></EuiTitle><EuiText color="subdued">Map cluster workloads to initialized Podman hosts and manage their persistent limits.</EuiText></div><EuiBadge color="hollow">{selectedCluster.name}</EuiBadge></div>
     {error && <EuiCallOut title="Role operation failed" color="danger" iconType="warning">{error}</EuiCallOut>}
     <section className="section-band">
       <div className="section-heading"><div><EuiTitle size="s"><h2>Host membership</h2></EuiTitle><EuiText color="subdued">Each membership declares system/data and user-facing network bindings.</EuiText></div></div>
@@ -393,11 +406,12 @@ export function RolesWorkspace() {
     </section>
     <section className="section-band">
       <div className="section-heading"><div><EuiTitle size="s"><h2>Cluster → roles → hosts</h2></EuiTitle><EuiText color="subdued">Solid cells are managed workloads; outlined cells are pending changes.</EuiText></div></div>
-      <div className="role-matrix"><div className="role-matrix__header">Host</div>{roles.map((role) => <div className="role-matrix__header" key={role.id}>{role.label}</div>)}{matrix.flatMap(({ host, assigned, creating, detaching }) => [<div className="role-matrix__host" key={`${host.node_id}-host`}><strong>{host.name}</strong><small className="block-muted">{host.zone_id || 'no zone'}</small></div>, ...roles.map((role) => {
+      <div className="role-matrix" aria-label="Cluster workload placement matrix"><div className="role-matrix__header">Host</div>{roles.map((role) => <div className="role-matrix__header" key={role.id}>{role.label}</div>)}{matrix.flatMap(({ host, assigned, creating, detaching }) => [<div className="role-matrix__host" key={`${host.node_id}-host`}><strong>{host.name}</strong><small className="block-muted">{host.zone_id || 'no zone'}</small></div>, ...roles.map((role) => {
         const isCreating = creating.has(role.id);
-        const isAssigned = assigned.has(role.id);
+        const managedAssignment = assigned.get(role.id);
+        const isAssigned = Boolean(managedAssignment);
         const isDetaching = detaching.has(role.id);
-        return <div key={`${host.node_id}-${role.id}`} className={`role-cell ${isAssigned ? 'is-assigned' : ''} ${isCreating ? 'is-pending' : ''} ${isDetaching ? 'is-pending-removal' : ''}`}>{isCreating ? `${role.label} pending` : isDetaching ? `${role.label} detach` : isAssigned ? role.label : '—'}</div>;
+        return <div key={`${host.node_id}-${role.id}`} className={`role-cell ${isAssigned ? 'is-assigned' : ''} ${isCreating ? 'is-pending' : ''} ${isDetaching ? 'is-pending-removal' : ''}`}>{isCreating ? `${role.label} pending` : isDetaching ? `${role.label} detach` : managedAssignment ? <><strong>{role.label}</strong><small className="role-cell__version">{workloadRuntimeVersionLabel(managedAssignment)}</small></> : '—'}</div>;
       })])}</div>
     </section>
     <section className="section-band workload-stage-band">
@@ -452,7 +466,7 @@ export function RolesWorkspace() {
     {modal && <WorkloadModal state={modal} close={() => setModal(undefined)} completed={refresh} stageChange={stageChange} />}
     {pendingNavigation && <EuiOverlayMask><EuiModal onClose={() => setPendingNavigation(undefined)}>
       <EuiModalHeader><EuiModalHeaderTitle>{applyingRunId ? 'Workload changes are applying' : 'Discard pending workload changes?'}</EuiModalHeaderTitle></EuiModalHeader>
-      <EuiModalBody><EuiText>{applyingRunId ? 'The current batch must finish or roll back before leaving Role Assignment.' : 'These browser-local changes have not been applied. Discarding them cannot be undone.'}</EuiText></EuiModalBody>
+      <EuiModalBody><EuiText>{applyingRunId ? 'The current batch must finish or roll back before leaving Workload Placement.' : 'These browser-local changes have not been applied. Discarding them cannot be undone.'}</EuiText></EuiModalBody>
       <EuiModalFooter><EuiButtonEmpty onClick={() => setPendingNavigation(undefined)}>{applyingRunId ? 'Keep watching' : 'Keep changes'}</EuiButtonEmpty>{!applyingRunId && <EuiButton fill color="danger" onClick={discardPendingChangesAndContinue}>Discard changes</EuiButton>}</EuiModalFooter>
     </EuiModal></EuiOverlayMask>}
   </div>;

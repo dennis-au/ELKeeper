@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Literal
+from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -19,6 +19,7 @@ def _aware(value: datetime, field_name: str) -> datetime:
 
 class OperationKind(str, Enum):
     REBOOT = "reboot"
+    MANUAL_MAINTENANCE = "manual_maintenance"
     WORKLOAD_RESTART = "workload_restart"
     RESOURCE_CHANGE = "resource_change"
     SETTINGS_CHANGE = "settings_change"
@@ -33,6 +34,96 @@ class OperationKind(str, Enum):
 class AvailabilityMode(str, Enum):
     ZERO_IMPACT = "zero-impact"
     AUDITED_OUTAGE = "audited-outage"
+
+
+class PreviewOperation(str, Enum):
+    """Public operation vocabulary for the non-mutating planning API.
+
+    Stored plans continue to use :class:`OperationKind`; this vocabulary is
+    intentionally stable for callers while the older internal names remain
+    compatible.
+    """
+
+    REBOOT = "reboot"
+    MANUAL_MAINTENANCE = "manual_maintenance"
+    RESOURCE_CHANGE = "resource_change"
+    CLUSTER_SETTINGS = "cluster_settings"
+    ZONING = "zoning"
+    APPLY = "apply"
+    DETACH = "detach"
+    PURGE = "purge"
+    DOWNLOAD = "download"
+    UPGRADE = "upgrade"
+
+
+class _PreviewRequestBase(FrozenModel):
+    reason: str = Field(min_length=1, max_length=512)
+    availability_mode: AvailabilityMode = AvailabilityMode.ZERO_IMPACT
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+
+    @field_validator("reason")
+    @classmethod
+    def normalize_reason(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("reason must not be blank")
+        return value
+
+
+class RebootPreviewRequest(_PreviewRequestBase):
+    operation: Literal[PreviewOperation.REBOOT] = PreviewOperation.REBOOT
+    node_id: int = Field(ge=1)
+
+
+class ManualMaintenancePreviewRequest(_PreviewRequestBase):
+    operation: Literal[PreviewOperation.MANUAL_MAINTENANCE] = PreviewOperation.MANUAL_MAINTENANCE
+    node_id: int = Field(ge=1)
+
+
+class AssignmentPreviewRequest(_PreviewRequestBase):
+    operation: Literal[
+        PreviewOperation.RESOURCE_CHANGE,
+        PreviewOperation.APPLY,
+        PreviewOperation.DETACH,
+        PreviewOperation.PURGE,
+    ]
+    assignment_ids: tuple[int, ...] = Field(min_length=1)
+
+    @field_validator("assignment_ids", mode="before")
+    @classmethod
+    def normalize_assignment_ids(cls, value):
+        values = tuple(sorted(set(value or ())))
+        if any(isinstance(item, bool) or not isinstance(item, int) or item < 1 for item in values):
+            raise ValueError("assignment_ids must contain positive integer identifiers")
+        return values
+
+
+class ClusterPreviewRequest(_PreviewRequestBase):
+    operation: Literal[
+        PreviewOperation.CLUSTER_SETTINGS,
+        PreviewOperation.ZONING,
+        PreviewOperation.DOWNLOAD,
+    ]
+    cluster_id: int = Field(ge=1)
+
+
+class UpgradePreviewRequest(_PreviewRequestBase):
+    operation: Literal[PreviewOperation.UPGRADE] = PreviewOperation.UPGRADE
+    cluster_id: int = Field(ge=1)
+    current_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+    target_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+
+
+MaintenancePlanPreviewInput = Annotated[
+    Union[
+        RebootPreviewRequest,
+        ManualMaintenancePreviewRequest,
+        AssignmentPreviewRequest,
+        ClusterPreviewRequest,
+        UpgradePreviewRequest,
+    ],
+    Field(discriminator="operation"),
+]
 
 
 class ProviderType(str, Enum):

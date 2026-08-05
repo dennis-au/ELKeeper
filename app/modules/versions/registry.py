@@ -85,6 +85,35 @@ class ElasticRegistry:
             with self._urlopen(authenticated, timeout=self._request_timeout) as response:
                 return json.loads(response.read().decode()), response.headers
 
+    def manifest_digest(self, repository: str, tag: str) -> str:
+        """Resolve a registry manifest to an immutable OCI digest.
+
+        A tag is never sufficient for a maintenance upgrade plan because it
+        may later point at different content.  The result is cached only for
+        the existing bounded registry-cache interval.
+        """
+
+        cache_key = ("manifest-digest", repository, tag)
+        cached = self._cache.get(cache_key)
+        if cached and cached[0] + self._cache_seconds > time.time():
+            return cached[1]
+        payload, headers = self.json(
+            f"https://docker.elastic.co/v2/{repository}/manifests/{urllib.parse.quote(tag, safe='')}",
+            headers={
+                "Accept": (
+                    "application/vnd.oci.image.index.v1+json,"
+                    "application/vnd.docker.distribution.manifest.list.v2+json,"
+                    "application/vnd.oci.image.manifest.v1+json,"
+                    "application/vnd.docker.distribution.manifest.v2+json"
+                ),
+            },
+        )
+        digest = str(headers.get("Docker-Content-Digest") or "").strip()
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            raise HTTPException(503, f"Elastic registry did not return an immutable digest for {repository}:{tag}")
+        self._cache[cache_key] = (time.time(), digest)
+        return digest
+
     def tags(self, repository: str, cursor: str, *, fetch_json: Callable | None = None) -> set[str]:
         cache_key = (repository, cursor)
         cached = self._cache.get(cache_key)

@@ -14,6 +14,17 @@ class WorkloadTopologyTests(unittest.TestCase):
         self.assertEqual(urls[0]["url"], "https://192.0.2.20:5602")
         self.assertNotIn("198.51.100.20", urls[0]["url"])
 
+    def test_role_box_includes_redacted_maintenance_progress(self):
+        cluster = {
+            "name": "lab",
+            "slug": "lab",
+            "role_ports": {"kibana": {"kibana": 5601}},
+            "members": [{"node_id": 1, "name": "node-1", "zone_id": "zone-a", "network_mode": "shared", "user_interface": "ens18", "user_address": "192.0.2.20", "data_interface": "ens18", "data_address": "192.0.2.20"}],
+            "assignments": [{"id": 5, "node_id": 1, "role": "kibana", "config": {"cpu": "1", "memory": "2g", "storage_path": "/srv/kibana"}, "maintenance": {"lifecycle_state": "recovery_required", "checkpoint": {"recovery_classification": "recovery_required"}}}],
+        }
+        output, _ = render_topology(cluster, {"kibana": {"label": "Kibana"}}, {}, lambda value: value.count(".") == 3)
+        self.assertIn("Maintenance: recovery_required (recovery_required)", output)
+
     def test_rendering_contains_host_and_role_boxes_and_transport_connector(self):
         cluster = {
             "name": "demo", "slug": "demo", "role_ports": {

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from app.maintenance_lifecycle import (
     PLAN_TRANSITIONS,
@@ -17,10 +20,17 @@ from app.maintenance_lifecycle import (
     validate_plan_transition,
 )
 from app.maintenance_recovery import RecoveryClassification, RecoveryEvidence, classify_recovery
+from app.modules.maintenance.recovery import (
+    MaintenanceStartupRecoveryCoordinator,
+    RecoveryProjectionBundle,
+    RecoveryProjectionResult,
+    StartupRecoveryClassification,
+)
 from app.modules.maintenance.store import (
     IdempotencyConflict,
     LockConflict,
     LockRequest,
+    MAINTENANCE_MIGRATIONS,
     MaintenanceRepository,
     MigrationDriftError,
     OverlappingPlanError,
@@ -163,6 +173,45 @@ class MaintenanceMigrationTests(unittest.TestCase):
             item["name"] for item in connection.execute("PRAGMA table_info(maintenance_checkpoints)")
         }
         self.assertIn("recovery_evidence_json", checkpoint_columns)
+
+    def test_ledger_marked_legacy_interruption_is_reconciled_without_rewriting_history(self):
+        connection = base_connection()
+        self.addCleanup(connection.close)
+        version, name, checksum, _apply = MAINTENANCE_MIGRATIONS[0]
+        connection.executescript("""
+            CREATE TABLE maintenance_schema_migrations(
+              version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,applied_at TEXT NOT NULL
+            );
+            CREATE TABLE maintenance_plans(id TEXT PRIMARY KEY, plan_json TEXT);
+        """)
+        connection.execute(
+            "INSERT INTO maintenance_schema_migrations VALUES(?,?,?,?)",
+            (version, name, checksum, "2026-08-03T00:00:00Z"),
+        )
+        connection.execute(
+            "INSERT INTO maintenance_plans(id,plan_json) VALUES('legacy-interrupted','{\"step\":\"prepare\"}')"
+        )
+
+        self.assertEqual(install_maintenance_schema(connection), SCHEMA_VERSION)
+
+        plan_columns = {item["name"] for item in connection.execute("PRAGMA table_info(maintenance_plans)")}
+        self.assertTrue({"target_manifest_json", "lifecycle_state", "state_revision"}.issubset(plan_columns))
+        self.assertEqual(
+            connection.execute("SELECT plan_json FROM maintenance_plans WHERE id='legacy-interrupted'").fetchone()[0],
+            '{"step":"prepare"}',
+        )
+        self.assertIsNotNone(connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='ux_maintenance_plans_idempotency'"
+        ).fetchone())
+        self.assertIsNotNone(connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='maintenance_plan_immutable_content'"
+        ).fetchone())
+        self.assertEqual(
+            [row["version"] for row in connection.execute(
+                "SELECT version FROM maintenance_schema_migrations ORDER BY version"
+            )],
+            [1, 2, 3],
+        )
 
     def test_checksum_mismatch_fails_closed(self):
         connection = base_connection()
@@ -338,6 +387,211 @@ class MaintenanceRepositoryTests(unittest.TestCase):
         first_log = self.connection.execute("SELECT log FROM runs WHERE id=1").fetchone()[0]
         self.repository.prepare_startup_recovery()
         self.assertEqual(self.connection.execute("SELECT log FROM runs WHERE id=1").fetchone()[0], first_log)
+
+    def test_restored_checkpoint_recovery_is_idempotent_before_any_remote_cleanup(self):
+        plan = self.create_plan("backup-recovery", initial_state=MaintenanceState.READY, run_id=1)
+        executing = self.repository.transition_plan(plan.id, plan.state_revision, MaintenanceState.EXECUTING)
+        self.repository.record_checkpoint(
+            plan_id=executing.id,
+            checkpoint_key="signed-executor",
+            sequence=0,
+            side_effect_state=SideEffectState.PREPARED,
+            payload={"manifest": "sha256:fixture", "token": "must-not-store"},
+            observation={"boot_id": "before"},
+        )
+        self.connection.commit()
+
+        with tempfile.TemporaryDirectory() as root:
+            backup_path = Path(root) / "control.db"
+            backup = sqlite3.connect(backup_path)
+            try:
+                self.connection.backup(backup)
+            finally:
+                backup.close()
+
+            restored = sqlite3.connect(backup_path)
+            restored.row_factory = sqlite3.Row
+            restored.execute("PRAGMA foreign_keys = ON")
+            self.addCleanup(restored.close)
+            recovered = MaintenanceRepository(restored)
+
+            first = recovered.prepare_startup_recovery()
+            second = recovered.prepare_startup_recovery()
+
+            self.assertEqual(first.protected_run_ids, frozenset({1}))
+            self.assertEqual(second.transitioned_plan_ids, ())
+            self.assertEqual(
+                recovered.get_plan(executing.id).lifecycle_state,
+                MaintenanceState.RECOVERY_REQUIRED,
+            )
+            checkpoint = recovered.latest_checkpoint(executing.id)
+            self.assertIsNotNone(checkpoint)
+            assert checkpoint is not None
+            self.assertEqual(checkpoint.payload["token"], "[REDACTED]")
+            self.assertEqual(
+                restored.execute("SELECT status FROM runs WHERE id=1").fetchone()["status"],
+                "recovery_required",
+            )
+
+    def test_startup_recovery_closes_only_checkpoint_proven_complete(self):
+        plan = self.create_plan("startup-complete", initial_state=MaintenanceState.READY, run_id=1)
+        plan = self.repository.transition_plan(plan.id, plan.state_revision, MaintenanceState.EXECUTING)
+        checkpoint = self.repository.record_checkpoint(
+            plan_id=plan.id,
+            checkpoint_key="workload.restarted",
+            sequence=1,
+            side_effect_state=SideEffectState.MAY_HAVE_STARTED,
+            payload={"workload": "redacted"},
+        )
+        self.connection.execute(
+            "UPDATE maintenance_checkpoints SET recovery_evidence_json=? WHERE id=?",
+            (json.dumps({
+                source: {
+                    "observation_complete": True,
+                    "observed_fingerprint": "after",
+                    "before_fingerprint": "before",
+                    "after_fingerprint": "after",
+                }
+                for source in ("host", "workload", "observability", "elasticsearch")
+            }), checkpoint.id),
+        )
+
+        startup = self.repository.prepare_startup_recovery()
+
+        self.assertEqual(startup.protected_run_ids, frozenset())
+        self.assertEqual(startup.classifications[0].classification, StartupRecoveryClassification.COMPLETE)
+        self.assertEqual(self.repository.get_plan(plan.id).lifecycle_state, MaintenanceState.SUCCEEDED)
+        self.assertEqual(self.connection.execute("SELECT status FROM runs WHERE id=1").fetchone()[0], "succeeded")
+        classified = self.repository.latest_checkpoint(plan.id)
+        assert classified is not None
+        self.assertEqual(classified.recovery_classification, "complete")
+        self.assertEqual(classified.recovery_reason_code, "after_state_observed")
+
+    def test_startup_recovery_uses_all_named_projections_and_fails_closed(self):
+        plan = self.create_plan("startup-incomplete", initial_state=MaintenanceState.READY, run_id=1)
+        plan = self.repository.transition_plan(plan.id, plan.state_revision, MaintenanceState.EXECUTING)
+        self.repository.record_checkpoint(
+            plan_id=plan.id,
+            checkpoint_key="workload.prepared",
+            sequence=1,
+            side_effect_state=SideEffectState.PREPARED,
+            payload={},
+        )
+
+        class Projection:
+            def __init__(self, source, *, complete=True, identity_matches=True):
+                self.source = source
+                self.complete = complete
+                self.identity_matches = identity_matches
+
+            def observe(self, _plan, _checkpoint):
+                return RecoveryProjectionResult(
+                    source=self.source,
+                    complete=self.complete,
+                    observed_fingerprint="before" if self.complete else None,
+                    before_fingerprint="before",
+                    after_fingerprint="after",
+                    identity_matches=self.identity_matches,
+                )
+
+        coordinator = MaintenanceStartupRecoveryCoordinator(
+            self.repository,
+            RecoveryProjectionBundle(
+                host=Projection("host"),
+                workload=Projection("workload"),
+                observability=Projection("observability", complete=False),
+                elasticsearch=Projection("elasticsearch"),
+            ),
+        )
+
+        startup = self.repository.prepare_startup_recovery(coordinator)
+
+        self.assertEqual(startup.protected_run_ids, frozenset({1}))
+        self.assertEqual(startup.classifications[0].classification, StartupRecoveryClassification.AMBIGUOUS)
+        self.assertEqual(startup.classifications[0].sources, ("host", "workload", "observability", "elasticsearch"))
+        self.assertEqual(self.repository.get_plan(plan.id).lifecycle_state, MaintenanceState.RECOVERY_REQUIRED)
+        checkpoint = self.repository.latest_checkpoint(plan.id)
+        assert checkpoint is not None
+        self.assertEqual(checkpoint.recovery_reason_code, "projection_incomplete")
+
+    def test_startup_recovery_marks_prepared_checkpoint_incomplete_and_resumable(self):
+        plan = self.create_plan("startup-resumable", initial_state=MaintenanceState.READY, run_id=1)
+        plan = self.repository.transition_plan(plan.id, plan.state_revision, MaintenanceState.EXECUTING)
+        self.repository.record_checkpoint(
+            plan_id=plan.id,
+            checkpoint_key="workload.prepared",
+            sequence=1,
+            side_effect_state=SideEffectState.PREPARED,
+            payload={},
+        )
+
+        class Projection:
+            def __init__(self, source):
+                self.source = source
+
+            def observe(self, _plan, _checkpoint):
+                return RecoveryProjectionResult(
+                    source=self.source,
+                    complete=True,
+                    observed_fingerprint="before",
+                    before_fingerprint="before",
+                    after_fingerprint="after",
+                )
+
+        coordinator = MaintenanceStartupRecoveryCoordinator(
+            self.repository,
+            RecoveryProjectionBundle(*(Projection(source) for source in (
+                "host", "workload", "observability", "elasticsearch",
+            ))),
+        )
+
+        startup = self.repository.prepare_startup_recovery(coordinator)
+
+        self.assertEqual(startup.classifications[0].classification, StartupRecoveryClassification.INCOMPLETE)
+        self.assertTrue(startup.classifications[0].resumable)
+        checkpoint = self.repository.latest_checkpoint(plan.id)
+        assert checkpoint is not None
+        self.assertEqual(checkpoint.recovery_classification, "incomplete")
+        self.assertTrue(checkpoint.resumable)
+
+    def test_startup_recovery_marks_non_idempotent_started_checkpoint_recovery_required(self):
+        plan = self.create_plan("startup-unsafe", initial_state=MaintenanceState.READY, run_id=1)
+        plan = self.repository.transition_plan(plan.id, plan.state_revision, MaintenanceState.EXECUTING)
+        self.repository.record_checkpoint(
+            plan_id=plan.id,
+            checkpoint_key="workload.started",
+            sequence=1,
+            side_effect_state=SideEffectState.MAY_HAVE_STARTED,
+            payload={},
+        )
+
+        class Projection:
+            def __init__(self, source):
+                self.source = source
+
+            def observe(self, _plan, _checkpoint):
+                return RecoveryProjectionResult(
+                    source=self.source,
+                    complete=True,
+                    observed_fingerprint="before",
+                    before_fingerprint="before",
+                    after_fingerprint="after",
+                )
+
+        coordinator = MaintenanceStartupRecoveryCoordinator(
+            self.repository,
+            RecoveryProjectionBundle(*(Projection(source) for source in (
+                "host", "workload", "observability", "elasticsearch",
+            ))),
+        )
+
+        startup = self.repository.prepare_startup_recovery(coordinator)
+
+        self.assertEqual(startup.classifications[0].classification, StartupRecoveryClassification.RECOVERY_REQUIRED)
+        checkpoint = self.repository.latest_checkpoint(plan.id)
+        assert checkpoint is not None
+        self.assertEqual(checkpoint.recovery_classification, "recovery_required")
+        self.assertFalse(checkpoint.resumable)
 
     def test_conflict_observation_is_scoped_read_only_deterministic_and_redacted(self):
         self.connection.execute(

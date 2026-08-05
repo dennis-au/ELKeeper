@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import Field, field_validator
 
-from .lifecycle import MaintenanceState, redact_structure
+from .lifecycle import MaintenanceState, canonical_hash, redact_structure
 from .models import (
     AvailabilityMode,
     ClusterObservation,
@@ -25,8 +25,10 @@ from .models import (
     RollbackBoundary,
     SourceObservation,
     WorkloadObservation,
+    MaintenancePlanPreviewInput,
+    PreviewOperation,
 )
-from .planning import compile_plan
+from .planning import canonical_hash, compile_plan
 from .safety import calculate_impact, evaluate_predicates
 from .store import IdempotencyConflict, MaintenanceRepository, PlanRecord, iso_timestamp, utc_now
 
@@ -63,6 +65,39 @@ class HostRebootPlanRequest(FrozenModel):
         if not reason:
             raise ValueError("reason must not be blank")
         return reason
+
+
+def generic_preview_idempotency_key(
+    request: MaintenancePlanPreviewInput,
+    *,
+    requested_by: str,
+) -> str:
+    """Return the stable idempotency key for a public preview request."""
+    return request.idempotency_key or canonical_hash({
+        "operation": request.operation.value,
+        "node_id": getattr(request, "node_id", None),
+        "cluster_id": getattr(request, "cluster_id", None),
+        "assignment_ids": list(getattr(request, "assignment_ids", ())),
+        "current_version": getattr(request, "current_version", None),
+        "target_version": getattr(request, "target_version", None),
+        "reason": request.reason,
+        "availability_mode": request.availability_mode.value,
+        "requested_by": requested_by,
+    })
+
+
+def same_generic_preview_request(record: PlanRecord, request: MaintenancePlanPreviewInput) -> bool:
+    """Check a repeat request without recollecting live observations."""
+    target = record.plan.get("target", {}) if isinstance(record.plan, dict) else {}
+    return bool(
+        target.get("operation") == MaintenancePlanningService._internal_operation(request.operation.value)
+        and target.get("reason") == request.reason
+        and target.get("availability_mode") == request.availability_mode.value
+        and target.get("cluster_id") == getattr(request, "cluster_id", None)
+        and tuple(target.get("assignment_ids", ())) == tuple(getattr(request, "assignment_ids", ()))
+        and target.get("current_version") == getattr(request, "current_version", None)
+        and target.get("target_version") == getattr(request, "target_version", None)
+    )
 
 
 def build_host_reboot_snapshot(
@@ -237,7 +272,9 @@ def serialize_plan_preview(record: PlanRecord, *, now: datetime | None = None) -
         item.get("cluster_id"): item for item in cluster_impacts if isinstance(item, dict)
     }
     current_time = (now or utc_now()).astimezone(timezone.utc)
-    expires_at = compiled.get("expires_at", record.expires_at)
+    # The durable column is authoritative: tests, recovery, and retention may
+    # update it after the immutable compiled payload was created.
+    expires_at = record.expires_at
     expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
     fresh_predicate = next(
         (
@@ -350,15 +387,44 @@ def serialize_plan_preview(record: PlanRecord, *, now: datetime | None = None) -
             "state": "pending",
             "target": str(scope) if scope is not None else None,
         })
+    operation_kind = str(target.get("operation", record.operation_kind)) if isinstance(target, dict) else record.operation_kind
+    target_cluster_id = target.get("cluster_id") if isinstance(target, dict) else record.target_cluster_id
+    target_assignment_ids = target.get("assignment_ids", ()) if isinstance(target, dict) else ()
+    if target_cluster_id is not None:
+        target_view = {
+            "kind": "cluster",
+            "name": cluster_names.get(target_cluster_id, f"cluster-{target_cluster_id}"),
+        }
+    elif target_assignment_ids:
+        assignment = next((item for item in workloads if isinstance(item, dict) and item.get("assignment_id") == target_assignment_ids[0]), {})
+        target_view = {
+            "kind": "workload",
+            "name": assignment.get("name") or f"assignment-{target_assignment_ids[0]}",
+        }
+    else:
+        target_view = {
+            "kind": "host",
+            "name": target_host.get("name") or f"node-{target_node_id}",
+        }
+    operation_label = {
+        "reboot": "Reboot host",
+        "manual_maintenance": "Manual maintenance",
+        "resource_change": "Resource change",
+        "settings_change": "Cluster settings",
+        "zoning_change": "Zoning change",
+        "workload_restart": "Workload restart",
+        "apply": "Apply workload",
+        "detach": "Detach workload",
+        "purge": "Purge workload",
+        "download": "Download images",
+        "upgrade": "Upgrade cluster",
+    }.get(operation_kind, _display_title(operation_kind.replace("_", " ")).title())
     view = {
         "header": {
             "planId": record.id,
             "state": record.lifecycle_state.value,
-            "target": {
-                "kind": "host",
-                "name": target_host.get("name") or f"node-{target_node_id}",
-            },
-            "operation": "Reboot host",
+            "target": target_view,
+            "operation": operation_label,
             "reason": target.get("reason", "") if isinstance(target, dict) else "",
             "requester": record.requested_by,
             "createdAt": compiled.get("created_at", record.created_at),
@@ -551,3 +617,160 @@ class MaintenancePlanningService:
             connection.execute("RELEASE SAVEPOINT maintenance_preview_create")
             raise
         return serialize_plan_preview(persisted, now=self.clock())
+
+    def create_generic_preview(
+        self,
+        data: HostRebootPlanningData,
+        request: MaintenancePlanPreviewInput,
+        *,
+        requested_by: str,
+    ) -> dict:
+        """Compile and persist a non-mutating preview for any public target.
+
+        This intentionally shares the reboot observation and persistence
+        contracts. It only writes the maintenance plan, step, and audit rows;
+        no run, lock, host, workload, cluster, or remote state is changed.
+        """
+        public_operation = request.operation.value
+        idempotency_key = generic_preview_idempotency_key(request, requested_by=requested_by)
+        existing = self.repository.get_plan_by_idempotency_key(idempotency_key)
+        if existing:
+            if not same_generic_preview_request(existing, request):
+                raise IdempotencyConflict("Idempotency key was already used for a different maintenance preview")
+            return serialize_plan_preview(existing, now=self.clock())
+
+        operation = self._internal_operation(public_operation)
+        target = PlanningTarget(
+            operation=operation,
+            # The anchor host is an observation scope, not a requested
+            # mutation target. Keeping it in the compiled target preserves
+            # existing predicate and response contracts.
+            node_id=data.target_node_id,
+            cluster_id=getattr(request, "cluster_id", None),
+            assignment_ids=tuple(getattr(request, "assignment_ids", ())),
+            reason=request.reason,
+            availability_mode=request.availability_mode,
+            current_version=getattr(request, "current_version", None),
+            target_version=getattr(request, "target_version", None),
+        )
+        affected_cluster_ids = set(item.cluster_id for item in data.workloads if item.node_id == data.target_node_id)
+        affected_cluster_ids.update(item.cluster_id for item in data.workloads if item.assignment_id in target.assignment_ids)
+        if target.cluster_id is not None:
+            affected_cluster_ids.add(target.cluster_id)
+        policies = tuple(
+            PolicyObservation(
+                cluster_id=cluster_id,
+                revision=(record.revision if (record := self.repository.get_policy(cluster_id)) else 0),
+                policy=MaintenancePolicy.model_validate(record.policy if record else {}),
+            )
+            for cluster_id in sorted(affected_cluster_ids)
+        )
+        snapshot = build_host_reboot_snapshot(data, policies)
+        effective_policy = _effective_policy(policies)
+        impact = _impact_for_policies(snapshot, target, policies, effective_policy)
+        now = self.clock().astimezone(timezone.utc)
+        predicates = evaluate_predicates(snapshot, target, effective_policy, impact, now=now)
+        steps = self._generic_steps(target, impact)
+        compiled = compile_plan(
+            target=target,
+            policy=effective_policy,
+            policy_revision=max((item.revision for item in policies), default=0),
+            backend=_backend(snapshot, impact.affected_cluster_ids),
+            observation=snapshot,
+            predicates=predicates,
+            impact=impact,
+            steps=steps,
+            rollback_boundaries=(RollbackBoundary(
+                before_step=max(1, next((item.sequence for item in steps if item.kind == "apply-preview-boundary"), 1)),
+                behavior="No remote side effect has started; discard this preview and create a fresh plan.",
+            ),),
+            created_at=now,
+            idempotency_key=idempotency_key,
+        )
+        state = MaintenanceState.BLOCKED if any(item.outcome == PredicateOutcome.BLOCKED for item in predicates) else MaintenanceState.READY
+        revision_map = {item.assignment_id: item.revision for item in snapshot.assignment_revisions}
+        target_revisions = [
+            {"assignment_id": assignment_id, "revision": revision_map.get(assignment_id)}
+            for assignment_id in target.assignment_ids
+        ]
+        assignment_cluster_ids = {
+            item.cluster_id for item in snapshot.workloads if item.assignment_id in target.assignment_ids
+        }
+        persisted_cluster_id = target.cluster_id
+        if persisted_cluster_id is None and len(assignment_cluster_ids) == 1:
+            persisted_cluster_id = next(iter(assignment_cluster_ids))
+        payload = compiled.model_dump(mode="json")
+        connection = self.repository.connection
+        connection.execute("SAVEPOINT maintenance_generic_preview_create")
+        try:
+            persisted = self.repository.create_plan(
+                operation_kind=operation.value,
+                plan=payload,
+                idempotency_key=idempotency_key,
+                requested_by=requested_by,
+                expires_at=compiled.expires_at,
+                observation=compiled.observation.model_dump(mode="json"),
+                target_node_id=data.target_node_id,
+                target_cluster_id=persisted_cluster_id,
+                target_assignment_id=(target.assignment_ids[0] if len(target.assignment_ids) == 1 else None),
+                expected_policy_revision=(compiled.policy_revision if len(policies) == 1 else None),
+                expected_assignment_revision=(target_revisions[0]["revision"] if len(target_revisions) == 1 else None),
+                observed_at=iso_timestamp(snapshot.captured_at),
+                target_manifest={
+                    "authoritative_plan_hash": compiled.plan_hash,
+                    "affected_cluster_ids": list(impact.affected_cluster_ids),
+                    "assignment_revisions": target_revisions,
+                    "public_operation": public_operation,
+                },
+                initial_state=state,
+                authoritative_plan_hash=compiled.plan_hash,
+            )
+            for step in compiled.steps:
+                self.repository.create_step(
+                    plan_id=persisted.id,
+                    step_key=f"preview:{step.sequence}:{step.kind}",
+                    sequence=step.sequence,
+                    step_kind=step.kind,
+                    affected_cluster_id=step.cluster_id,
+                    affected_assignment_id=step.assignment_id,
+                    affected_node_id=step.node_id,
+                )
+            self.repository.record_audit(
+                username=requested_by,
+                action="maintenance-plan-preview-created",
+                item_id=persisted.id,
+                detail={"operation": public_operation, "result": state.value, "plan_hash": compiled.plan_hash},
+            )
+            connection.execute("RELEASE SAVEPOINT maintenance_generic_preview_create")
+        except Exception:
+            connection.execute("ROLLBACK TO SAVEPOINT maintenance_generic_preview_create")
+            connection.execute("RELEASE SAVEPOINT maintenance_generic_preview_create")
+            raise
+        return serialize_plan_preview(persisted, now=self.clock())
+
+    @staticmethod
+    def _internal_operation(value: str) -> OperationKind:
+        return {
+            PreviewOperation.REBOOT.value: OperationKind.REBOOT,
+            PreviewOperation.MANUAL_MAINTENANCE.value: OperationKind.MANUAL_MAINTENANCE,
+            PreviewOperation.RESOURCE_CHANGE.value: OperationKind.RESOURCE_CHANGE,
+            PreviewOperation.CLUSTER_SETTINGS.value: OperationKind.SETTINGS_CHANGE,
+            PreviewOperation.ZONING.value: OperationKind.ZONING_CHANGE,
+            PreviewOperation.APPLY.value: OperationKind.APPLY,
+            PreviewOperation.DETACH.value: OperationKind.DETACH,
+            PreviewOperation.PURGE.value: OperationKind.PURGE,
+            PreviewOperation.DOWNLOAD.value: OperationKind.DOWNLOAD,
+            PreviewOperation.UPGRADE.value: OperationKind.UPGRADE,
+        }[value]
+
+    @staticmethod
+    def _generic_steps(target: PlanningTarget, impact: ImpactManifest) -> tuple[PlanStep, ...]:
+        steps = [
+            PlanStep(sequence=1, kind="acquire-maintenance-locks", summary="Acquire locks after this preview is explicitly approved.", node_id=target.node_id),
+            PlanStep(sequence=2, kind="refresh-observations", summary="Refresh host, workload, and cluster observations.", node_id=target.node_id),
+            PlanStep(sequence=3, kind="evaluate-safety-predicates", summary="Re-evaluate safety predicates against fresh observations.", node_id=target.node_id),
+        ]
+        scope = target.cluster_id or (target.assignment_ids[0] if target.assignment_ids else target.node_id)
+        steps.append(PlanStep(sequence=4, kind="apply-preview-boundary", summary="Validate the selected operation without performing it.", cluster_id=target.cluster_id, assignment_id=(target.assignment_ids[0] if target.assignment_ids else None), node_id=target.node_id))
+        steps.append(PlanStep(sequence=5, kind="release-maintenance-locks", summary="Release any locks if execution is later approved.", node_id=target.node_id))
+        return tuple(steps)

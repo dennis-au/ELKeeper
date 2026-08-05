@@ -323,6 +323,27 @@
   },
   {
     "file": "app/modules/maintenance/api.py",
+    "handler": "preview_evacuation",
+    "method": "POST",
+    "owner": "maintenance",
+    "path": "/api/maintenance/evacuation/preview"
+  },
+  {
+    "file": "app/modules/maintenance/api.py",
+    "handler": "list_maintenance_plans",
+    "method": "GET",
+    "owner": "maintenance",
+    "path": "/api/maintenance/plans"
+  },
+  {
+    "file": "app/modules/maintenance/api.py",
+    "handler": "create_maintenance_plan_preview",
+    "method": "POST",
+    "owner": "maintenance",
+    "path": "/api/maintenance/plans/preview"
+  },
+  {
+    "file": "app/modules/maintenance/api.py",
     "handler": "get_maintenance_plan",
     "method": "GET",
     "owner": "maintenance",
@@ -404,6 +425,27 @@
     "method": "POST",
     "owner": "hosts",
     "path": "/api/nodes/{node_id}/legacy-known-hosts/remove"
+  },
+  {
+    "file": "app/modules/maintenance/api.py",
+    "handler": "get_manual_maintenance_mode",
+    "method": "GET",
+    "owner": "hosts",
+    "path": "/api/nodes/{node_id}/maintenance-mode"
+  },
+  {
+    "file": "app/modules/maintenance/api.py",
+    "handler": "enter_manual_maintenance_mode",
+    "method": "POST",
+    "owner": "hosts",
+    "path": "/api/nodes/{node_id}/maintenance-mode/enter"
+  },
+  {
+    "file": "app/modules/maintenance/api.py",
+    "handler": "exit_manual_maintenance_mode",
+    "method": "POST",
+    "owner": "hosts",
+    "path": "/api/nodes/{node_id}/maintenance-mode/exit"
   },
   {
     "file": "app/modules/maintenance/api.py",

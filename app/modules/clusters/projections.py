@@ -38,6 +38,7 @@ class ClusterProjectionService:
         provider_payload: Callable[[Any, str | None], dict],
         open_config: Callable[[str], dict],
         redacted_config: Callable[[dict], dict],
+        workload_maintenance_progress: Callable[[Any, tuple[int, ...]], dict[int, dict]] | None = None,
     ) -> dict:
         cluster = self._clusters.record_in_connection(self._connection, cluster_id)
         if not cluster:
@@ -107,6 +108,11 @@ class ClusterProjectionService:
         observations = self._versions.observations_for_assignments_in_connection(
             self._connection, assignment_ids
         )
+        maintenance_progress = (
+            workload_maintenance_progress(self._connection, tuple(assignment_ids))
+            if workload_maintenance_progress is not None
+            else {}
+        )
         assignment_hosts = self._hosts.records_for_ids_in_connection(
             self._connection, [int(assignment["node_id"]) for assignment in assignments]
         )
@@ -116,8 +122,7 @@ class ClusterProjectionService:
             key=lambda value: (assignment_hosts.get(int(value["node_id"]), {}).get("name", ""), value["role"]),
         ):
             observation = observations.get(int(assignment["id"]))
-            result["assignments"].append(
-                {
+            item = {
                     "id": assignment["id"],
                     "cluster_id": assignment["cluster_id"],
                     "node_id": assignment["node_id"],
@@ -150,5 +155,8 @@ class ClusterProjectionService:
                         else {"state": "disabled", "error": ""}
                     ),
                 }
-            )
+            progress = maintenance_progress.get(int(assignment["id"]))
+            if progress is not None:
+                item["maintenance"] = progress
+            result["assignments"].append(item)
         return result

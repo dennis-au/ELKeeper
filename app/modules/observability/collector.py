@@ -216,12 +216,19 @@ class TelemetryManager:
 
     def _record_workload_runtime(self, node_id, containers):
         by_name = {item["name"]: item for item in containers}
+        by_assignment = {}
+        for item in containers:
+            labels = item.get("labels") or {}
+            assignment_id = labels.get("io.elastic-control.assignment-id")
+            role = labels.get("io.elastic-control.role")
+            if assignment_id and role:
+                by_assignment[(str(assignment_id), str(role))] = item
         assignments = self._deps.workload_repository(self._deps.db_factory).active_for_node(node_id)
         clusters = self._deps.cluster_repository(self._deps.db_factory)
         versions = self._deps.version_repository(self._deps.db_factory)
         for assignment in assignments:
             name = self._deps.workload_name({"slug": clusters.slug(assignment["cluster_id"])}, assignment)
-            container = by_name.get(name)
+            container = by_assignment.get((str(assignment["id"]), str(assignment["role"]))) or by_name.get(name)
             image = container.get("image", "") if container else ""
             digest = container.get("digest", "") if container else ""
             version = self._deps.image_version(image)

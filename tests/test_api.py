@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 from email.message import Message
@@ -42,6 +43,10 @@ class ApiTests(unittest.TestCase):
             con.execute("DELETE FROM controller_ssh_keys")
             con.execute("DELETE FROM workload_change_batches")
             con.execute("DELETE FROM cluster_zoning_observations")
+            # Plans deliberately hold immutable references to their workload
+            # targets. Clear the isolated test plans before resetting those
+            # targets so one planning test cannot affect the next API case.
+            con.execute("DELETE FROM maintenance_plans")
             con.execute("UPDATE runs SET status='failed', finished_at=CURRENT_TIMESTAMP WHERE status IN ('queued','running','recovery_required')")
             con.execute("DELETE FROM cluster_assignments")
             con.execute("DELETE FROM memberships")
@@ -1198,6 +1203,51 @@ class ApiTests(unittest.TestCase):
         self.assertIn("198.51.100.102 -> 198.51.100.103:19301/tcp (TLS)", diagram)
         self.assertTrue(all(len(line) <= 80 for line in diagram.splitlines()))
 
+    def test_cluster_and_topology_surface_workload_maintenance_progress(self):
+        from app.modules.maintenance.workload_contracts import (
+            DisruptionBudget,
+            WorkloadMaintenancePlanInput,
+            WorkloadMaintenanceTarget,
+            WorkloadOperation,
+            WorkloadRole,
+        )
+        from app.modules.maintenance.workload_engine import WorkloadMaintenancePlanService
+
+        headers = self.login()
+        node_id = self.node(headers)
+        cluster_id = self.cluster(headers)
+        self.assertEqual(self.membership(headers, cluster_id, node_id).status_code, 201)
+        assignment = self.client.post(
+            f"/api/clusters/{cluster_id}/assignments",
+            headers=headers,
+            json={"node_id": node_id, "role": "kibana", "config": {"cpu": "1", "memory": "2g", "storage_path": "/srv/progress/kibana"}},
+        ).json()
+        with self.main.db() as connection:
+            WorkloadMaintenancePlanService(self.main.MaintenanceStore(connection)).create_preview(
+                WorkloadMaintenancePlanInput(
+                    target=WorkloadMaintenanceTarget(
+                        assignment_id=assignment["id"],
+                        cluster_id=cluster_id,
+                        node_id=node_id,
+                        role=WorkloadRole.KIBANA,
+                        operation=WorkloadOperation.RESTART,
+                        expected_name="ecp-progress-kibana",
+                        expected_image="docker.elastic.co/kibana/kibana:8.19.1",
+                        budget=DisruptionBudget(available_before=2, minimum_ready=1),
+                    ),
+                    reason="Inspect planned workload maintenance",
+                    idempotency_key="api-workload-progress",
+                ),
+                requested_by="operator",
+            )
+
+        cluster = self.client.get(f"/api/clusters/{cluster_id}", headers=headers).json()
+        progress = cluster["assignments"][0]["maintenance"]
+        self.assertEqual(progress["lifecycle_state"], "blocked")
+        self.assertFalse(progress["execution_enabled"])
+        diagram = self.client.get(f"/api/clusters/{cluster_id}/topology", headers=headers).json()["topology"]
+        self.assertIn("Maintenance: blocked", diagram)
+
     def test_cluster_monitoring_credential_is_encrypted_and_metricbeat_versions_are_required(self):
         headers = self.login()
         cluster_id = self.cluster(headers)
@@ -1342,6 +1392,104 @@ class ApiTests(unittest.TestCase):
             result = self.client.post(f"/api/clusters/{cluster_id}/upgrades", headers=headers, json={"target_version": "8.20.0"})
         self.assertEqual(result.status_code, 422)
         self.assertIn("three healthy master-eligible", result.json()["detail"])
+
+    def test_upgrade_is_blocked_by_an_active_maintenance_plan_before_preflight(self):
+        from app.modules.maintenance.store import MaintenanceRepository
+
+        headers = self.login()
+        node_id = self.node(headers)
+        cluster_id = self.cluster(headers)
+        self.assertEqual(self.membership(headers, cluster_id, node_id).status_code, 201)
+        with self.main.db() as connection:
+            plan = MaintenanceRepository(connection).create_plan(
+                operation_kind="upgrade",
+                plan={"target": {"operation": "upgrade", "cluster_id": cluster_id}},
+                observation={},
+                idempotency_key="upgrade-maintenance-conflict",
+                requested_by="operator",
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                target_cluster_id=cluster_id,
+                initial_state="ready",
+            )
+        try:
+            with patch.object(self.main, "available_versions", return_value=["8.20.0"]):
+                result = self.client.post(
+                    f"/api/clusters/{cluster_id}/upgrades",
+                    headers=headers,
+                    json={"target_version": "8.20.0"},
+                )
+        finally:
+            with self.main.db() as connection:
+                connection.execute("DELETE FROM maintenance_plans WHERE id=?", (plan.id,))
+        self.assertEqual(result.status_code, 409)
+        self.assertIn("maintenance", result.json()["detail"].lower())
+
+    def test_upgrade_persists_a_fail_closed_maintenance_plan_without_launching_remote_work(self):
+        headers = self.login()
+        cluster_id = self.cluster(headers)
+        assignments = []
+        for index in range(3):
+            node_id = self.node(
+                headers,
+                name=f"upgrade-master-{index}",
+                address=f"192.0.2.{110 + index}",
+            )
+            self.assertEqual(
+                self.membership(
+                    headers,
+                    cluster_id,
+                    node_id,
+                    user_address=f"192.0.2.{110 + index}",
+                    data_address=f"198.51.100.{110 + index}",
+                ).status_code,
+                201,
+            )
+            assignment = self.client.post(f"/api/clusters/{cluster_id}/assignments", headers=headers, json={
+                "node_id": node_id,
+                "role": "master",
+                "config": {"cpu": "2", "memory": "4g", "storage_path": f"/srv/upgrade/master-{index}"},
+            }).json()["id"]
+            assignments.append(assignment)
+            self.main.record_observation(
+                {"assignment_id": assignment},
+                "ECP_VERSION=%s|1|docker.elastic.co/elasticsearch/elasticsearch:8.19.0|sha256:%s\n"
+                % (assignment, "a" * 64),
+                True,
+            )
+        digest_map = {assignment: "sha256:" + "b" * 64 for assignment in assignments}
+        body = None
+        try:
+            with (
+                patch.object(self.main, "available_versions", return_value=["8.20.0"]),
+                patch.object(self.main, "target_image_digests", return_value=digest_map),
+                patch.object(self.main, "launch_upgrade") as launch,
+            ):
+                result = self.client.post(
+                    f"/api/clusters/{cluster_id}/upgrades",
+                    headers=headers,
+                    json={"target_version": "8.20.0"},
+                )
+            self.assertEqual(result.status_code, 200)
+            body = result.json()
+            self.assertIn("run_id", body)
+            self.assertIn("plan_id", body)
+            self.assertFalse(body["execution_enabled"])
+            self.assertIn("maintenance_upgrade_execution_disabled", body["blockers"])
+            launch.assert_not_called()
+            with self.main.db() as connection:
+                plan = connection.execute(
+                    "SELECT lifecycle_state,target_manifest_json FROM maintenance_plans WHERE id=?",
+                    (body["plan_id"],),
+                ).fetchone()
+                run = connection.execute("SELECT status,command_json FROM runs WHERE id=?", (body["run_id"],)).fetchone()
+            self.assertEqual(plan["lifecycle_state"], "blocked")
+            self.assertIn(body["manifest_hash"], plan["target_manifest_json"])
+            self.assertEqual((run["status"], run["command_json"]), ("succeeded", "[]"))
+        finally:
+            if body:
+                with self.main.db() as connection:
+                    connection.execute("DELETE FROM maintenance_plans WHERE id=?", (body["plan_id"],))
+                    connection.execute("DELETE FROM runs WHERE id=?", (body["run_id"],))
 
     def test_version_rendering_and_download_only_are_present(self):
         playbook = Path(self.main.PLAYBOOKS / "cluster-reconcile.yml").read_text()

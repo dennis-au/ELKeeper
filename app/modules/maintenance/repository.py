@@ -14,9 +14,42 @@ import json
 import sqlite3
 from typing import Any, Callable, Iterator, Mapping
 
-from app.modules.platform import update_run_status_in_connection
+from app.modules.platform import open_config, update_run_status_in_connection
 
 from .lifecycle import LockScope
+
+
+def _memory_bytes(value: object) -> int | None:
+    """Parse the persisted workload memory form without exposing its config."""
+
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if len(text) < 2 or text[-1] not in {"k", "m", "g", "t"}:
+        return None
+    try:
+        amount = float(text[:-1])
+    except ValueError:
+        return None
+    if amount <= 0:
+        return None
+    units = {"k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
+    return int(amount * units[text[-1]])
+
+
+def _managed_storage_path(value: object) -> bool:
+    """Recognize only the explicit non-system paths accepted by workloads."""
+
+    if (
+        not isinstance(value, str)
+        or not value.startswith("/")
+        or value == "/"
+        or ":" in value
+        or any(character.isspace() for character in value)
+    ):
+        return False
+    blocked = ("/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/proc", "/sys", "/dev", "/run", "/tmp")
+    return not any(value == path or value.startswith(path + "/") for path in blocked)
 
 
 @dataclass(frozen=True)
@@ -24,6 +57,14 @@ class HostLookup:
     id: int
     name: str
     enabled: bool
+    record: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class HostRuntimeLookup:
+    """Read-only host health projection owned by observability."""
+
+    node_id: int
     record: Mapping[str, Any]
 
 
@@ -98,6 +139,16 @@ class MaintenanceRepository:
         record = dict(row)
         return HostLookup(int(record["id"]), str(record["name"]), bool(record["enabled"]), record)
 
+    def host_runtime(self, node_id: int) -> HostRuntimeLookup | None:
+        """Return the latest durable host observation without exposing SQL."""
+
+        with self._db() as connection:
+            row = connection.execute(
+                "SELECT * FROM host_runtime_observations WHERE node_id=?",
+                (node_id,),
+            ).fetchone()
+        return HostRuntimeLookup(node_id, dict(row)) if row else None
+
     def cluster_exists(self, cluster_id: int) -> bool:
         """Check cluster existence through the maintenance read contract."""
 
@@ -132,6 +183,163 @@ class MaintenanceRepository:
                 cluster_ids,
             ).fetchall()
         return tuple(ClusterLookup(int(row["id"]), str(row["name"]), dict(row)) for row in rows)
+
+    def evacuation_inventory(
+        self,
+        *,
+        cluster_id: int,
+        source_node_id: int,
+        replacement_node_id: int | None,
+        max_surge: int,
+    ) -> dict[str, Any]:
+        """Assemble the narrow, read-only inventory used by evacuation preview.
+
+        This is an approved maintenance read projection.  It intentionally
+        exposes summarized workload resources only, never encrypted configs or
+        controller credentials, and performs no plan, run, lock, or remote I/O.
+        """
+
+        with self._db() as connection:
+            cluster_row = connection.execute("SELECT * FROM clusters WHERE id=?", (cluster_id,)).fetchone()
+            source_row = connection.execute("SELECT * FROM nodes WHERE id=?", (source_node_id,)).fetchone()
+            replacement_row = (
+                connection.execute("SELECT * FROM nodes WHERE id=?", (replacement_node_id,)).fetchone()
+                if replacement_node_id is not None
+                else None
+            )
+            source_membership = connection.execute(
+                "SELECT * FROM memberships WHERE cluster_id=? AND node_id=?",
+                (cluster_id, source_node_id),
+            ).fetchone()
+            replacement_membership = (
+                connection.execute(
+                    "SELECT * FROM memberships WHERE cluster_id=? AND node_id=?",
+                    (cluster_id, replacement_node_id),
+                ).fetchone()
+                if replacement_node_id is not None
+                else None
+            )
+            source_assignments = connection.execute(
+                "SELECT * FROM cluster_assignments WHERE cluster_id=? AND node_id=? AND state='active' ORDER BY id",
+                (cluster_id, source_node_id),
+            ).fetchall()
+            replacement_assignments = (
+                connection.execute(
+                    "SELECT * FROM cluster_assignments WHERE node_id=? AND state='active' ORDER BY id",
+                    (replacement_node_id,),
+                ).fetchall()
+                if replacement_node_id is not None
+                else []
+            )
+            related_cluster_ids = sorted({
+                cluster_id,
+                *(int(row["cluster_id"]) for row in replacement_assignments),
+            })
+            placeholders = ",".join("?" for _ in related_cluster_ids)
+            related_clusters = connection.execute(
+                "SELECT * FROM clusters WHERE id IN (" + placeholders + ") ORDER BY id",
+                related_cluster_ids,
+            ).fetchall()
+            source_runtime = connection.execute(
+                "SELECT * FROM host_runtime_observations WHERE node_id=?", (source_node_id,)
+            ).fetchone()
+            replacement_runtime = (
+                connection.execute(
+                    "SELECT * FROM host_runtime_observations WHERE node_id=?", (replacement_node_id,)
+                ).fetchone()
+                if replacement_node_id is not None
+                else None
+            )
+            source_observations = {}
+            if source_assignments:
+                assignment_ids = [int(row["id"]) for row in source_assignments]
+                observation_rows = connection.execute(
+                    "SELECT * FROM workload_observations WHERE assignment_id IN ("
+                    + ",".join("?" for _ in assignment_ids) + ")",
+                    assignment_ids,
+                ).fetchall()
+                source_observations = {int(row["assignment_id"]): dict(row) for row in observation_rows}
+
+        return {
+            "cluster": self._public_cluster_projection(cluster_row),
+            "clusters": [self._public_cluster_projection(row) for row in related_clusters],
+            "source": dict(source_row) if source_row else {},
+            "replacement": dict(replacement_row) if replacement_row else {},
+            "source_node_id": source_node_id,
+            "replacement_node_id": replacement_node_id,
+            "source_membership": dict(source_membership) if source_membership else {},
+            "replacement_membership": dict(replacement_membership) if replacement_membership else {},
+            "source_runtime": self._public_runtime_projection(source_runtime),
+            "replacement_runtime": self._public_runtime_projection(replacement_runtime),
+            "source_assignments": [
+                self._public_evacuation_assignment(row, source_observations.get(int(row["id"])))
+                for row in source_assignments
+            ],
+            "replacement_assignments": [
+                {"cluster_id": int(row["cluster_id"]), "role": str(row["role"])}
+                for row in replacement_assignments
+            ],
+            "max_surge": max_surge,
+        }
+
+    @staticmethod
+    def _public_cluster_projection(row: Any | None) -> dict[str, Any]:
+        if not row:
+            return {}
+        record = dict(row)
+        try:
+            role_ports = json.loads(record.get("role_ports_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            role_ports = {}
+        try:
+            zoning = json.loads(record.get("zoning_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            zoning = {}
+        return {
+            "id": int(record["id"]),
+            "provider_type": record.get("provider_type", "native_podman"),
+            "role_ports": role_ports,
+            "zoning": zoning,
+        }
+
+    @staticmethod
+    def _public_runtime_projection(row: Any | None) -> dict[str, Any] | None:
+        if not row:
+            return None
+        record = dict(row)
+        try:
+            interfaces = json.loads(record.get("network_interfaces_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            interfaces = {}
+        return {
+            "initialized": bool(record.get("initialized")),
+            "reachable": bool(record.get("reachable")),
+            "network_interfaces": interfaces,
+        }
+
+    @staticmethod
+    def _public_evacuation_assignment(row: Any, observation: Mapping[str, Any] | None) -> dict[str, Any]:
+        resource = {"storage_managed": False}
+        try:
+            config = json.loads(open_config(str(row["config_json"])))
+            if isinstance(config, dict):
+                cpu = config.get("cpu")
+                memory = _memory_bytes(config.get("memory"))
+                path = config.get("storage_path")
+                resource = {
+                    "cpu": cpu,
+                    "memory_bytes": memory,
+                    "storage_managed": _managed_storage_path(path),
+                }
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        return {
+            "id": int(row["id"]),
+            "cluster_id": int(row["cluster_id"]),
+            "role": str(row["role"]),
+            "resource": resource,
+            "observation": dict(observation or {}),
+        }
 
     def run(self, run_id: int) -> RunLookup | None:
         with self._db() as connection:

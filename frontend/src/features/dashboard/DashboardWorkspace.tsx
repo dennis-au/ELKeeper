@@ -242,6 +242,7 @@ export function DashboardWorkspace() {
   const dataTierZoneBreakdown = groupNodeCapacity(dataTierNodes, (node) => node.zone || 'unassigned');
   const allElasticsearchNodeCount = Math.max(safeNumber(metrics.nodes), nodeBreakdown.length);
   const accessUrls = topology?.access_urls || [];
+  const maintenanceAssignments = (selectedCluster?.assignments || []).filter((assignment) => assignment.maintenance);
   const logMonitoring = cluster?.log_monitoring || selectedCluster?.log_monitoring;
   const logsState = monitoringState(logMonitoring);
   const crossClusterHostUsage = data.cross_cluster_host_usage || [];
@@ -323,6 +324,7 @@ export function DashboardWorkspace() {
         <section className="section-band">
           <div className="section-heading"><div><EuiTitle size="s"><h2>{cluster.name}</h2></EuiTitle><HealthStatus health={cluster.health}>{healthLabel(cluster.health)}{awaitingData ? '' : ' cluster health'}</HealthStatus></div></div>
           {alerts.length > 0 && <div className="alert-stack">{alerts.map((alert, index) => <EuiCallOut key={`${alert.source}-${alert.source_id}-${index}`} size="s" title={alert.message} color={alert.severity === 'critical' ? 'danger' : 'warning'} iconType="warning" />)}</div>}
+          {maintenanceAssignments.length > 0 && <div className="alert-stack">{maintenanceAssignments.map((assignment) => <EuiCallOut key={assignment.id} size="s" title={`Maintenance plan for ${assignment.role} on ${assignment.node_name}`} color={assignment.maintenance?.lifecycle_state === 'recovery_required' || assignment.maintenance?.checkpoint?.recovery_classification === 'recovery_required' ? 'danger' : 'warning'} iconType="wrench">{assignment.maintenance?.checkpoint?.recovery_classification || assignment.maintenance?.lifecycle_state}. Execution remains gated until the applicable maintenance phase is accepted.</EuiCallOut>)}</div>}
           {awaitingData ? <EuiPanel className="dashboard-setup-state" paddingSize="l" hasBorder>
             <EuiTitle size="s"><h2>Data role required</h2></EuiTitle>
             <EuiSpacer size="s" />

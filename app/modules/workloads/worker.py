@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 from pathlib import Path
 from collections.abc import Awaitable, Callable
 
 import yaml
+
+from app.modules.maintenance.contracts import LegacyBatchRecoveryDecision
 
 
 class WorkloadChangeWorker:
@@ -32,6 +35,7 @@ class WorkloadChangeWorker:
         launch_filebeat_reconcile: Callable[[int, str], int],
         recovery_required_ids: Callable,
         reconcile_runner: Callable[[int, Path, dict, str, str], Awaitable[bool]] | None = None,
+        batch_recovery_observer: Callable[[int, dict, list[dict]], Awaitable[LegacyBatchRecoveryDecision | None] | LegacyBatchRecoveryDecision | None] | None = None,
     ):
         self._db = db_factory
         self._variables = variables_dir
@@ -50,6 +54,7 @@ class WorkloadChangeWorker:
         self._launch_filebeat = launch_filebeat_reconcile
         self._recovery_required_ids = recovery_required_ids
         self._reconcile_runner = reconcile_runner
+        self._batch_recovery_observer = batch_recovery_observer
 
     def batch_plan(self, connection, run_id: int) -> dict:
         row = self._workloads.from_connection(connection).batch(run_id)
@@ -123,6 +128,19 @@ class WorkloadChangeWorker:
                 plan = self.batch_plan(connection, run_id)
                 completed_ids = self._workloads.from_connection(connection).completed_batch_client_ids_in_connection(connection, run_id)
             completed = [item for item in plan["changes"] if item["client_id"] in completed_ids]
+            decision = await self._observe_batch_recovery(run_id, plan, completed)
+            if decision is not None:
+                self._add_log(run_id, f"Observed workload recovery state: {decision.reason}.\n")
+                if decision.classification == "recovery_required":
+                    with self._db() as connection:
+                        self._finish_run(connection, run_id, "recovery_required")
+                    return
+                if decision.classification == "rollback":
+                    allowed = set(decision.rollback_assignment_ids)
+                    completed = [
+                        item for item in plan["changes"]
+                        if item.get("assignment_id") in allowed
+                    ]
             inventory_path = self._inventory(run_id)
             if not await self.rollback(run_id, inventory_path, plan, completed):
                 return
@@ -139,6 +157,28 @@ class WorkloadChangeWorker:
         finally:
             if inventory_path:
                 inventory_path.unlink(missing_ok=True)
+
+    async def _observe_batch_recovery(
+        self,
+        run_id: int,
+        plan: dict,
+        completed: list[dict],
+    ) -> LegacyBatchRecoveryDecision | None:
+        """Use an injected observation projection when one is available.
+
+        The compatibility path intentionally retains legacy progress-based
+        recovery until application assembly provides runtime observations.  A
+        supplied projection is authoritative and may stop unsafe rollback.
+        """
+
+        if self._batch_recovery_observer is None:
+            return None
+        value = self._batch_recovery_observer(run_id, plan, completed)
+        if inspect.isawaitable(value):
+            value = await value
+        if value is not None and not isinstance(value, LegacyBatchRecoveryDecision):
+            raise TypeError("batch_recovery_observer must return LegacyBatchRecoveryDecision or None")
+        return value
 
     async def recover_all(self) -> None:
         with self._db() as connection:

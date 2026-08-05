@@ -14,7 +14,8 @@ const pages = [
   { path: '/dashboard', label: 'Dashboard' },
   { path: '/clusters', label: 'Cluster Config' },
   { path: '/hosts', label: 'Host Config' },
-  { path: '/roles', label: 'Role Assignment' },
+  { path: '/roles', label: 'Workload Placement' },
+  { path: '/maintenance', label: 'Maintenance' },
   { path: '/advanced', label: 'Advance' },
 ];
 

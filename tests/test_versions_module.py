@@ -80,6 +80,25 @@ class VersionsModuleTests(unittest.TestCase):
         )
         self.assertEqual(result, {"8.19.0"})
 
+    def test_registry_manifest_digest_requires_and_caches_an_immutable_digest(self):
+        registry = ElasticRegistry(
+            cache={}, cache_seconds=60, request_timeout=1, listing_timeout=1,
+            tag_page_size=100, tag_page_limit=1, tag_result_limit=10,
+        )
+        calls = []
+
+        def registry_json(url, headers=None):
+            calls.append((url, headers))
+            return {}, {"Docker-Content-Digest": "sha256:" + "a" * 64}
+
+        registry.json = registry_json
+        first = registry.manifest_digest("kibana/kibana", "8.20.0")
+        second = registry.manifest_digest("kibana/kibana", "8.20.0")
+        self.assertEqual(first, "sha256:" + "a" * 64)
+        self.assertEqual(second, first)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("/v2/kibana/kibana/manifests/8.20.0", calls[0][0])
+
     def test_runtime_observation_preserves_primary_fields_when_filebeat_updates(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "versions.db"

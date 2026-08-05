@@ -15,6 +15,20 @@ export interface FilebeatCompanionObservation {
   error: string;
 }
 
+export interface WorkloadMaintenanceProgress {
+  plan_id: string;
+  operation: string;
+  lifecycle_state: string;
+  execution_enabled: false;
+  execution_blockers: string[];
+  step_count: number;
+  verified_steps: number;
+  checkpoint?: {
+    recovery_classification?: string | null;
+    recovery_reason?: string | null;
+  } | null;
+}
+
 export interface Assignment {
   id: number;
   cluster_id: number;
@@ -27,6 +41,7 @@ export interface Assignment {
   config: Record<string, string>;
   observation?: WorkloadObservation;
   filebeat?: FilebeatCompanionObservation;
+  maintenance?: WorkloadMaintenanceProgress;
 }
 
 export interface AccessUrl {
