@@ -79,7 +79,7 @@ class ManualMaintenanceApiTests(unittest.TestCase):
         }
         with self.main.db() as connection:
             connection.execute(
-                "INSERT INTO host_runtime_observations(" 
+                "INSERT INTO host_runtime_observations("
                 "node_id,initialized,reachable,podman_socket_active,os_name,podman_version,observed_at,last_error"
                 ") VALUES(?,?,?,?,?,?,?,?)",
                 (node_id, int(healthy), int(healthy), int(healthy), "Test Linux", "5.8.5", value, "" if healthy else "probe failed"),
