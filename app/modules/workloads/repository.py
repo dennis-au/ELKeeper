@@ -174,6 +174,14 @@ class WorkloadRepository:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def active_in_connection(self, connection) -> list[dict]:
+        """Return all active workload-owned records for a controller projection."""
+
+        rows = connection.execute(
+            "SELECT * FROM cluster_assignments WHERE state='active' ORDER BY id"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def operation_run_ids_for_cluster_in_connection(self, connection, cluster_id: int) -> list[int]:
         rows = connection.execute(
             "SELECT operation_run_id FROM cluster_assignments WHERE cluster_id=? "
@@ -312,6 +320,38 @@ class WorkloadRepository:
             [run_id, *assignment_ids],
         )
         return cursor.rowcount == len(assignment_ids)
+
+    def claim_assignment_operation_in_connection(
+        self,
+        connection,
+        *,
+        assignment_id: int,
+        expected_revision: int,
+        run_id: int,
+    ) -> bool:
+        """Claim one unchanged active workload for a maintenance-owned run."""
+
+        cursor = connection.execute(
+            "UPDATE cluster_assignments SET operation_run_id=? "
+            "WHERE id=? AND state='active' AND revision=? AND operation_run_id IS NULL",
+            (run_id, assignment_id, expected_revision),
+        )
+        return cursor.rowcount == 1
+
+    def release_assignment_operation_in_connection(
+        self,
+        connection,
+        *,
+        assignment_id: int,
+        run_id: int,
+    ) -> bool:
+        """Release only the exact workload claim owned by a completed operation."""
+
+        cursor = connection.execute(
+            "UPDATE cluster_assignments SET operation_run_id=NULL WHERE id=? AND operation_run_id=?",
+            (assignment_id, run_id),
+        )
+        return cursor.rowcount == 1
 
     def active_batch_runs(self, cluster_ids: set[int]) -> list[dict]:
         """Return active batch run projections for conflict detection."""

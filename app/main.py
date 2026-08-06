@@ -27,15 +27,48 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import Response
-from pydantic import Field
+from pydantic import Field, SecretStr
 
 from app.modules.maintenance.store import MaintenanceRepository as MaintenanceStore, install_maintenance_schema
 from app.modules.maintenance.repository import MaintenanceRepository as MaintenanceReadRepository
 from app.modules.maintenance.models import MaintenanceBackend, ProviderType
 from app.modules.maintenance import (
+    AllocationGuardController,
+    AllocationGuardService,
+    BasicAuthCredential,
+    ClusterAllocationGuardRouter,
+    ContainerMaintenanceActionService,
+    ContainerMaintenanceService,
+    ControllerManagedHostMaintenanceRuntime,
+    ControllerManagedHostRuntime,
+    ControllerManagedServiceAvailability,
+    ControllerMaintenanceIOAdapter,
+    ControllerManagedWorkloadRuntime,
+    ElasticsearchClientConfig,
+    ElasticsearchMaintenanceClient,
+    MaintenanceExecutionService,
+    HostMaintenanceActionService,
+    HostMaintenanceRebootCoordinator,
+    HostMaintenanceRebootPredicates,
+    HostMaintenanceService,
+    MaintenanceRuntimeFlags,
+    MaintenanceWorkflowRecoveryService,
     MaintenanceUpgradePlanningService,
+    ManagedEndpointProbeTarget,
+    PooledRemoteCommandSSHRunner,
+    RebootOrchestrator,
+    RunBoundMaintenanceAnsibleRunner,
+    PostReturnCoordinator,
+    RuntimeActionResult,
     Phase2RebootAdapterFactory,
+    build_container_workflow_router,
+    build_host_workflow_router,
     workload_maintenance_progress_in_connection,
+)
+from app.modules.maintenance.runtime import (
+    CaVerifiedElasticsearchClientPool,
+    ElasticsearchPostReturnAdapter,
+    ElasticsearchRuntimeConnection,
 )
 from app.modules.maintenance.provider import (
     OwnershipState,
@@ -77,7 +110,7 @@ from app.modules.platform.command_runs import run_commands as platform_run_comma
 from app.modules.platform.integration import PlatformRunOperations
 from app.modules.platform.http import LoginPayload, build_router
 from app.modules.maintenance.http import build_router as build_maintenance_router
-from app.modules.maintenance.api import router as maintenance_router
+from app.modules.maintenance.api import capability_revision, router as maintenance_router
 from app.modules.platform.bootstrap import ControllerBootstrapService, apply_controller_schema_upgrades, bootstrap_controller_schema, complete_controller_bootstrap
 from app.modules.platform.security import StoredSecretError
 from app.modules.platform.security import digest as platform_digest
@@ -127,6 +160,7 @@ from app.modules.observability import runtime_observation
 from app.modules.certificates import (
     CertificateInventoryService,
     CertificateLifecycleService,
+    cluster_ca_path,
     install_certificate_schema,
 )
 from app.modules.certificates.http import build_router as build_certificates_router
@@ -742,6 +776,9 @@ def init():
             connection,
             maintenance_migrations=(install_maintenance_schema, install_certificate_schema),
             prepare_maintenance_recovery=MaintenanceStore(connection).prepare_startup_recovery,
+            reconcile_maintenance_workflows=lambda: MaintenanceWorkflowRecoveryService(
+                MaintenanceStore(connection),
+            ).reconcile_startup_workflows(),
             set_workload_batch_phase=repository.set_batch_phase,
             mark_recovery_required=platform_mark_recovery_required_in_connection,
             finish_run=platform_finish_run_in_connection,
@@ -1254,8 +1291,13 @@ def record_filebeat_observation(assignment_id, output, succeeded):
     return _filebeat_worker().record_observation(assignment_id, output, succeeded)
 
 
-async def run_filebeat_reconcile(run_id, cluster_id, inventory_path):
-    return await _filebeat_worker().run(run_id, cluster_id, inventory_path)
+async def run_filebeat_reconcile(run_id, cluster_id, inventory_path, *, assignment_ids=None):
+    return await _filebeat_worker().run(
+        run_id,
+        cluster_id,
+        inventory_path,
+        assignment_ids=assignment_ids,
+    )
 
 
 def _filebeat_worker():
@@ -1275,14 +1317,18 @@ def _filebeat_worker():
         inventory_factory=inventory,
         audit_event=audit_event,
         run_descriptor=PlatformRunDescriptor,
-        run_reconcile=lambda run_id, cluster_id, inventory_path: run_filebeat_reconcile(
-            run_id, cluster_id, inventory_path
+        run_reconcile=lambda run_id, cluster_id, inventory_path, *, assignment_ids=None: run_filebeat_reconcile(
+            run_id, cluster_id, inventory_path, assignment_ids=assignment_ids,
         ),
     )
 
 
 def launch_filebeat_reconcile(cluster_id, username):
     return _filebeat_worker().launch(cluster_id, username)
+
+
+def launch_filebeat_assignment_reconcile(cluster_id, assignment_ids, username):
+    return _filebeat_worker().launch_assignments(cluster_id, tuple(assignment_ids), username)
 
 
 async def start_telemetry():
@@ -1438,6 +1484,375 @@ console.configure_runtime(
         secrets_catalog_service=lambda: secrets_catalog_service,
     )
 )
+
+
+class _SelectedFilebeatCompanionReconciler:
+    """Schedule only the maintained workload's Filebeat companion."""
+
+    def __init__(self, *, cluster_for_assignment, launch_selected) -> None:
+        self._cluster_for_assignment = cluster_for_assignment
+        self._launch_selected = launch_selected
+
+    async def reconcile(self, *, assignment_id: int, run_id: int) -> RuntimeActionResult:
+        cluster_id = self._cluster_for_assignment(assignment_id)
+        companion_run_id = self._launch_selected(cluster_id, (assignment_id,), "system")
+        return RuntimeActionResult(
+            confirmed=isinstance(companion_run_id, int) and companion_run_id > 0,
+            detail="selected-filebeat-companion-scheduled",
+        )
+
+
+_ENDPOINT_PROBE_CONFIG = {
+    "master": ("elasticsearch_http", "https", "/", (200, 401)),
+    "coordinating": ("elasticsearch_http", "https", "/", (200, 401)),
+    "kibana": ("kibana", "https", "/api/status", (200, 302)),
+    "fleet-server": ("fleet", "https", "/api/status", (200, 401)),
+    "logstash": ("logstash_api", "http", "/", (200,)),
+}
+
+
+def _managed_endpoint_probe_targets(connection):
+    """Return controller-generated probes for managed workload endpoints only."""
+
+    targets = {}
+    clusters = {}
+    assignments = WorkloadRepository.from_connection(connection).active_in_connection(connection)
+    for assignment in assignments:
+        role = str(assignment["role"])
+        config = _ENDPOINT_PROBE_CONFIG.get(role)
+        if config is None:
+            continue
+        cluster_id = int(assignment["cluster_id"])
+        cluster = clusters.setdefault(cluster_id, cluster_record(connection, cluster_id))
+        members = {int(item["node_id"]): item for item in cluster["members"]}
+        member = members.get(int(assignment["node_id"]))
+        ports = cluster["role_ports"].get(role, {})
+        port_name, scheme, path, statuses = config
+        address = member.get("user_address") if member else None
+        port = ports.get(port_name) if isinstance(ports, dict) else None
+        if (
+            not isinstance(address, str)
+            or not isinstance(port, int)
+            or isinstance(port, bool)
+            or not 1 <= port <= 65535
+        ):
+            continue
+        host = f"[{address}]" if ":" in address else address
+        ca_path = (
+            f"/etc/elastic-control/clusters/{cluster['slug']}/workloads/"
+            f"ecp-{cluster['slug']}-{role}-{int(assignment['node_id'])}/certs/ca.crt"
+            if scheme == "https"
+            else None
+        )
+        try:
+            target = ManagedEndpointProbeTarget(
+                endpoint_ref=f"assignment-{int(assignment['id'])}",
+                node_id=int(assignment["node_id"]),
+                url=f"{scheme}://{host}:{port}{path}",
+                ca_path=ca_path,
+                accepted_statuses=statuses,
+            )
+        except ValueError:
+            continue
+        targets[target.endpoint_ref] = target
+    return targets
+
+
+class _HostPostReturnElasticsearchResolver:
+    """Resolve verified runtime access without exposing secrets to a browser or run."""
+
+    def __init__(self, connection) -> None:
+        self._connection = connection
+
+    def resolve(self, cluster_id: int) -> ElasticsearchRuntimeConnection:
+        cluster = cluster_record(self._connection, cluster_id)
+        members = {int(item["node_id"]): item for item in cluster["members"]}
+        candidates = sorted(
+            (
+                assignment
+                for assignment in cluster["assignments"]
+                if assignment.get("role") in ELASTICSEARCH_ROLES
+            ),
+            key=lambda assignment: (
+                0 if assignment.get("role") == "master" else 1,
+                int(assignment["id"]),
+            ),
+        )
+        endpoint = None
+        for assignment in candidates:
+            role = str(assignment["role"])
+            member = members.get(int(assignment["node_id"]))
+            ports = cluster["role_ports"].get(role, {})
+            address = member.get("user_address") if member else None
+            port = ports.get("elasticsearch_http") if isinstance(ports, dict) else None
+            if (
+                not isinstance(address, str)
+                or not isinstance(port, int)
+                or isinstance(port, bool)
+                or not 1 <= port <= 65535
+            ):
+                continue
+            try:
+                ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            host = f"[{address}]" if ":" in address else address
+            endpoint = f"https://{host}:{port}"
+            break
+        if endpoint is None:
+            raise RuntimeError("No managed Elasticsearch API endpoint is available for host return verification")
+
+        credentials = open_config(ClusterRepository.from_connection(self._connection).secrets_json(cluster_id))
+        api_key = credentials.get("monitoring_api_key") if isinstance(credentials, dict) else None
+        if not isinstance(api_key, str) or not api_key:
+            raise RuntimeError("Host return verification credentials are not configured")
+        if api_key.startswith("ApiKey "):
+            api_key = api_key.removeprefix("ApiKey ")
+        ca_path = cluster_ca_path(console.CA_CACHE, cluster_id)
+        if not ca_path.is_file():
+            raise RuntimeError("Host return verification CA material is not available")
+        return ElasticsearchRuntimeConnection(
+            endpoint=endpoint,
+            ca_path=str(ca_path),
+            api_key=SecretStr(api_key),
+        )
+
+
+def _host_post_return_verifier(connection, controller_io, runtime):
+    clients = CaVerifiedElasticsearchClientPool(
+        _HostPostReturnElasticsearchResolver(connection),
+    )
+    cluster = ElasticsearchPostReturnAdapter(
+        clients,
+        ControllerManagedServiceAvailability(connection, controller_io),
+    )
+    return PostReturnCoordinator(host=runtime, cluster=cluster)
+
+
+def _maintenance_workflow_dependencies(connection, *, lifecycle_enabled: bool):
+    """Build shared controller-owned dependencies for planned maintenance actions."""
+
+    repository = MaintenanceStore(connection)
+
+    def node_record(node_id):
+        node = HostRepository.from_connection(connection).get(node_id)
+        if node is None:
+            raise RuntimeError("Selected maintenance host is no longer available")
+        return node
+
+    def cluster_for_assignment(assignment_id):
+        assignment = WorkloadRepository.from_connection(connection).record_in_connection(connection, assignment_id)
+        if assignment is None or assignment.get("state") != "active":
+            raise RuntimeError("Selected maintenance workload is no longer active")
+        return int(assignment["cluster_id"])
+
+    def allocation_guard_for_cluster(cluster_id):
+        cluster = cluster_record(connection, cluster_id)
+        members = {int(item["node_id"]): item for item in cluster["members"]}
+        endpoint = None
+        for assignment in cluster["assignments"]:
+            role = str(assignment.get("role") or "")
+            member = members.get(int(assignment.get("node_id") or 0))
+            ports = cluster["role_ports"].get(role, {})
+            address = member.get("user_address") if member else None
+            port = ports.get("elasticsearch_http") if isinstance(ports, dict) else None
+            if role in ELASTICSEARCH_ROLES and isinstance(address, str) and isinstance(port, int):
+                endpoint = f"https://{address}:{port}"
+                break
+        if endpoint is None:
+            raise RuntimeError("No managed Elasticsearch API endpoint is available for allocation safety")
+        credentials = open_config(ClusterRepository.from_connection(connection).secrets_json(cluster_id))
+        password = credentials.get("elastic_password") if isinstance(credentials, dict) else None
+        if not isinstance(password, str) or not password:
+            raise RuntimeError("Allocation safety credentials are not configured")
+        ca_path = cluster_ca_path(console.CA_CACHE, cluster_id)
+        if not ca_path.is_file():
+            raise RuntimeError("Allocation safety CA material is not available")
+        client = ElasticsearchMaintenanceClient(
+            ElasticsearchClientConfig(endpoint=endpoint, ca_path=str(ca_path)),
+            BasicAuthCredential(username="elastic", password=SecretStr(password)),
+        )
+        return AllocationGuardService(repository, AllocationGuardController(client))
+
+    allocation_guard = ClusterAllocationGuardRouter(
+        allocation_guard_for_cluster,
+        close_guard=lambda guard: guard.controller.client.aclose(),
+    )
+
+    controller_io = ControllerMaintenanceIOAdapter(
+        node_resolver=node_record,
+        active_key_path=lambda: str(active_ssh_key_path()),
+        known_hosts_path=lambda node_ids: str(known_hosts_path(node_ids)),
+        host_key_args=ssh_host_key_args,
+        ssh_runner=PooledRemoteCommandSSHRunner(console.remote_command),
+        ansible_runner=None,
+        endpoint_targets=_managed_endpoint_probe_targets(connection),
+        flags=MaintenanceRuntimeFlags(
+            workload_lifecycle_enabled=lifecycle_enabled,
+        ),
+    )
+    companions = _SelectedFilebeatCompanionReconciler(
+        cluster_for_assignment=cluster_for_assignment,
+        launch_selected=launch_filebeat_assignment_reconcile,
+    )
+    return repository, controller_io, companions, allocation_guard
+
+
+def _container_maintenance_workflow(connection):
+    """Assemble the default-disabled assignment workflow at the app boundary."""
+
+    repository, controller_io, companions, allocation_guard = _maintenance_workflow_dependencies(
+        connection,
+        lifecycle_enabled=bool(MAINTENANCE_CAPABILITIES["container_stop"]),
+    )
+    return ContainerMaintenanceService(
+        repository,
+        execution=MaintenanceExecutionService(
+            repository,
+            capability_revision=capability_revision,
+        ),
+        runtime=ControllerManagedWorkloadRuntime(controller_io),
+        companions=companions,
+        allocation_guard=allocation_guard,
+        progress=lambda run_id, message: platform_append_log_in_connection(connection, run_id, message),
+    )
+
+
+container_maintenance_actions = ContainerMaintenanceActionService(
+    db_factory=db,
+    enabled=lambda: bool(MAINTENANCE_CAPABILITIES["container_stop"]),
+    workflow_factory=_container_maintenance_workflow,
+    close_workflow=lambda workflow: workflow.aclose(),
+)
+
+
+def _maintenance_executor_signing_key():
+    """Derive the controller-local signing key without persisting plaintext key material."""
+
+    if not KEY:
+        raise RuntimeError("Host maintenance executor signing requires APP_SECRET_KEY")
+    seed = hmac.digest(
+        KEY.encode("utf-8"),
+        b"elkeeper-host-maintenance-executor-v1",
+        "sha256",
+    )
+    return ed25519.Ed25519PrivateKey.from_private_bytes(seed)
+
+
+def _host_maintenance_rebooter_factory(connection, repository):
+    """Build a signed reboot bridge only after the workflow has an attached run."""
+
+    def node_record(node_id):
+        node = HostRepository.from_connection(connection).get(node_id)
+        if node is None:
+            raise RuntimeError("Selected maintenance host is no longer available")
+        return node
+
+    def build(plan, targets):
+        if plan.run_id is None or plan.run_id < 1 or plan.target_node_id is None:
+            raise RuntimeError("Host maintenance reboot requires an attached run and target host")
+        if not targets or any(target.node_id != plan.target_node_id for target in targets):
+            raise RuntimeError("Host maintenance reboot target set is invalid")
+        run_id = plan.run_id
+        runner = RunBoundMaintenanceAnsibleRunner(
+            run_id=run_id,
+            variables_dir=VARIABLES,
+            inventory_for_node=lambda node_id: inventory(
+                run_id,
+                node_ids=[node_id],
+                pinned_host_key_only=True,
+            ),
+            command_for_invocation=lambda invocation, inventory_path, variables_path: orchestration_playbook(
+                inventory_path,
+                PLAYBOOKS / invocation.request.playbook,
+                invocation.node.name,
+                invocation.private_key_path,
+                variables_path,
+            ),
+            stream_command=stream_command,
+            append_progress=lambda current_run_id, message: platform_append_log_in_connection(
+                connection,
+                current_run_id,
+                message,
+            ),
+            allowed_playbooks=frozenset({
+                "host-maintenance-executor-stage.yml",
+                "host-maintenance-reboot.yml",
+            }),
+        )
+        flags = MaintenanceRuntimeFlags(
+            executor_staging_enabled=True,
+            reboot_enabled=True,
+            cleanup_enabled=True,
+            workload_lifecycle_enabled=True,
+        )
+        controller_io = ControllerMaintenanceIOAdapter(
+            node_resolver=node_record,
+            active_key_path=lambda: str(active_ssh_key_path()),
+            known_hosts_path=lambda node_ids: str(known_hosts_path(node_ids)),
+            host_key_args=ssh_host_key_args,
+            ssh_runner=PooledRemoteCommandSSHRunner(console.remote_command),
+            ansible_runner=runner,
+            flags=flags,
+        )
+        signing_key = _maintenance_executor_signing_key()
+        runtime = ControllerManagedHostRuntime(
+            node_id=plan.target_node_id,
+            io=controller_io,
+            executor_public_key=signing_key.public_key(),
+            flags=flags,
+        )
+        orchestrator = RebootOrchestrator(
+            repository=repository,
+            predicates=HostMaintenanceRebootPredicates(
+                repository,
+                expected_assignment_ids=tuple(sorted(target.assignment_id for target in targets)),
+            ),
+            executor=runtime,
+            host=runtime,
+            execution_enabled=True,
+            sequence_base=5000,
+        )
+        return HostMaintenanceRebootCoordinator(
+            repository,
+            runtime=runtime,
+            orchestrator=orchestrator,
+            signing_key=signing_key,
+        )
+
+    return build
+
+
+def _host_maintenance_workflow(connection):
+    """Assemble the default-disabled host workflow at the app boundary."""
+
+    repository, controller_io, companions, allocation_guard = _maintenance_workflow_dependencies(
+        connection,
+        lifecycle_enabled=bool(MAINTENANCE_CAPABILITIES["host_reboot"]),
+    )
+    runtime = ControllerManagedHostMaintenanceRuntime(controller_io)
+    return HostMaintenanceService(
+        repository,
+        execution=MaintenanceExecutionService(
+            repository,
+            capability_revision=capability_revision,
+        ),
+        runtime=runtime,
+        companions=companions,
+        allocation_guard=allocation_guard,
+        post_return=_host_post_return_verifier(connection, controller_io, runtime),
+        reboot_executor_factory=_host_maintenance_rebooter_factory(connection, repository),
+        progress=lambda run_id, message: platform_append_log_in_connection(connection, run_id, message),
+    )
+
+
+host_maintenance_actions = HostMaintenanceActionService(
+    db_factory=db,
+    enabled=lambda: bool(MAINTENANCE_CAPABILITIES["host_reboot"]),
+    workflow_factory=_host_maintenance_workflow,
+    close_workflow=lambda workflow: workflow.aclose(),
+)
+
 
 app.include_router(console.router)
 app.include_router(
@@ -1776,6 +2191,18 @@ app.include_router(
     )
 )
 app.include_router(maintenance_router)
+app.include_router(
+    build_container_workflow_router(
+        operations=container_maintenance_actions,
+        user_dependency=user,
+    )
+)
+app.include_router(
+    build_host_workflow_router(
+        operations=host_maintenance_actions,
+        user_dependency=user,
+    )
+)
 app.include_router(build_maintenance_router(MAINTENANCE_CAPABILITIES))
 app.include_router(build_identity_router(db_factory=db, audit_fn=audit_event, default_timezone=DEFAULT_DISPLAY_TIMEZONE))
 app.include_router(

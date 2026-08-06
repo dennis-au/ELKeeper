@@ -8,12 +8,20 @@ from app.maintenance_models import (
     ClusterObservation,
     CompiledPlan,
     HostObservation,
+    HostMaintenancePreviewRequest,
     MaintenanceBackend,
     ProviderType,
     RevisionObservation,
     SourceObservation,
     SourceStatus,
     WorkloadObservation,
+)
+from app.modules.maintenance.post_return import (
+    ClusterExpectation,
+    EndpointExpectation,
+    NodeIdentityExpectation,
+    PostReturnExpectations,
+    ServiceBudgetExpectation,
 )
 from app.maintenance_planning import verify_plan_hash
 from app.maintenance_service import (
@@ -120,7 +128,47 @@ def master(assignment_id, cluster_id, node_id, revision):
     ), RevisionObservation(assignment_id=assignment_id, revision=revision)
 
 
-def planning_data(*, captured_at=NOW, singleton_kibana=False):
+def post_return_expectations():
+    return PostReturnExpectations(
+        endpoints=(EndpointExpectation(endpoint_ref="kibana-status"),),
+        clusters=(
+            ClusterExpectation(
+                cluster_id=1,
+                required_health="green",
+                nodes=(
+                    NodeIdentityExpectation(
+                        cluster_id=1,
+                        assignment_id=11,
+                        persistent_node_id="persistent-node-1",
+                        node_name="ecp-cluster-a-master-1",
+                        version="8.19.0",
+                        cluster_uuid="cluster_uuid_1",
+                    ),
+                ),
+            ),
+            ClusterExpectation(
+                cluster_id=2,
+                required_health="green",
+                nodes=(
+                    NodeIdentityExpectation(
+                        cluster_id=2,
+                        assignment_id=21,
+                        persistent_node_id="persistent-node-2",
+                        node_name="ecp-cluster-b-master-1",
+                        version="8.19.0",
+                        cluster_uuid="cluster_uuid_2",
+                    ),
+                ),
+            ),
+        ),
+        service_budgets=(
+            ServiceBudgetExpectation(cluster_id=1, role="master", minimum_available=2),
+            ServiceBudgetExpectation(cluster_id=2, role="master", minimum_available=2),
+        ),
+    )
+
+
+def planning_data(*, captured_at=NOW, singleton_kibana=False, post_return=None):
     workload_pairs = (
         master(11, 1, 1, 4),
         master(12, 1, 2, 2),
@@ -157,6 +205,7 @@ def planning_data(*, captured_at=NOW, singleton_kibana=False):
         clusters=(cluster(1), cluster(2)),
         workloads=tuple(workloads),
         assignment_revisions=tuple(revisions),
+        post_return_expectations=post_return,
     )
 
 
@@ -293,6 +342,33 @@ class MaintenancePlanningServiceTests(unittest.TestCase):
         self.assertNotIn("private_key", serialized)
         self.assertNotIn("password", serialized)
         self.assertNotIn("token", serialized)
+
+    def test_host_maintenance_preview_persists_immutable_post_return_expectations(self):
+        preview = self.service.create_generic_preview(
+            planning_data(post_return=post_return_expectations()),
+            HostMaintenancePreviewRequest(
+                node_id=1,
+                reason="Host patching",
+                idempotency_key="host-post-return-evidence",
+            ),
+            requested_by="operator",
+        )
+
+        stored = self.repository.get_plan(preview["plan_id"])
+        expectations = PostReturnExpectations.model_validate(
+            stored.target_manifest["post_return_expectations"],
+        )
+        self.assertEqual(
+            [(item.cluster_id, item.required_health) for item in expectations.clusters],
+            [(1, "green"), (2, "green")],
+        )
+        self.assertEqual(expectations.clusters[0].nodes[0].persistent_node_id, "persistent-node-1")
+        self.assertEqual(expectations.clusters[0].nodes[0].version, "8.19.0")
+        self.assertEqual(expectations.endpoints[0].endpoint_ref, "kibana-status")
+        self.assertEqual(
+            [(item.cluster_id, item.role, item.minimum_available) for item in expectations.service_budgets],
+            [(1, "master", 2), (2, "master", 2)],
+        )
 
 
 if __name__ == "__main__":

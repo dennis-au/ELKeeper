@@ -34,6 +34,8 @@ TABLE_OWNERSHIP: Dict[str, str] = {
     "maintenance_checkpoints": "maintenance",
     "host_maintenance_state": "maintenance",
     "maintenance_locks": "maintenance",
+    "maintenance_allocation_guards": "maintenance",
+    "assignment_maintenance_state": "maintenance",
     "maintenance_schema_migrations": "platform.db",
     "certificate_trust_domains": "certificates",
     "certificate_policies": "certificates",

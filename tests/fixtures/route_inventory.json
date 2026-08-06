@@ -434,6 +434,13 @@
     "path": "/api/maintenance/evacuation/preview"
   },
   {
+    "file": "app/modules/maintenance/workflow_http.py",
+    "handler": "run_host_workflow_action",
+    "method": "POST",
+    "owner": "maintenance",
+    "path": "/api/maintenance/host-workflows/{plan_id}/{action}"
+  },
+  {
     "file": "app/modules/maintenance/api.py",
     "handler": "list_maintenance_plans",
     "method": "GET",
@@ -460,6 +467,13 @@
     "method": "POST",
     "owner": "maintenance",
     "path": "/api/maintenance/plans/{plan_id}/{action}"
+  },
+  {
+    "file": "app/modules/maintenance/workflow_http.py",
+    "handler": "run_container_workflow_action",
+    "method": "POST",
+    "owner": "maintenance",
+    "path": "/api/maintenance/workflows/{plan_id}/{action}"
   },
   {
     "file": "app/modules/hosts/http.py",

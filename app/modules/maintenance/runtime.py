@@ -88,6 +88,7 @@ class MaintenanceRuntimeFlags(FrozenModel):
     executor_staging_enabled: bool = False
     reboot_enabled: bool = False
     cleanup_enabled: bool = False
+    workload_lifecycle_enabled: bool = False
 
 
 class PlaybookExecutionRequest(FrozenModel):
@@ -195,6 +196,10 @@ class ControllerMaintenanceIO(Protocol):
     async def run_playbook(self, request: PlaybookExecutionRequest) -> ExecutionReceipt: ...
 
     async def request_reboot(self, *, node_id: int, operation_id: str) -> RebootRequestReceipt: ...
+
+    async def stop_managed_unit(self, *, node_id: int, unit: str) -> bool: ...
+
+    async def start_managed_unit(self, *, node_id: int, unit: str) -> bool: ...
 
     async def wait_for_disconnect(
         self, *, node_id: int, invocation_id: str,
@@ -685,6 +690,9 @@ class ElasticsearchPostReturnAdapter:
         if status not in ("green", "yellow", "red"):
             raise ValueError("Elasticsearch health status is invalid")
         return str(status)
+
+    async def aclose(self) -> None:
+        await self.clients.aclose()
 
 
 def _non_negative_integer(payload: Mapping[str, Any], key: str) -> int:

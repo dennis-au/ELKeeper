@@ -31,6 +31,7 @@ from .models import (
 from .planning import canonical_hash, compile_plan
 from .safety import calculate_impact, evaluate_predicates
 from .store import IdempotencyConflict, MaintenanceRepository, PlanRecord, iso_timestamp, utc_now
+from .post_return import ClusterExpectation, PostReturnExpectations, ServiceBudgetExpectation
 
 
 class HostRebootPlanningData(FrozenModel):
@@ -43,6 +44,7 @@ class HostRebootPlanningData(FrozenModel):
     workloads: tuple[WorkloadObservation, ...]
     assignment_revisions: tuple[RevisionObservation, ...]
     conflicting_operations: tuple[str, ...] = ()
+    post_return_expectations: PostReturnExpectations | None = None
 
     @field_validator("captured_at")
     @classmethod
@@ -77,7 +79,7 @@ def generic_preview_idempotency_key(
         "operation": request.operation.value,
         "node_id": getattr(request, "node_id", None),
         "cluster_id": getattr(request, "cluster_id", None),
-        "assignment_ids": list(getattr(request, "assignment_ids", ())),
+        "assignment_ids": list(_preview_assignment_ids(request)),
         "current_version": getattr(request, "current_version", None),
         "target_version": getattr(request, "target_version", None),
         "reason": request.reason,
@@ -90,14 +92,21 @@ def same_generic_preview_request(record: PlanRecord, request: MaintenancePlanPre
     """Check a repeat request without recollecting live observations."""
     target = record.plan.get("target", {}) if isinstance(record.plan, dict) else {}
     return bool(
-        target.get("operation") == MaintenancePlanningService._internal_operation(request.operation.value)
+        target.get("operation") == MaintenancePlanningService._internal_operation(request)
         and target.get("reason") == request.reason
         and target.get("availability_mode") == request.availability_mode.value
         and target.get("cluster_id") == getattr(request, "cluster_id", None)
-        and tuple(target.get("assignment_ids", ())) == tuple(getattr(request, "assignment_ids", ()))
+        and tuple(target.get("assignment_ids", ())) == _preview_assignment_ids(request)
         and target.get("current_version") == getattr(request, "current_version", None)
         and target.get("target_version") == getattr(request, "target_version", None)
     )
+
+
+def _preview_assignment_ids(request: MaintenancePlanPreviewInput) -> tuple[int, ...]:
+    assignment_id = getattr(request, "assignment_id", None)
+    if assignment_id is not None:
+        return (assignment_id,)
+    return tuple(getattr(request, "assignment_ids", ()))
 
 
 def build_host_reboot_snapshot(
@@ -170,6 +179,60 @@ def _impact_for_policies(
         affected_cluster_ids=effective.affected_cluster_ids,
         affected_assignment_ids=effective.affected_assignment_ids,
         clusters=tuple(clusters),
+    )
+
+
+def _host_post_return_expectations(
+    expectations: PostReturnExpectations | None,
+    impact: ImpactManifest,
+    policies: tuple[PolicyObservation, ...],
+) -> PostReturnExpectations | None:
+    """Freeze policy-specific return health and availability expectations."""
+
+    if expectations is None:
+        return None
+    policy_by_cluster = {item.cluster_id: item.policy for item in policies}
+    expected_cluster_ids = tuple(item.cluster_id for item in expectations.clusters)
+    if expected_cluster_ids != impact.affected_cluster_ids:
+        return None
+    clusters = tuple(
+        ClusterExpectation(
+            cluster_id=item.cluster_id,
+            required_health=policy_by_cluster.get(
+                item.cluster_id,
+                MaintenancePolicy(),
+            ).required_cluster_health,
+            nodes=item.nodes,
+        )
+        for item in expectations.clusters
+    )
+    budgets = {
+        (item.cluster_id, item.role): item.minimum_available
+        for item in expectations.service_budgets
+    }
+    for cluster in impact.clusters:
+        if "master" in cluster.affected_roles and cluster.master_required:
+            key = (cluster.cluster_id, "master")
+            budgets[key] = max(budgets.get(key, 0), cluster.master_required)
+        for tier in cluster.data_tiers:
+            if tier.tier in cluster.affected_roles:
+                key = (cluster.cluster_id, tier.tier)
+                budgets[key] = max(budgets.get(key, 0), tier.required)
+        for service in cluster.services:
+            if service.role in cluster.affected_roles:
+                key = (cluster.cluster_id, service.role)
+                budgets[key] = max(budgets.get(key, 0), service.required)
+    return PostReturnExpectations(
+        endpoints=expectations.endpoints,
+        clusters=clusters,
+        service_budgets=tuple(
+            ServiceBudgetExpectation(
+                cluster_id=cluster_id,
+                role=role,
+                minimum_available=minimum_available,
+            )
+            for (cluster_id, role), minimum_available in sorted(budgets.items())
+        ),
     )
 
 
@@ -387,28 +450,38 @@ def serialize_plan_preview(record: PlanRecord, *, now: datetime | None = None) -
             "state": "pending",
             "target": str(scope) if scope is not None else None,
         })
-    operation_kind = str(target.get("operation", record.operation_kind)) if isinstance(target, dict) else record.operation_kind
+    public_operation = (
+        record.target_manifest.get("public_operation")
+        if isinstance(record.target_manifest, dict)
+        else None
+    )
+    operation_kind = str(public_operation or target.get("operation", record.operation_kind)) if isinstance(target, dict) else record.operation_kind
     target_cluster_id = target.get("cluster_id") if isinstance(target, dict) else record.target_cluster_id
     target_assignment_ids = target.get("assignment_ids", ()) if isinstance(target, dict) else ()
     if target_cluster_id is not None:
         target_view = {
             "kind": "cluster",
+            "id": target_cluster_id,
             "name": cluster_names.get(target_cluster_id, f"cluster-{target_cluster_id}"),
         }
     elif target_assignment_ids:
         assignment = next((item for item in workloads if isinstance(item, dict) and item.get("assignment_id") == target_assignment_ids[0]), {})
         target_view = {
-            "kind": "workload",
+            "kind": "container" if public_operation == PreviewOperation.CONTAINER_MAINTENANCE.value else "workload",
+            "id": target_assignment_ids[0],
             "name": assignment.get("name") or f"assignment-{target_assignment_ids[0]}",
         }
     else:
         target_view = {
             "kind": "host",
+            "id": target_node_id,
             "name": target_host.get("name") or f"node-{target_node_id}",
         }
     operation_label = {
         "reboot": "Reboot host",
         "manual_maintenance": "Manual maintenance",
+        "host_maintenance": "Host maintenance",
+        "container_maintenance": "Container maintenance",
         "resource_change": "Resource change",
         "settings_change": "Cluster settings",
         "zoning_change": "Zoning change",
@@ -639,7 +712,7 @@ class MaintenancePlanningService:
                 raise IdempotencyConflict("Idempotency key was already used for a different maintenance preview")
             return serialize_plan_preview(existing, now=self.clock())
 
-        operation = self._internal_operation(public_operation)
+        operation = self._internal_operation(request)
         target = PlanningTarget(
             operation=operation,
             # The anchor host is an observation scope, not a requested
@@ -647,14 +720,20 @@ class MaintenancePlanningService:
             # existing predicate and response contracts.
             node_id=data.target_node_id,
             cluster_id=getattr(request, "cluster_id", None),
-            assignment_ids=tuple(getattr(request, "assignment_ids", ())),
+            assignment_ids=_preview_assignment_ids(request),
             reason=request.reason,
             availability_mode=request.availability_mode,
             current_version=getattr(request, "current_version", None),
             target_version=getattr(request, "target_version", None),
         )
-        affected_cluster_ids = set(item.cluster_id for item in data.workloads if item.node_id == data.target_node_id)
-        affected_cluster_ids.update(item.cluster_id for item in data.workloads if item.assignment_id in target.assignment_ids)
+        if target.assignment_ids:
+            affected_cluster_ids = {
+                item.cluster_id for item in data.workloads if item.assignment_id in target.assignment_ids
+            }
+        else:
+            affected_cluster_ids = {
+                item.cluster_id for item in data.workloads if item.node_id == data.target_node_id
+            }
         if target.cluster_id is not None:
             affected_cluster_ids.add(target.cluster_id)
         policies = tuple(
@@ -687,12 +766,39 @@ class MaintenancePlanningService:
             created_at=now,
             idempotency_key=idempotency_key,
         )
-        state = MaintenanceState.BLOCKED if any(item.outcome == PredicateOutcome.BLOCKED for item in predicates) else MaintenanceState.READY
+        post_return_expectations = (
+            _host_post_return_expectations(
+                data.post_return_expectations,
+                impact,
+                policies,
+            )
+            if public_operation == PreviewOperation.HOST_MAINTENANCE.value
+            else None
+        )
+        state = (
+            MaintenanceState.BLOCKED
+            if (
+                any(item.outcome == PredicateOutcome.BLOCKED for item in predicates)
+                or (
+                    public_operation == PreviewOperation.HOST_MAINTENANCE.value
+                    and post_return_expectations is None
+                )
+            )
+            else MaintenanceState.READY
+        )
         revision_map = {item.assignment_id: item.revision for item in snapshot.assignment_revisions}
+        manifest_assignment_ids = target.assignment_ids
+        if public_operation == PreviewOperation.HOST_MAINTENANCE.value:
+            manifest_assignment_ids = impact.affected_assignment_ids
         target_revisions = [
             {"assignment_id": assignment_id, "revision": revision_map.get(assignment_id)}
-            for assignment_id in target.assignment_ids
+            for assignment_id in manifest_assignment_ids
         ]
+        post_return_expectations_json = (
+            post_return_expectations.model_dump(mode="json")
+            if post_return_expectations is not None
+            else None
+        )
         assignment_cluster_ids = {
             item.cluster_id for item in snapshot.workloads if item.assignment_id in target.assignment_ids
         }
@@ -721,6 +827,11 @@ class MaintenancePlanningService:
                     "affected_cluster_ids": list(impact.affected_cluster_ids),
                     "assignment_revisions": target_revisions,
                     "public_operation": public_operation,
+                    **(
+                        {"post_return_expectations": post_return_expectations_json}
+                        if post_return_expectations_json is not None
+                        else {}
+                    ),
                 },
                 initial_state=state,
                 authoritative_plan_hash=compiled.plan_hash,
@@ -749,10 +860,13 @@ class MaintenancePlanningService:
         return serialize_plan_preview(persisted, now=self.clock())
 
     @staticmethod
-    def _internal_operation(value: str) -> OperationKind:
+    def _internal_operation(request: MaintenancePlanPreviewInput) -> OperationKind:
+        value = request.operation.value
         return {
             PreviewOperation.REBOOT.value: OperationKind.REBOOT,
             PreviewOperation.MANUAL_MAINTENANCE.value: OperationKind.MANUAL_MAINTENANCE,
+            PreviewOperation.HOST_MAINTENANCE.value: OperationKind.REBOOT,
+            PreviewOperation.CONTAINER_MAINTENANCE.value: OperationKind.WORKLOAD_RESTART,
             PreviewOperation.RESOURCE_CHANGE.value: OperationKind.RESOURCE_CHANGE,
             PreviewOperation.CLUSTER_SETTINGS.value: OperationKind.SETTINGS_CHANGE,
             PreviewOperation.ZONING.value: OperationKind.ZONING_CHANGE,

@@ -176,6 +176,64 @@ def default_recovery_projections() -> RecoveryProjectionBundle:
     )
 
 
+_HOST_REBOOT_PRE_INTENT_CHECKPOINTS = frozenset({
+    "host:reboot:host",
+    "host-reboot-request",
+    "reboot.clusters-prepared",
+    "reboot.executor-staged",
+    "reboot.cluster-guards-active",
+})
+_HOST_REBOOT_AMBIGUOUS_CHECKPOINTS = frozenset({
+    "reboot.intent",
+    "reboot.invocation-acknowledged",
+    "reboot.ssh-disconnected",
+    "reboot.host-reconnected",
+})
+_HOST_REBOOT_POST_RETURN_CHECKPOINTS = frozenset({
+    "reboot.return-discovered",
+    "host:reboot-complete:host",
+})
+
+
+def classify_host_reboot_checkpoint(
+    plan: "PlanRecord",
+    checkpoint: "CheckpointRecord",
+) -> RecoveryDecision | None:
+    """Classify a host reboot boundary without issuing a remote observation.
+
+    The checkpoint is the durable proof boundary.  Before ``reboot.intent`` no
+    reboot request has been sent, so retry remains idempotent.  From intent
+    through reconnect, a controller restart cannot prove the host action's
+    outcome and must require rediscovery.  A verified return deliberately
+    permits only post-return work; it is never a license to invoke reboot
+    again.
+    """
+
+    manifest = plan.target_manifest
+    if manifest.get("public_operation") != "host_maintenance":
+        return None
+    key = checkpoint.checkpoint_key
+    if key in _HOST_REBOOT_PRE_INTENT_CHECKPOINTS:
+        return RecoveryDecision(
+            RecoveryClassification.SAFE_TO_RESUME,
+            "reboot-not-invoked",
+            True,
+        )
+    if key in _HOST_REBOOT_AMBIGUOUS_CHECKPOINTS:
+        return RecoveryDecision(
+            RecoveryClassification.AMBIGUOUS,
+            "reboot-outcome-requires-rediscovery",
+            False,
+        )
+    if key in _HOST_REBOOT_POST_RETURN_CHECKPOINTS:
+        return RecoveryDecision(
+            RecoveryClassification.SAFE_TO_RESUME,
+            "reboot-return-verified-continue-post-return",
+            True,
+        )
+    return None
+
+
 class MaintenanceStartupRecoveryCoordinator:
     """Classify interrupted checkpoints before transient-artifact cleanup.
 
@@ -189,36 +247,41 @@ class MaintenanceStartupRecoveryCoordinator:
         self.projections = projections or default_recovery_projections()
 
     def classify_checkpoint(self, plan: "PlanRecord", checkpoint: "CheckpointRecord") -> StartupRecoveryResult:
-        projection_results = tuple(
-            projection.observe(plan, checkpoint)
-            for projection in (
-                self.projections.host,
-                self.projections.workload,
-                self.projections.observability,
-                self.projections.elasticsearch,
-            )
-        )
-        sources = tuple(item.source for item in projection_results)
-        if any(not item.identity_matches for item in projection_results):
-            decision = RecoveryDecision(RecoveryClassification.AMBIGUOUS, "projection_identity_mismatch", False)
-        elif any(not item.complete for item in projection_results):
-            decision = RecoveryDecision(RecoveryClassification.AMBIGUOUS, "projection_incomplete", False)
+        reboot_decision = classify_host_reboot_checkpoint(plan, checkpoint)
+        if reboot_decision is not None:
+            decision = reboot_decision
+            sources = ("host-reboot-checkpoint",)
         else:
-            fingerprints = [item for item in projection_results if item.observed_fingerprint]
-            observed = _aggregate_fingerprint(fingerprints, "observed_fingerprint")
-            before = _aggregate_fingerprint(fingerprints, "before_fingerprint")
-            after = _aggregate_fingerprint(fingerprints, "after_fingerprint")
-            idempotent = all(item.resume_is_idempotent for item in projection_results)
-            evidence = RecoveryEvidence(
-                side_effect_state=checkpoint.side_effect_state,
-                observation_complete=True,
-                observed_fingerprint=observed,
-                before_fingerprint=before,
-                after_fingerprint=after,
-                identity_matches=True,
-                resume_is_idempotent=idempotent,
+            projection_results = tuple(
+                projection.observe(plan, checkpoint)
+                for projection in (
+                    self.projections.host,
+                    self.projections.workload,
+                    self.projections.observability,
+                    self.projections.elasticsearch,
+                )
             )
-            decision = classify_recovery(evidence)
+            sources = tuple(item.source for item in projection_results)
+            if any(not item.identity_matches for item in projection_results):
+                decision = RecoveryDecision(RecoveryClassification.AMBIGUOUS, "projection_identity_mismatch", False)
+            elif any(not item.complete for item in projection_results):
+                decision = RecoveryDecision(RecoveryClassification.AMBIGUOUS, "projection_incomplete", False)
+            else:
+                fingerprints = [item for item in projection_results if item.observed_fingerprint]
+                observed = _aggregate_fingerprint(fingerprints, "observed_fingerprint")
+                before = _aggregate_fingerprint(fingerprints, "before_fingerprint")
+                after = _aggregate_fingerprint(fingerprints, "after_fingerprint")
+                idempotent = all(item.resume_is_idempotent for item in projection_results)
+                evidence = RecoveryEvidence(
+                    side_effect_state=checkpoint.side_effect_state,
+                    observation_complete=True,
+                    observed_fingerprint=observed,
+                    before_fingerprint=before,
+                    after_fingerprint=after,
+                    identity_matches=True,
+                    resume_is_idempotent=idempotent,
+                )
+                decision = classify_recovery(evidence)
         classification, resumable = _startup_classification(decision)
         reason = decision.reason_code
         if checkpoint.recovery_evidence.get("startup_reason_code") != reason:

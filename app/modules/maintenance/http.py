@@ -17,10 +17,17 @@ def build_router(capabilities: Mapping[str, object]) -> APIRouter:
         return {
             "planning": capabilities["planning"],
             "operations": {
+                "manual_maintenance_entry": capabilities["manual_maintenance_entry"],
+                "container_stop": capabilities["container_stop"],
+                "host_shutdown": capabilities["host_shutdown"],
                 "host_reboot": capabilities["host_reboot"],
                 "rolling_restart": capabilities["rolling_restart"],
                 "upgrade": capabilities["upgrade"],
                 "evacuation": capabilities["evacuation"],
+            },
+            "lifecycle": {
+                "manual_maintenance_exit": capabilities["manual_maintenance_exit"],
+                "recovery": capabilities["recovery"],
             },
             "backends": {
                 "documented_rolling": True,

@@ -46,6 +46,8 @@ class PreviewOperation(str, Enum):
 
     REBOOT = "reboot"
     MANUAL_MAINTENANCE = "manual_maintenance"
+    HOST_MAINTENANCE = "host_maintenance"
+    CONTAINER_MAINTENANCE = "container_maintenance"
     RESOURCE_CHANGE = "resource_change"
     CLUSTER_SETTINGS = "cluster_settings"
     ZONING = "zoning"
@@ -78,6 +80,16 @@ class RebootPreviewRequest(_PreviewRequestBase):
 class ManualMaintenancePreviewRequest(_PreviewRequestBase):
     operation: Literal[PreviewOperation.MANUAL_MAINTENANCE] = PreviewOperation.MANUAL_MAINTENANCE
     node_id: int = Field(ge=1)
+
+
+class HostMaintenancePreviewRequest(_PreviewRequestBase):
+    operation: Literal[PreviewOperation.HOST_MAINTENANCE] = PreviewOperation.HOST_MAINTENANCE
+    node_id: int = Field(ge=1)
+
+
+class ContainerMaintenancePreviewRequest(_PreviewRequestBase):
+    operation: Literal[PreviewOperation.CONTAINER_MAINTENANCE] = PreviewOperation.CONTAINER_MAINTENANCE
+    assignment_id: int = Field(ge=1)
 
 
 class AssignmentPreviewRequest(_PreviewRequestBase):
@@ -118,6 +130,8 @@ MaintenancePlanPreviewInput = Annotated[
     Union[
         RebootPreviewRequest,
         ManualMaintenancePreviewRequest,
+        HostMaintenancePreviewRequest,
+        ContainerMaintenancePreviewRequest,
         AssignmentPreviewRequest,
         ClusterPreviewRequest,
         UpgradePreviewRequest,

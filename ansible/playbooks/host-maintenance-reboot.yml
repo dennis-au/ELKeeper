@@ -1,0 +1,26 @@
+---
+- name: Schedule an approved ELKeeper maintenance reboot
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    maintenance_executor_operation_id: ""
+  tasks:
+    - name: Require a bounded approved reboot operation
+      ansible.builtin.assert:
+        that:
+          - maintenance_host_reboot_enabled | default(false) | bool
+          - maintenance_executor_operation_id is string
+          - maintenance_executor_operation_id is match('^[0-9a-f]{32}$')
+        fail_msg: ELKeeper maintenance reboot requires an explicitly approved operation identifier.
+
+    - name: Schedule the managed reboot without waiting for host return
+      ansible.builtin.command:
+        argv:
+          - systemd-run
+          - --unit=ecp-maintenance-reboot-{{ maintenance_executor_operation_id }}
+          - --on-active=1s
+          - --collect
+          - /usr/bin/systemctl
+          - reboot
+      changed_when: true

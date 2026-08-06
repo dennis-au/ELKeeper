@@ -2,10 +2,17 @@
 export interface MaintenanceCapabilities {
   planning: boolean;
   operations: {
+    manual_maintenance_entry?: boolean;
+    container_stop?: boolean;
+    host_shutdown?: boolean;
     host_reboot: boolean;
     rolling_restart: boolean;
     upgrade: boolean;
     evacuation: boolean;
+  };
+  lifecycle?: {
+    manual_maintenance_exit: boolean;
+    recovery: boolean;
   };
   backends: {
     documented_rolling: boolean;
@@ -43,6 +50,8 @@ export interface MaintenancePolicyResponse {
 export type MaintenancePreviewOperation =
   | 'reboot'
   | 'manual_maintenance'
+  | 'host_maintenance'
+  | 'container_maintenance'
   | 'resource_change'
   | 'cluster_settings'
   | 'zoning'
@@ -64,6 +73,8 @@ export interface ManualMaintenanceMode {
   node_id: number;
   state: 'available' | 'planning' | 'maintenance' | 'recovery_required';
   state_revision: number;
+  workflow_state?: 'available' | 'preparing' | 'ready_to_stop' | 'stopping' | 'maintenance' | 'returning' | 'verifying' | 'blocked' | 'recovery_required';
+  workflow_state_revision?: number;
   plan_id: string | null;
   run_id: number | null;
   expires_at: string | null;
@@ -77,7 +88,7 @@ export interface MaintenancePlanHistoryItem {
     header: {
       planId: string;
       state: string;
-      target: { kind: string; name: string };
+      target: { kind: string; id?: string | number; name: string };
       operation: string;
       reason: string;
       requester: string;

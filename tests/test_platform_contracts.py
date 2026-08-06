@@ -106,6 +106,9 @@ class PlatformContractTests(unittest.TestCase):
         import app.modules.platform.maintenance as maintenance
 
         names = (
+            "MAINTENANCE_MANUAL_MAINTENANCE_ENABLED",
+            "MAINTENANCE_CONTAINER_STOP_ENABLED",
+            "MAINTENANCE_HOST_SHUTDOWN_ENABLED",
             "MAINTENANCE_HOST_REBOOT_ENABLED",
             "MAINTENANCE_ROLLING_RESTART_ENABLED",
             "MAINTENANCE_UPGRADE_ENABLED",
@@ -118,6 +121,9 @@ class PlatformContractTests(unittest.TestCase):
             self.assertTrue(all(
                 not maintenance._approved_environment_capability(capability, variable)
                 for capability, variable in (
+                    ("manual_maintenance_entry", "MAINTENANCE_MANUAL_MAINTENANCE_ENABLED"),
+                    ("container_stop", "MAINTENANCE_CONTAINER_STOP_ENABLED"),
+                    ("host_shutdown", "MAINTENANCE_HOST_SHUTDOWN_ENABLED"),
                     ("host_reboot", "MAINTENANCE_HOST_REBOOT_ENABLED"),
                     ("rolling_restart", "MAINTENANCE_ROLLING_RESTART_ENABLED"),
                     ("upgrade", "MAINTENANCE_UPGRADE_ENABLED"),

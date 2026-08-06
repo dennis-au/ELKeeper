@@ -1,6 +1,21 @@
 """Public provider contracts shared with other ELKeeper modules."""
 
 from .models import MaintenanceBackend, ProviderType
+from .planned_contracts import (
+    AllocationGuardStatus,
+    ContainerMaintenanceTarget,
+    HostMaintenanceTarget,
+    MaintenanceActionAvailability,
+    MaintenanceAffectedCluster,
+    MaintenanceAffectedWorkload,
+    MaintenancePreflightEvidence,
+    MaintenanceTarget,
+    MaintenanceTargetScope,
+    MaintenanceWorkflowAction,
+    MaintenanceWorkflowCheckpoint,
+    MaintenanceWorkflowState,
+    MaintenanceWorkflowSummary,
+)
 from .provider import OwnershipState, ProviderProfile
 from .workload_contracts import (
     DisruptionBudget,
@@ -23,6 +38,19 @@ __all__ = [
     "LegacyBatchRecoveryDecision",
     "LegacyWorkloadObservation",
     "MaintenanceBackend",
+    "AllocationGuardStatus",
+    "ContainerMaintenanceTarget",
+    "HostMaintenanceTarget",
+    "MaintenanceActionAvailability",
+    "MaintenanceAffectedCluster",
+    "MaintenanceAffectedWorkload",
+    "MaintenancePreflightEvidence",
+    "MaintenanceTarget",
+    "MaintenanceTargetScope",
+    "MaintenanceWorkflowAction",
+    "MaintenanceWorkflowCheckpoint",
+    "MaintenanceWorkflowState",
+    "MaintenanceWorkflowSummary",
     "OwnershipState",
     "ProviderProfile",
     "ReadinessEvidence",

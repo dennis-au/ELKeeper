@@ -8,6 +8,16 @@ import type {
 
 export interface MaintenancePlanResponse { plan: Record<string, unknown> }
 
+export type ContainerMaintenanceWorkflowAction = 'prepare' | 'stop' | 'return';
+export type HostMaintenanceWorkflowAction = ContainerMaintenanceWorkflowAction | 'reboot';
+export interface MaintenanceWorkflowActionResponse {
+  plan_id: string;
+  run_id: number;
+  action: string;
+  workflow_state: string;
+  lifecycle_state: string;
+}
+
 export const maintenanceApi = {
   capabilities: () => api<MaintenanceCapabilities>('/api/maintenance/capabilities'),
   policy: (clusterId: number) => api<MaintenancePolicyResponse>(`/api/clusters/${clusterId}/maintenance-policy`),
@@ -30,4 +40,8 @@ export const maintenanceApi = {
   exitManualMode: (nodeId: number, input: { reason?: string } = {}) =>
     api<ManualMaintenanceMode>(`/api/nodes/${nodeId}/maintenance-mode/exit`, { method: 'POST', ...jsonBody(input) }),
   action: (planId: string, action: string) => api<{ run_id?: number }>(`/api/maintenance/plans/${encodeURIComponent(planId)}/${encodeURIComponent(action)}`, { method: 'POST' }),
+  containerWorkflowAction: (planId: string, action: ContainerMaintenanceWorkflowAction) =>
+    api<MaintenanceWorkflowActionResponse>(`/api/maintenance/workflows/${encodeURIComponent(planId)}/${action}`, { method: 'POST' }),
+  hostWorkflowAction: (planId: string, action: HostMaintenanceWorkflowAction) =>
+    api<MaintenanceWorkflowActionResponse>(`/api/maintenance/host-workflows/${encodeURIComponent(planId)}/${action}`, { method: 'POST' }),
 };

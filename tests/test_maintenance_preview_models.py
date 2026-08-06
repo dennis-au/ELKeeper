@@ -11,6 +11,8 @@ class MaintenancePreviewModelTests(unittest.TestCase):
         requests = [
             {"operation": "reboot", "node_id": 1, "reason": "inspect"},
             {"operation": "manual_maintenance", "node_id": 1, "reason": "inspect"},
+            {"operation": "host_maintenance", "node_id": 1, "reason": "inspect"},
+            {"operation": "container_maintenance", "assignment_id": 2, "reason": "inspect"},
             {"operation": "resource_change", "assignment_ids": [2], "reason": "inspect"},
             {"operation": "cluster_settings", "cluster_id": 3, "reason": "inspect"},
             {"operation": "zoning", "cluster_id": 3, "reason": "inspect"},

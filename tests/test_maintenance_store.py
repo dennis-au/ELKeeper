@@ -9,15 +9,18 @@ from pathlib import Path
 
 from app.maintenance_lifecycle import (
     PLAN_TRANSITIONS,
+    WORKFLOW_TRANSITIONS,
     LockScope,
     MaintenanceState,
     MaintenanceStepState,
+    MaintenanceWorkflowState,
     PlanHashInput,
     SideEffectState,
     TransitionError,
     canonical_plan_hash,
     derive_idempotency_key,
     validate_plan_transition,
+    validate_workflow_transition,
 )
 from app.maintenance_recovery import RecoveryClassification, RecoveryEvidence, classify_recovery
 from app.modules.maintenance.recovery import (
@@ -121,6 +124,7 @@ class MaintenanceMigrationTests(unittest.TestCase):
         for table in (
             "maintenance_policies", "maintenance_plans", "maintenance_steps",
             "maintenance_checkpoints", "host_maintenance_state", "maintenance_locks",
+            "maintenance_allocation_guards", "assignment_maintenance_state",
         ):
             self.assertIsNotNone(connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,),
@@ -154,6 +158,41 @@ class MaintenanceMigrationTests(unittest.TestCase):
             item["name"] for item in connection.execute("PRAGMA table_info(host_runtime_observations)")
         }
         self.assertIn("network_interfaces_json", runtime_columns)
+
+    def test_workflow_state_migration_preserves_legacy_host_state(self):
+        connection = base_connection()
+        self.addCleanup(connection.close)
+        legacy_migrations = MAINTENANCE_MIGRATIONS[:3]
+        connection.execute("""
+            CREATE TABLE maintenance_schema_migrations(
+              version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,applied_at TEXT NOT NULL
+            )
+        """)
+        for version, name, checksum, _apply in legacy_migrations:
+            connection.execute(
+                "INSERT INTO maintenance_schema_migrations VALUES(?,?,?,?)",
+                (version, name, checksum, "2026-08-04T00:00:00Z"),
+            )
+        connection.execute("""
+            CREATE TABLE host_maintenance_state(
+              node_id INTEGER PRIMARY KEY,state TEXT NOT NULL,active_plan_id TEXT,
+              state_revision INTEGER NOT NULL,entered_at TEXT NOT NULL,updated_at TEXT NOT NULL
+            )
+        """)
+        for node_id, state in ((1, "available"), (2, "maintenance")):
+            connection.execute(
+                "INSERT INTO host_maintenance_state VALUES(?,?,?,?,?,?)",
+                (node_id, state, None, 1, "2026-08-04T00:00:00Z", "2026-08-04T00:00:00Z"),
+            )
+
+        self.assertEqual(install_maintenance_schema(connection), SCHEMA_VERSION)
+        rows = connection.execute(
+            "SELECT node_id,state,workflow_state,workflow_state_revision FROM host_maintenance_state ORDER BY node_id"
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [(1, "available", "available", 1), (2, "maintenance", "maintenance", 1)],
+        )
 
     def test_partial_schema_is_completed_without_deleting_rows(self):
         connection = base_connection()
@@ -210,7 +249,7 @@ class MaintenanceMigrationTests(unittest.TestCase):
             [row["version"] for row in connection.execute(
                 "SELECT version FROM maintenance_schema_migrations ORDER BY version"
             )],
-            [1, 2, 3],
+            list(range(1, SCHEMA_VERSION + 1)),
         )
 
     def test_checksum_mismatch_fails_closed(self):
@@ -241,6 +280,15 @@ class MaintenanceLifecycleTests(unittest.TestCase):
                 else:
                     with self.assertRaises(TransitionError):
                         validate_plan_transition(current, target)
+
+    def test_workflow_transition_matrix_is_complete_and_rejects_repeats(self):
+        for current in MaintenanceWorkflowState:
+            for target in MaintenanceWorkflowState:
+                if target in WORKFLOW_TRANSITIONS[current]:
+                    validate_workflow_transition(current, target)
+                else:
+                    with self.assertRaises(TransitionError):
+                        validate_workflow_transition(current, target)
 
     def test_hash_and_idempotency_are_canonical_and_cover_observations(self):
         first = PlanHashInput(
@@ -722,6 +770,71 @@ class MaintenanceRepositoryTests(unittest.TestCase):
             self.repository.transition_host_state(1, host.state_revision, "maintenance", plan.id)
         available = self.repository.transition_host_state(1, planning.state_revision, "available", plan.id)
         self.assertIsNone(available.active_plan_id)
+        self.assertEqual(available.workflow_state, MaintenanceWorkflowState.AVAILABLE)
+
+    def test_workflow_state_has_independent_revision_and_legacy_state(self):
+        host = self.repository.get_host_state(1)
+        prepared = self.repository.transition_host_workflow_state(
+            1,
+            host.workflow_state_revision,
+            MaintenanceWorkflowState.PREPARING,
+        )
+        self.assertEqual(prepared.state.value, "available")
+        self.assertEqual(prepared.workflow_state, MaintenanceWorkflowState.PREPARING)
+        self.assertEqual(prepared.workflow_state_revision, host.workflow_state_revision + 1)
+
+    def test_assignment_workflow_requires_an_owned_plan_until_returned_to_available(self):
+        plan = self.create_plan("assignment-workflow")
+        state = self.repository.get_assignment_state(1)
+        preparing = self.repository.transition_assignment_state(
+            1,
+            state.state_revision,
+            MaintenanceWorkflowState.PREPARING,
+            plan.id,
+        )
+        self.assertEqual(preparing.active_plan_id, plan.id)
+        self.assertEqual(preparing.workflow_state, MaintenanceWorkflowState.PREPARING)
+        ready = self.repository.transition_assignment_state(
+            1,
+            preparing.state_revision,
+            MaintenanceWorkflowState.READY_TO_STOP,
+            plan.id,
+        )
+        available = self.repository.transition_assignment_state(
+            1,
+            ready.state_revision,
+            MaintenanceWorkflowState.AVAILABLE,
+            plan.id,
+        )
+        self.assertIsNone(available.active_plan_id)
+
+    def test_assignment_workflow_upgrade_allows_one_host_plan_to_own_multiple_assignments(self):
+        self.connection.execute("DROP INDEX IF EXISTS ix_assignment_maintenance_active_plan")
+        self.connection.execute(
+            "CREATE UNIQUE INDEX ux_assignment_maintenance_active_plan "
+            "ON assignment_maintenance_state(active_plan_id) WHERE active_plan_id IS NOT NULL"
+        )
+        self.connection.execute(
+            "DELETE FROM maintenance_schema_migrations WHERE version=?", (SCHEMA_VERSION,),
+        )
+
+        self.assertEqual(install_maintenance_schema(self.connection), SCHEMA_VERSION)
+        plan = self.create_plan("shared-host-plan")
+        first = self.repository.get_assignment_state(1)
+        second = self.repository.get_assignment_state(2)
+        self.repository.transition_assignment_state(
+            1, first.state_revision, MaintenanceWorkflowState.PREPARING, plan.id,
+        )
+        self.repository.transition_assignment_state(
+            2, second.state_revision, MaintenanceWorkflowState.PREPARING, plan.id,
+        )
+
+        indexes = {
+            row["name"]: row["unique"]
+            for row in self.connection.execute("PRAGMA index_list('assignment_maintenance_state')")
+        }
+        self.assertEqual(indexes["ix_assignment_maintenance_active_plan"], 0)
+        self.assertNotIn("ux_assignment_maintenance_active_plan", indexes)
 
     def test_multi_scope_locks_are_atomic_and_expiry_requires_recovery(self):
         first = self.create_plan("first")

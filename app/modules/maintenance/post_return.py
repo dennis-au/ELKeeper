@@ -174,6 +174,64 @@ class ClusterExpectation(FrozenModel):
         return self
 
 
+class PostReturnExpectations(FrozenModel):
+    """Immutable verification evidence captured by a host-maintenance preview."""
+
+    endpoints: tuple[EndpointExpectation, ...] = ()
+    clusters: tuple[ClusterExpectation, ...]
+    service_budgets: tuple[ServiceBudgetExpectation, ...] = ()
+
+    @model_validator(mode="after")
+    def references_are_complete_and_deterministic(self):
+        cluster_ids = [item.cluster_id for item in self.clusters]
+        endpoint_refs = [item.endpoint_ref for item in self.endpoints]
+        budget_keys = [(item.cluster_id, item.role) for item in self.service_budgets]
+        if not cluster_ids or len(cluster_ids) != len(set(cluster_ids)):
+            raise ValueError("post-return expectations require unique affected clusters")
+        if cluster_ids != sorted(cluster_ids):
+            raise ValueError("post-return cluster expectations must use deterministic order")
+        if len(endpoint_refs) != len(set(endpoint_refs)) or endpoint_refs != sorted(endpoint_refs):
+            raise ValueError("post-return endpoint expectations must use deterministic unique references")
+        if len(budget_keys) != len(set(budget_keys)) or budget_keys != sorted(budget_keys):
+            raise ValueError("post-return service budgets must use deterministic unique cluster roles")
+        if any(item.cluster_id not in set(cluster_ids) for item in self.service_budgets):
+            raise ValueError("post-return service budgets must reference an affected cluster")
+        return self
+
+
+class HostMaintenancePostReturnRequest(FrozenModel):
+    """Immutable evidence required to close a host-maintenance return."""
+
+    plan_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    node_id: int = Field(ge=1)
+    host_return_timeout_seconds: int = Field(default=900, ge=30, le=86400)
+    workloads: tuple[WorkloadExpectation, ...]
+    endpoints: tuple[EndpointExpectation, ...] = ()
+    clusters: tuple[ClusterExpectation, ...]
+    service_budgets: tuple[ServiceBudgetExpectation, ...] = ()
+
+    @model_validator(mode="after")
+    def request_is_complete_and_deterministic(self):
+        units = [item.unit for item in self.workloads]
+        assignment_ids = [item.assignment_id for item in self.workloads]
+        endpoint_refs = [item.endpoint_ref for item in self.endpoints]
+        cluster_ids = [item.cluster_id for item in self.clusters]
+        budget_keys = [(item.cluster_id, item.role) for item in self.service_budgets]
+        if not units or len(units) != len(set(units)) or units != sorted(units):
+            raise ValueError("host maintenance workloads must use deterministic unique units")
+        if len(assignment_ids) != len(set(assignment_ids)):
+            raise ValueError("host maintenance workloads must use unique assignments")
+        if not cluster_ids or len(cluster_ids) != len(set(cluster_ids)) or cluster_ids != sorted(cluster_ids):
+            raise ValueError("host maintenance clusters must use deterministic unique identifiers")
+        if len(endpoint_refs) != len(set(endpoint_refs)) or endpoint_refs != sorted(endpoint_refs):
+            raise ValueError("host maintenance endpoints must use deterministic unique references")
+        if len(budget_keys) != len(set(budget_keys)) or budget_keys != sorted(budget_keys):
+            raise ValueError("host maintenance service budgets must use deterministic unique cluster roles")
+        if any(item.cluster_id not in set(cluster_ids) for item in self.service_budgets):
+            raise ValueError("host maintenance service budgets must reference an affected cluster")
+        return self
+
+
 class ShutdownCleanupExpectation(FrozenModel):
     cluster_id: int = Field(ge=1)
     persistent_node_id: str = Field(min_length=1, max_length=256)
@@ -290,6 +348,31 @@ class PostReturnResult(FrozenModel):
         return self
 
 
+class HostMaintenancePostReturnResult(FrozenModel):
+    """Redacted verification outcome for a host-maintenance handoff return."""
+
+    state: str = Field(pattern=r"^(complete|recovery_required)$")
+    checks: tuple[PostReturnCheck, ...]
+    error_categories: tuple[PostReturnErrorCategory, ...]
+    completed_at: datetime = Field(default_factory=_utc_now)
+
+    @field_validator("completed_at")
+    @classmethod
+    def completed_at_is_aware(cls, value):
+        return _aware(value, "completed_at")
+
+    @model_validator(mode="after")
+    def completion_is_proven(self):
+        if self.state == "complete" and (
+            self.error_categories
+            or any(check.status != CheckStatus.PASSED for check in self.checks)
+        ):
+            raise ValueError("complete host-maintenance returns require fully verified checks")
+        if self.state == "recovery_required" and not self.error_categories:
+            raise ValueError("recovery-required host-maintenance returns require verification errors")
+        return self
+
+
 class HostReturnAdapter(Protocol):
     async def wait_for_ssh(self, node_id: int, timeout_seconds: int) -> bool:
         ...
@@ -376,11 +459,11 @@ class PostReturnCoordinator:
         *,
         host: HostReturnAdapter,
         cluster: ClusterReturnAdapter,
-        allocation: AllocationRestorer,
-        shutdown: ShutdownCleaner,
-        executor_results: ExecutorResultImporter,
-        artifacts: ManagedArtifactCleaner,
-        locks: MaintenanceLockReleaser,
+        allocation: AllocationRestorer | None = None,
+        shutdown: ShutdownCleaner | None = None,
+        executor_results: ExecutorResultImporter | None = None,
+        artifacts: ManagedArtifactCleaner | None = None,
+        locks: MaintenanceLockReleaser | None = None,
         clock=_utc_now,
     ):
         self.host = host
@@ -392,7 +475,102 @@ class PostReturnCoordinator:
         self.locks = locks
         self.clock = clock
 
+    async def verify_host_maintenance(
+        self,
+        request: HostMaintenancePostReturnRequest,
+    ) -> HostMaintenancePostReturnResult:
+        """Verify a host returned from an operator handoff without executor cleanup.
+
+        A host workflow restores its allocation guards before invoking this
+        check, so shard recovery is evaluated only after normal allocation is
+        available again. Lock and artifact cleanup remain owned by the host
+        workflow's successful finalization path.
+        """
+
+        checks: list[PostReturnCheck] = []
+        errors: list[PostReturnErrorCategory] = []
+
+        def pass_check(check_id: str) -> None:
+            checks.append(PostReturnCheck(check_id=check_id, status=CheckStatus.PASSED))
+
+        def fail_check(check_id: str, category: PostReturnErrorCategory) -> None:
+            checks.append(
+                PostReturnCheck(
+                    check_id=check_id,
+                    status=CheckStatus.FAILED,
+                    error_category=category,
+                )
+            )
+            if category not in errors:
+                errors.append(category)
+
+        def skip_check(check_id: str) -> None:
+            checks.append(PostReturnCheck(check_id=check_id, status=CheckStatus.SKIPPED))
+
+        ssh_ready = await self._boolean_call(
+            self.host.wait_for_ssh(request.node_id, request.host_return_timeout_seconds)
+        )
+        if ssh_ready:
+            pass_check("ssh-return")
+            if await self._boolean_call(self.host.podman_socket_ready(request.node_id)):
+                pass_check("podman-socket")
+            else:
+                fail_check("podman-socket", PostReturnErrorCategory.PODMAN_SOCKET_UNAVAILABLE)
+            quadlet_ready = await self._boolean_call(
+                self.host.quadlet_generator_ready(request.node_id)
+            )
+            if quadlet_ready:
+                pass_check("quadlet-generator")
+            else:
+                fail_check("quadlet-generator", PostReturnErrorCategory.QUADLET_GENERATOR_UNAVAILABLE)
+            await self._verify_workloads(
+                request,
+                checks,
+                errors,
+                pass_check,
+                fail_check,
+                skip_check,
+                quadlet_ready,
+            )
+            await self._verify_endpoints(request, pass_check, fail_check)
+        else:
+            fail_check("ssh-return", PostReturnErrorCategory.SSH_UNAVAILABLE)
+            for check_id in ("podman-socket", "quadlet-generator", "required-quadlets", "required-workloads"):
+                skip_check(check_id)
+            for endpoint in request.endpoints:
+                skip_check(f"endpoint:{endpoint.endpoint_ref}")
+
+        for cluster in request.clusters:
+            await self._verify_cluster(cluster, pass_check, fail_check)
+        for budget in request.service_budgets:
+            await self._verify_budget(budget, pass_check, fail_check)
+
+        return HostMaintenancePostReturnResult(
+            state="complete" if not errors else "recovery_required",
+            checks=tuple(checks),
+            error_categories=tuple(errors),
+            completed_at=self.clock(),
+        )
+
+    async def aclose(self) -> None:
+        close = getattr(self.cluster, "aclose", None)
+        if close is not None:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+
     async def verify_and_cleanup(self, request: PostReturnRequest) -> PostReturnResult:
+        if any(
+            dependency is None
+            for dependency in (
+                self.allocation,
+                self.shutdown,
+                self.executor_results,
+                self.artifacts,
+                self.locks,
+            )
+        ):
+            raise RuntimeError("full post-return cleanup dependencies are not configured")
         checks: list[PostReturnCheck] = []
         errors: list[PostReturnErrorCategory] = []
         allocation_evidence: list[AllocationCleanupEvidence] = []

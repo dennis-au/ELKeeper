@@ -20,7 +20,7 @@ from app.modules.maintenance.manual import (
     ManualMaintenanceRecoveryRequired,
     ManualMaintenanceService,
 )
-from app.modules.maintenance.models import MaintenancePlanPreviewInput, MaintenancePolicy
+from app.modules.maintenance.models import MaintenancePlanPreviewInput, MaintenancePolicy, PreviewOperation
 from app.modules.maintenance.evacuation_contracts import (
     build_inventory_evacuation_preview,
 )
@@ -48,6 +48,7 @@ from app.modules.maintenance.store import (
     StaleLockRequiresRecovery,
 )
 from app.modules.maintenance.repository import MaintenanceRepository as MaintenanceReadRepository
+from app.modules.maintenance.workflow_recovery import MaintenanceWorkflowRecoveryService
 
 
 router = APIRouter()
@@ -137,15 +138,28 @@ def maintenance_plan_response(repository: MaintenanceRepository, record):
         pause=MAINTENANCE_CAPABILITIES["host_reboot"],
         resume=MAINTENANCE_CAPABILITIES["host_reboot"],
         cancel=MAINTENANCE_CAPABILITIES["host_reboot"],
-        recover=MAINTENANCE_CAPABILITIES["host_reboot"],
+        recover=MAINTENANCE_CAPABILITIES["recovery"],
     )
+    host_state = repository.find_host_state(record.target_node_id) if record.target_node_id else None
+    workflow_state = None
+    if host_state is not None and host_state.active_plan_id == record.id:
+        workflow_state = host_state.workflow_state
+    elif record.target_assignment_id is not None:
+        assignment_state = repository.find_assignment_state(record.target_assignment_id)
+        if assignment_state is not None and assignment_state.active_plan_id == record.id:
+            workflow_state = assignment_state.workflow_state
+    workflow_scope = record.target_manifest.get("public_operation")
+    if workflow_scope not in {"host_maintenance", "container_maintenance"}:
+        workflow_scope = None
     return {
         **serialize_plan_preview(record),
         "operation": serialize_maintenance_operation(
             record,
             steps=repository.list_steps(record.id),
             checkpoints=repository.list_checkpoints(record.id),
-            host_state=(repository.find_host_state(record.target_node_id) if record.target_node_id else None),
+            host_state=host_state,
+            workflow_state=workflow_state,
+            workflow_scope=workflow_scope,
             capabilities=capabilities,
         ),
     }
@@ -228,6 +242,7 @@ async def create_host_maintenance_plan(
                 capability_revision=capability_revision(),
                 conflicting_operations=conflicts.conflict_identifiers,
                 node_shutdown_backend_enabled=MAINTENANCE_CAPABILITIES["node_shutdown_backend"],
+                include_post_return_expectations=True,
             )
             preview = MaintenancePlanningService(repository).create_host_reboot_preview(
                 data,
@@ -256,6 +271,8 @@ async def get_manual_maintenance_mode(node_id: int, _: Annotated[str, Depends(re
             "node_id": node_id,
             "state": state.state.value,
             "state_revision": state.state_revision,
+            "workflow_state": state.workflow_state.value,
+            "workflow_state_revision": state.workflow_state_revision,
             "plan_id": plan.id if plan else None,
             "run_id": plan.run_id if plan else None,
             "expires_at": plan.expires_at if plan else None,
@@ -269,8 +286,8 @@ async def enter_manual_maintenance_mode(
     input: ManualMaintenanceEnterInput,
     username: Annotated[str, Depends(require_user)],
 ):
-    if not MAINTENANCE_CAPABILITIES["planning"]:
-        raise HTTPException(409, "Manual maintenance mode is disabled until the Phase 2 safety gate passes")
+    if not MAINTENANCE_CAPABILITIES["manual_maintenance_entry"]:
+        raise HTTPException(409, "Manual maintenance entry is disabled until the Phase 2 safety gate passes")
     key = input.idempotency_key or canonical_hash({
         "operation": "manual_maintenance",
         "node_id": node_id,
@@ -303,8 +320,6 @@ async def exit_manual_maintenance_mode(
     input: ManualMaintenanceExitInput,
     username: Annotated[str, Depends(require_user)],
 ):
-    if not MAINTENANCE_CAPABILITIES["planning"]:
-        raise HTTPException(409, "Manual maintenance mode is disabled until the Phase 2 safety gate passes")
     try:
         with control_db() as connection:
             read_repository = MaintenanceReadRepository.from_connection(connection)
@@ -346,14 +361,20 @@ async def create_maintenance_plan_preview(
                         "Idempotency key was already used for a different maintenance preview"
                     )
                 return maintenance_plan_response(repository, existing)
+            assignment_ids = tuple(getattr(input, "assignment_ids", ()))
+            if getattr(input, "assignment_id", None) is not None:
+                assignment_ids = (input.assignment_id,)
             data = collect_generic_preview_data(
                 connection,
                 telemetry(),
                 node_ids=((input.node_id,) if hasattr(input, "node_id") else ()),
                 additional_cluster_ids=((input.cluster_id,) if hasattr(input, "cluster_id") else ()),
-                additional_assignment_ids=tuple(getattr(input, "assignment_ids", ())),
+                additional_assignment_ids=assignment_ids,
                 capability_revision=capability_revision(),
                 node_shutdown_backend_enabled=MAINTENANCE_CAPABILITIES["node_shutdown_backend"],
+                include_post_return_expectations=(
+                    input.operation == PreviewOperation.HOST_MAINTENANCE
+                ),
             )
             preview = MaintenancePlanningService(repository).create_generic_preview(
                 data,
@@ -414,6 +435,7 @@ async def list_maintenance_plans(
     try:
         with control_db() as connection:
             repository = MaintenanceRepository(connection)
+            MaintenanceWorkflowRecoveryService(repository).expire_due_workflows()
             records = repository.list_plans(
                 node_id=selected_node_id,
                 cluster_id=cluster_id,
@@ -438,6 +460,7 @@ async def get_maintenance_plan(plan_id: str, _: Annotated[str, Depends(require_u
     try:
         with control_db() as connection:
             repository = MaintenanceRepository(connection)
+            MaintenanceWorkflowRecoveryService(repository).expire_due_workflows()
             return maintenance_plan_response(repository, repository.get_plan(plan_id))
     except RecordNotFound as error:
         raise HTTPException(404, str(error)) from error
@@ -449,6 +472,27 @@ async def maintenance_action(
     action: Literal["execute", "pause", "resume", "cancel", "recover"],
     username: Annotated[str, Depends(require_user)],
 ):
+    if action == "recover":
+        if not MAINTENANCE_CAPABILITIES["recovery"]:
+            raise HTTPException(409, "Maintenance recovery is disabled")
+        try:
+            with control_db() as connection:
+                repository = MaintenanceRepository(connection)
+                plan = repository.get_plan(plan_id)
+                MaintenanceWorkflowRecoveryService(repository).reconcile_plan(
+                    plan.id,
+                    reason="operator-recovery-request",
+                    username=username,
+                )
+                return {
+                    **maintenance_plan_response(repository, repository.get_plan(plan_id)),
+                    "run_id": plan.run_id,
+                }
+        except RecordNotFound as error:
+            raise HTTPException(404, str(error)) from error
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
+
     if not MAINTENANCE_CAPABILITIES["host_reboot"]:
         raise HTTPException(409, f"Maintenance {action} is disabled until its execution safety gate passes")
 

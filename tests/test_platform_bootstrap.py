@@ -183,6 +183,7 @@ class PlatformBootstrapTests(unittest.TestCase):
         phases = []
         recoveries = []
         completed = []
+        workflow_reconciliations = []
 
         def install_maintenance_schema(_connection):
             return None
@@ -191,6 +192,7 @@ class PlatformBootstrapTests(unittest.TestCase):
             connection,
             maintenance_migrations=(install_maintenance_schema,),
             prepare_maintenance_recovery=lambda: SimpleNamespace(protected_run_ids=frozenset({9})),
+            reconcile_maintenance_workflows=lambda: workflow_reconciliations.append("reconciled"),
             set_workload_batch_phase=lambda run_id, phase: phases.append((run_id, phase)),
             mark_recovery_required=lambda _connection, run_ids, message: recoveries.append((run_ids, message)),
             finish_run=lambda _connection, run_id, status, **kwargs: completed.append((run_id, status, kwargs["log_suffix"])),
@@ -199,6 +201,7 @@ class PlatformBootstrapTests(unittest.TestCase):
             default_timezone="UTC",
         )
         self.assertEqual(protected, frozenset({9}))
+        self.assertEqual(workflow_reconciliations, ["reconciled"])
         self.assertEqual(phases, [(7, "rolling_back")])
         self.assertEqual(recoveries[0][0], [7])
         self.assertEqual(completed[0][0:2], (7, "failed"))

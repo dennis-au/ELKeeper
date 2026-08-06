@@ -94,12 +94,27 @@ class FilebeatReconcileWorker:
             error = "Filebeat reconciliation did not report companion status" if succeeded else "Filebeat reconciliation failed"
         self._repository().record_filebeat_runtime(assignment_id, state=state, error=error)
 
-    async def run(self, run_id: int, cluster_id: int, inventory_path: Path) -> None:
+    async def run(
+        self,
+        run_id: int,
+        cluster_id: int,
+        inventory_path: Path,
+        *,
+        assignment_ids: tuple[int, ...] | None = None,
+    ) -> None:
         succeeded = True
         try:
             with self._db() as connection:
                 cluster = self._cluster_record(connection, cluster_id)
             assignments = cluster["assignments"]
+            if assignment_ids is not None:
+                selected_ids = tuple(sorted(set(assignment_ids)))
+                if not selected_ids or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in selected_ids):
+                    raise ValueError("Selected Filebeat reconciliation requires active assignment identifiers")
+                selected = set(selected_ids)
+                assignments = [item for item in assignments if int(item["id"]) in selected]
+                if {int(item["id"]) for item in assignments} != selected:
+                    raise ValueError("Selected Filebeat reconciliation references an inactive assignment")
             if not assignments:
                 self._add_log(run_id, "No managed workloads require Filebeat reconciliation.\n")
                 return
@@ -123,6 +138,24 @@ class FilebeatReconcileWorker:
 
     def launch(self, cluster_id: int, username: str) -> int:
         """Create and schedule a tracked Filebeat reconciliation run."""
+
+        return self._launch(cluster_id, username=username, assignment_ids=None)
+
+    def launch_assignments(self, cluster_id: int, assignment_ids: tuple[int, ...], username: str) -> int:
+        """Schedule Filebeat reconciliation for exactly the selected assignments."""
+
+        selected = tuple(sorted(set(assignment_ids)))
+        if not selected or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in selected):
+            raise ValueError("Selected Filebeat reconciliation requires assignment identifiers")
+        return self._launch(cluster_id, username=username, assignment_ids=selected)
+
+    def _launch(
+        self,
+        cluster_id: int,
+        *,
+        username: str,
+        assignment_ids: tuple[int, ...] | None,
+    ) -> int:
         if not all((self._active_operation, self._start_run, self._inventory, self._audit_event)):
             raise RuntimeError("Filebeat launch dependencies are not configured")
         with self._db() as connection:
@@ -134,16 +167,23 @@ class FilebeatReconcileWorker:
                 self._run_descriptor(
                     "filebeat-reconcile",
                     cluster["name"] + ":filebeat-reconcile",
-                    {"filebeat_enabled": cluster["log_monitoring"]["filebeat_enabled"]},
+                    {
+                        "filebeat_enabled": cluster["log_monitoring"]["filebeat_enabled"],
+                        "assignment_ids": list(assignment_ids or ()),
+                    },
                 ),
             )
             enabled = cluster["log_monitoring"]["filebeat_enabled"]
         run_id = run.run_id
         inventory_path = self._inventory(run_id)
-        self._create_task(self._run_reconcile(run_id, cluster_id, inventory_path))
+        if assignment_ids is None:
+            task = self._run_reconcile(run_id, cluster_id, inventory_path)
+        else:
+            task = self._run_reconcile(run_id, cluster_id, inventory_path, assignment_ids=assignment_ids)
+        self._create_task(task)
         self._audit_event(
             username,
-            "cluster_filebeat_reconcile",
+            "cluster_filebeat_reconcile" if assignment_ids is None else "assignment_filebeat_reconcile",
             str(cluster_id),
             "enabled" if enabled else "disabled",
         )

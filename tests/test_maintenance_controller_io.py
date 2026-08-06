@@ -23,6 +23,8 @@ from app.maintenance_controller_io import (
     AnsibleInvocation,
     ControllerMaintenanceIOAdapter,
     ControllerNodeRecord,
+    ManagedEndpointProbeTarget,
+    PooledRemoteCommandSSHRunner,
     SSHCommandRequest,
     SSHCommandResult,
     normalize_node,
@@ -40,6 +42,18 @@ class FakeSSH:
 
     async def run(self, request):
         self.requests.append(request)
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+class FakePooledRemoteCommand:
+    def __init__(self):
+        self.calls = []
+        self.result: bytes | Exception = b"pooled-ok\n"
+
+    async def __call__(self, node, *argv, timeout):
+        self.calls.append((node, argv, timeout))
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -111,6 +125,7 @@ class ControllerMaintenanceIOTests(unittest.IsolatedAsyncioTestCase):
                 executor_staging_enabled=True,
                 reboot_enabled=True,
                 cleanup_enabled=True,
+                workload_lifecycle_enabled=True,
             ),
             clock=lambda: NOW,
         )
@@ -138,6 +153,39 @@ class ControllerMaintenanceIOTests(unittest.IsolatedAsyncioTestCase):
                 host_key_args=("StrictHostKeyChecking=yes",),
                 timeout_seconds=5,
             )
+
+    async def test_pooled_remote_runner_preserves_validated_argv_and_redacts_transport_failures(self):
+        command = FakePooledRemoteCommand()
+        runner = PooledRemoteCommandSSHRunner(command)
+        request = SSHCommandRequest(
+            node=ControllerNodeRecord(
+                node_id=1,
+                name="node-a",
+                address="192.0.2.10",
+                ssh_port=22,
+                ssh_user="root",
+            ),
+            argv=("systemctl", "stop", "--", "ecp-alpha-hot-1.service"),
+            key_path="/run/secrets/controller.key",
+            known_hosts_path="/run/runtime/known-hosts-1",
+            host_key_args=("UserKnownHostsFile=/run/runtime/known-hosts-1", "StrictHostKeyChecking=yes"),
+            timeout_seconds=120,
+        )
+
+        result = await runner.run(request)
+
+        self.assertEqual(result.return_code, 0)
+        self.assertEqual(result.stdout, b"pooled-ok\n")
+        self.assertEqual(command.calls, [(
+            {"id": 1, "name": "node-a", "address": "192.0.2.10", "ssh_port": 22, "ssh_user": "root"},
+            request.argv,
+            120,
+        )])
+
+        command.result = RuntimeError("password=secret")
+        with self.assertRaisesRegex(RemoteOutcomeUnknown, "pooled SSH command failed") as error:
+            await runner.run(request)
+        self.assertNotIn("secret", str(error.exception))
 
     async def test_playbook_propagates_active_key_and_strict_host_key_policy_without_secrets(self):
         request = PlaybookExecutionRequest(
@@ -205,11 +253,98 @@ class ControllerMaintenanceIOTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ansible.invocations, [])
         self.assertEqual(self.reboot.requests, [])
 
+    async def test_workload_unit_lifecycle_is_fail_closed_and_uses_exact_managed_unit(self):
+        disabled = ControllerMaintenanceIOAdapter(
+            node_resolver=lambda node_id: node_payload(id=node_id),
+            active_key_path=lambda: "/run/secrets/controller.key",
+            known_hosts_path=lambda ids: "/run/runtime/known-hosts-1",
+            host_key_args=lambda node, known_hosts: (
+                "UserKnownHostsFile=" + known_hosts,
+                "StrictHostKeyChecking=yes",
+            ),
+            ssh_runner=self.ssh,
+            ansible_runner=self.ansible,
+        )
+        unit = "ecp-alpha-hot-1.service"
+
+        with self.assertRaises(RuntimeMutationDisabled):
+            await disabled.stop_managed_unit(node_id=1, unit=unit)
+        self.assertEqual(self.ssh.requests, [])
+
+        with self.assertRaises(ValueError):
+            await self.adapter.stop_managed_unit(
+                node_id=1,
+                unit=executor_instance_unit(OPERATION_ID),
+            )
+        self.assertEqual(self.ssh.requests, [])
+
+        self.assertTrue(await self.adapter.stop_managed_unit(node_id=1, unit=unit))
+        self.assertEqual(self.ssh.requests[-1].argv, ("systemctl", "stop", "--", unit))
+        self.assertTrue(await self.adapter.start_managed_unit(node_id=1, unit=unit))
+        self.assertEqual(self.ssh.requests[-1].argv, ("systemctl", "start", "--", unit))
+
+    async def test_generated_endpoint_probe_uses_only_controller_managed_target_data(self):
+        target = ManagedEndpointProbeTarget(
+            endpoint_ref="assignment-7",
+            node_id=1,
+            url="https://192.0.2.10:5601/api/status",
+            ca_path="/etc/elastic-control/clusters/alpha/workloads/ecp-alpha-kibana-1/certs/ca.crt",
+            accepted_statuses=(302, 200),
+        )
+        adapter = ControllerMaintenanceIOAdapter(
+            node_resolver=lambda node_id: node_payload(id=node_id),
+            active_key_path=lambda: "/run/secrets/controller.key",
+            known_hosts_path=lambda ids: "/run/runtime/known-hosts-1",
+            host_key_args=lambda node, known_hosts: (
+                "UserKnownHostsFile=" + known_hosts,
+                "StrictHostKeyChecking=yes",
+            ),
+            ssh_runner=self.ssh,
+            ansible_runner=self.ansible,
+            endpoint_targets={target.endpoint_ref: target},
+        )
+
+        self.assertTrue(await adapter.endpoint_ready(node_id=1, endpoint_ref="assignment-7"))
+        request = self.ssh.requests[-1]
+        self.assertEqual(request.argv[:2], ("python3", "-c"))
+        self.assertIn("create_default_context", request.argv[2])
+        self.assertEqual(request.argv[3:], (
+            "https://192.0.2.10:5601/api/status",
+            "/etc/elastic-control/clusters/alpha/workloads/ecp-alpha-kibana-1/certs/ca.crt",
+            "200,302",
+        ))
+
+        requests_before_wrong_node = len(self.ssh.requests)
+        self.assertFalse(await adapter.endpoint_ready(node_id=2, endpoint_ref="assignment-7"))
+        self.assertEqual(len(self.ssh.requests), requests_before_wrong_node)
+
+        with self.assertRaises(ValueError):
+            ManagedEndpointProbeTarget(
+                endpoint_ref="assignment-8",
+                node_id=1,
+                url="https://endpoint.example:5601/api/status",
+                ca_path="/etc/elastic-control/clusters/alpha/ca.crt",
+                accepted_statuses=(200,),
+            )
+
     async def test_ambiguous_reboot_transport_is_not_converted_to_success(self):
         self.reboot.result = RemoteOutcomeUnknown("lost connection")
         with self.assertRaises(RemoteOutcomeUnknown):
             await self.adapter.request_reboot(node_id=1, operation_id=OPERATION_ID)
         self.assertEqual(self.reboot.requests[0][1], OPERATION_ID)
+
+    async def test_reboot_uses_the_allowlisted_maintenance_playbook_when_no_legacy_runner_is_injected(self):
+        self.adapter.reboot_runner = None
+
+        receipt = await self.adapter.request_reboot(node_id=1, operation_id=OPERATION_ID)
+
+        self.assertEqual(receipt.operation_id, OPERATION_ID)
+        invocation = self.ansible.invocations[-1]
+        self.assertEqual(invocation.request.playbook, "host-maintenance-reboot.yml")
+        self.assertEqual(invocation.request.variables, {
+            "maintenance_host_reboot_enabled": True,
+            "maintenance_executor_operation_id": OPERATION_ID,
+        })
 
     async def test_disconnect_reconnect_and_boot_id_behavior(self):
         self.ssh.result = SSHCommandResult(return_code=255, stderr=b"connection closed")

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -40,6 +42,11 @@ class MaintenanceApiTests(unittest.TestCase):
         MAINTENANCE_ADAPTERS.clear()
         self.main.MAINTENANCE_CAPABILITIES.update({
             "planning": False,
+            "manual_maintenance_entry": False,
+            "container_stop": False,
+            "host_shutdown": False,
+            "manual_maintenance_exit": True,
+            "recovery": True,
             "host_reboot": False,
             "rolling_restart": False,
             "upgrade": False,
@@ -73,8 +80,8 @@ class MaintenanceApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201)
         return response.json()["id"]
 
-    def cluster(self, headers):
-        response = self.client.post("/api/clusters", headers=headers, json={"name": "cluster-a"})
+    def cluster(self, headers, name="cluster-a"):
+        response = self.client.post("/api/clusters", headers=headers, json={"name": name})
         self.assertEqual(response.status_code, 201)
         return response.json()["id"]
 
@@ -100,6 +107,23 @@ class MaintenanceApiTests(unittest.TestCase):
                 ") VALUES(?,?,?,?,?,?,?,?)",
                 (node_id, 1, 1, 1, "Test Linux", "5.8.5", observed_at, ""),
             )
+
+    def active_assignment(self, cluster_id, node_id, *, role):
+        with self.main.db() as connection:
+            connection.execute(
+                "INSERT INTO memberships(cluster_id,node_id,network_mode,data_interface,data_address,user_interface,user_address) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (cluster_id, node_id, "shared", "ens18", "192.0.2.101", "ens18", "192.0.2.101"),
+            )
+            assignment_id = connection.execute(
+                "INSERT INTO cluster_assignments(cluster_id,node_id,role,config_json,state) VALUES(?,?,?,?, 'active')",
+                (cluster_id, node_id, role, self.main.seal_config("{}")),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO workload_observations(assignment_id,image,digest,version,running,cached,error) VALUES(?,?,?,?,?,?,?)",
+                (assignment_id, f"example/{role}:8.19.0", "sha256:" + "a" * 64, "8.19.0", 1, 1, ""),
+            )
+            return assignment_id
 
     def evacuation_inventory(self, headers, *, provider="native_podman", same_zone=False):
         """Create durable preview evidence without invoking any managed host."""
@@ -150,7 +174,578 @@ class MaintenanceApiTests(unittest.TestCase):
         response = self.client.get("/api/maintenance/capabilities", headers=self.login())
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()["planning"])
+        self.assertFalse(response.json()["operations"]["manual_maintenance_entry"])
+        self.assertFalse(response.json()["operations"]["container_stop"])
+        self.assertFalse(response.json()["operations"]["host_shutdown"])
+        self.assertTrue(response.json()["lifecycle"]["manual_maintenance_exit"])
+        self.assertTrue(response.json()["lifecycle"]["recovery"])
         self.assertFalse(response.json()["operations"]["host_reboot"])
+
+    def test_container_workflow_action_route_is_authenticated_and_fail_closed_by_default(self):
+        path = "/api/maintenance/workflows/" + "a" * 32 + "/prepare"
+        self.assertEqual(self.client.post(path).status_code, 401)
+
+        disabled = self.client.post(path, headers=self.login())
+        self.assertEqual(disabled.status_code, 409, disabled.text)
+        self.assertIn("Container maintenance execution is disabled", disabled.text)
+        with self.main.db() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
+
+    def test_host_workflow_action_route_is_authenticated_and_fail_closed_by_default(self):
+        path = "/api/maintenance/host-workflows/" + "b" * 32 + "/prepare"
+        self.assertEqual(self.client.post(path).status_code, 401)
+
+        disabled = self.client.post(path, headers=self.login())
+        self.assertEqual(disabled.status_code, 409, disabled.text)
+        self.assertIn("Host maintenance execution is disabled", disabled.text)
+        with self.main.db() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
+
+    def test_container_workflow_uses_the_attached_run_exact_unit_and_selected_companion(self):
+        from app.modules.maintenance.lifecycle import MaintenanceState
+        from app.modules.maintenance.store import MaintenanceRepository
+
+        headers = self.login()
+        node_id = self.node(headers, "container-maintenance-node")
+        cluster_id = self.cluster(headers, "container-maintenance")
+        assignment_id = self.active_assignment(cluster_id, node_id, role="kibana")
+        self.main.MAINTENANCE_CAPABILITIES["container_stop"] = True
+        now = datetime.now(timezone.utc)
+        with self.main.db() as connection:
+            assignment = connection.execute(
+                "SELECT revision FROM cluster_assignments WHERE id=?", (assignment_id,),
+            ).fetchone()
+            plan = MaintenanceRepository(connection).create_plan(
+                operation_kind="workload_restart",
+                plan={"policy": {"observation_max_age_seconds": 120}},
+                observation={
+                    "captured_at": now.isoformat().replace("+00:00", "Z"),
+                    "capability_revision": self.main.capability_revision(),
+                },
+                idempotency_key="container-workflow-main-integration",
+                requested_by="operator",
+                expires_at=now + timedelta(minutes=5),
+                target_node_id=node_id,
+                target_cluster_id=cluster_id,
+                target_assignment_id=assignment_id,
+                target_manifest={
+                    "public_operation": "container_maintenance",
+                    "affected_cluster_ids": [cluster_id],
+                    "assignment_revisions": [{"assignment_id": assignment_id, "revision": assignment["revision"]}],
+                },
+                initial_state=MaintenanceState.READY,
+            )
+
+        remote_calls = []
+        companion_calls = []
+
+        async def remote_command(node, *argv, timeout=8):
+            remote_calls.append((node["id"], argv, timeout))
+            return b""
+
+        def launch_selected(companion_cluster_id, assignment_ids, username):
+            companion_calls.append((companion_cluster_id, assignment_ids, username))
+            return 91
+
+        with (
+            patch.object(self.main.console, "remote_command", new=remote_command),
+            patch.object(self.main, "active_ssh_key_path", return_value="/tmp/controller.key"),
+            patch.object(self.main, "known_hosts_path", return_value="/tmp/known-hosts"),
+            patch.object(
+                self.main,
+                "ssh_host_key_args",
+                return_value=("UserKnownHostsFile=/tmp/known-hosts", "StrictHostKeyChecking=yes"),
+            ),
+            patch.object(self.main, "launch_filebeat_assignment_reconcile", side_effect=launch_selected),
+        ):
+            prepared = self.client.post(
+                f"/api/maintenance/workflows/{plan.id}/prepare", headers=headers,
+            )
+            self.assertEqual(prepared.status_code, 200, prepared.text)
+            run_id = prepared.json()["run_id"]
+            self.assertEqual(prepared.json()["workflow_state"], "ready_to_stop")
+
+            stopped = self.client.post(
+                f"/api/maintenance/workflows/{plan.id}/stop", headers=headers,
+            )
+            self.assertEqual(stopped.status_code, 200, stopped.text)
+            self.assertEqual(stopped.json()["run_id"], run_id)
+
+            returned = self.client.post(
+                f"/api/maintenance/workflows/{plan.id}/return", headers=headers,
+            )
+            self.assertEqual(returned.status_code, 200, returned.text)
+            self.assertEqual(returned.json()["lifecycle_state"], "succeeded")
+
+        unit = f"ecp-container-maintenance-kibana-{node_id}.service"
+        self.assertEqual(remote_calls, [
+            (node_id, ("systemctl", "stop", "--", unit), 120),
+            (node_id, ("systemctl", "start", "--", unit), 120),
+            (node_id, ("systemctl", "is-active", "--quiet", unit), 15),
+        ])
+        self.assertEqual(companion_calls, [(cluster_id, (assignment_id,), "system")])
+        with self.main.db() as connection:
+            run = connection.execute("SELECT status,log FROM runs WHERE id=?", (run_id,)).fetchone()
+            claim = connection.execute(
+                "SELECT operation_run_id FROM cluster_assignments WHERE id=?", (assignment_id,),
+            ).fetchone()
+        self.assertEqual(run["status"], "succeeded")
+        self.assertIn("Preparing selected managed workload.\n", run["log"])
+        self.assertIn("Scheduling selected workload companion reconciliation.\n", run["log"])
+        self.assertIsNone(claim["operation_run_id"])
+
+    def test_host_workflow_uses_one_run_and_only_manages_selected_host_workloads(self):
+        from app.modules.maintenance.lifecycle import MaintenanceState
+        from app.modules.maintenance.post_return import HostMaintenancePostReturnResult
+        from app.modules.maintenance.store import MaintenanceRepository
+
+        headers = self.login()
+        node_id = self.node(headers, "host-maintenance-node")
+        cluster_id = self.cluster(headers, "host-maintenance")
+        master_id = self.active_assignment(cluster_id, node_id, role="master")
+        self.main.MAINTENANCE_CAPABILITIES["host_reboot"] = True
+        with self.main.db() as connection:
+            kibana_id = connection.execute(
+                "INSERT INTO cluster_assignments(cluster_id,node_id,role,config_json,state) VALUES(?,?,?,?, 'active')",
+                (cluster_id, node_id, "kibana", self.main.seal_config("{}")),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO workload_observations(assignment_id,image,digest,version,running,cached,error) VALUES(?,?,?,?,?,?,?)",
+                (kibana_id, "example/kibana:8.19.0", "sha256:" + "b" * 64, "8.19.0", 1, 1, ""),
+            )
+            revisions = connection.execute(
+                "SELECT id,revision FROM cluster_assignments WHERE id IN (?,?) ORDER BY id",
+                (master_id, kibana_id),
+            ).fetchall()
+            now = datetime.now(timezone.utc)
+            plan = MaintenanceRepository(connection).create_plan(
+                operation_kind="reboot",
+                plan={"policy": {"observation_max_age_seconds": 120}},
+                observation={
+                    "captured_at": now.isoformat().replace("+00:00", "Z"),
+                    "capability_revision": self.main.capability_revision(),
+                },
+                idempotency_key="host-workflow-main-integration",
+                requested_by="operator",
+                expires_at=now + timedelta(minutes=5),
+                target_node_id=node_id,
+                target_cluster_id=cluster_id,
+                target_manifest={
+                    "public_operation": "host_maintenance",
+                    "affected_cluster_ids": [cluster_id],
+                    "assignment_revisions": [
+                        {"assignment_id": row["id"], "revision": row["revision"]}
+                        for row in revisions
+                    ],
+                    "post_return_expectations": {
+                        "endpoints": [],
+                        "clusters": [{
+                            "cluster_id": cluster_id,
+                            "required_health": "green",
+                            "nodes": [{
+                                "cluster_id": cluster_id,
+                                "assignment_id": master_id,
+                                "persistent_node_id": "persistent-master-1",
+                                "node_name": f"ecp-host-maintenance-master-{node_id}",
+                                "version": "8.19.0",
+                                "cluster_uuid": "cluster_uuid_123",
+                            }],
+                        }],
+                        "service_budgets": [],
+                    },
+                },
+                initial_state=MaintenanceState.READY,
+            )
+
+        remote_calls = []
+        companion_calls = []
+        boot_id = b"11111111-1111-1111-1111-111111111111\n"
+
+        async def remote_command(node, *argv, timeout=8):
+            remote_calls.append((node["id"], argv, timeout))
+            if argv == ("cat", "/proc/sys/kernel/random/boot_id"):
+                return boot_id
+            return b""
+
+        def launch_selected(companion_cluster_id, assignment_ids, username):
+            companion_calls.append((companion_cluster_id, assignment_ids, username))
+            return 93
+
+        class VerifiedPostReturn:
+            def __init__(self):
+                self.requests = []
+
+            async def verify_host_maintenance(self, request):
+                self.requests.append(request)
+                return HostMaintenancePostReturnResult(
+                    state="complete",
+                    checks=(),
+                    error_categories=(),
+                )
+
+            async def aclose(self):
+                return None
+
+        post_return = VerifiedPostReturn()
+
+        class VerifiedRebooter:
+            def __init__(self):
+                self.calls = []
+
+            async def reboot(self, *, plan, targets):
+                self.calls.append(("reboot", plan.id, tuple(target.unit for target in targets)))
+                return self.main.RuntimeActionResult(confirmed=True, detail="reboot-verified")
+
+            async def cleanup(self, *, plan):
+                self.calls.append(("cleanup", plan.id, ()))
+                return self.main.RuntimeActionResult(confirmed=True, detail="cleanup-verified")
+
+        rebooter = VerifiedRebooter()
+        rebooter.main = self.main
+
+        with (
+            patch.object(self.main.console, "remote_command", new=remote_command),
+            patch.object(self.main, "active_ssh_key_path", return_value="/tmp/controller.key"),
+            patch.object(self.main, "known_hosts_path", return_value="/tmp/known-hosts"),
+            patch.object(
+                self.main,
+                "ssh_host_key_args",
+                return_value=("UserKnownHostsFile=/tmp/known-hosts", "StrictHostKeyChecking=yes"),
+            ),
+            patch.object(self.main, "launch_filebeat_assignment_reconcile", side_effect=launch_selected),
+            patch.object(self.main, "_host_post_return_verifier", return_value=post_return),
+            patch.object(
+                self.main,
+                "_host_maintenance_rebooter_factory",
+                return_value=lambda _plan, _targets: rebooter,
+            ),
+        ):
+            prepared = self.client.post(
+                f"/api/maintenance/host-workflows/{plan.id}/prepare", headers=headers,
+            )
+            self.assertEqual(prepared.status_code, 200, prepared.text)
+            run_id = prepared.json()["run_id"]
+            self.assertEqual(prepared.json()["workflow_state"], "ready_to_stop")
+
+            stopped = self.client.post(
+                f"/api/maintenance/host-workflows/{plan.id}/stop", headers=headers,
+            )
+            self.assertEqual(stopped.status_code, 200, stopped.text)
+            self.assertEqual(stopped.json()["workflow_state"], "maintenance")
+
+            rebooted = self.client.post(
+                f"/api/maintenance/host-workflows/{plan.id}/reboot", headers=headers,
+            )
+            self.assertEqual(rebooted.status_code, 200, rebooted.text)
+            self.assertEqual(rebooted.json()["action"], "reboot")
+
+            returned = self.client.post(
+                f"/api/maintenance/host-workflows/{plan.id}/return", headers=headers,
+            )
+            self.assertEqual(returned.status_code, 200, returned.text)
+            self.assertEqual(returned.json()["run_id"], run_id)
+            self.assertEqual(returned.json()["lifecycle_state"], "succeeded")
+
+        self.assertEqual([item.assignment_id for item in post_return.requests[0].workloads], [kibana_id, master_id])
+        self.assertEqual(post_return.requests[0].clusters[0].nodes[0].persistent_node_id, "persistent-master-1")
+
+        master_unit = f"ecp-host-maintenance-master-{node_id}.service"
+        kibana_unit = f"ecp-host-maintenance-kibana-{node_id}.service"
+        self.assertEqual(remote_calls, [
+            (node_id, ("systemctl", "stop", "--", kibana_unit), 120),
+            (node_id, ("systemctl", "stop", "--", master_unit), 120),
+            (node_id, ("true",), 30),
+            (node_id, ("systemctl", "is-active", "--quiet", "podman.socket"), 15),
+            (node_id, ("test", "-d", "/run/systemd/generator"), 15),
+            (node_id, ("cat", "/proc/sys/kernel/random/boot_id"), 8),
+            (node_id, ("systemctl", "start", "--", master_unit), 120),
+            (node_id, ("systemctl", "is-active", "--quiet", master_unit), 15),
+            (node_id, ("systemctl", "start", "--", kibana_unit), 120),
+            (node_id, ("systemctl", "is-active", "--quiet", kibana_unit), 15),
+        ])
+        self.assertEqual(companion_calls, [
+            (cluster_id, (master_id,), "system"),
+            (cluster_id, (kibana_id,), "system"),
+        ])
+        self.assertEqual(rebooter.calls, [
+            ("reboot", plan.id, (master_unit, kibana_unit)),
+            ("cleanup", plan.id, ()),
+        ])
+        with self.main.db() as connection:
+            run = connection.execute("SELECT status,log FROM runs WHERE id=?", (run_id,)).fetchone()
+            claims = connection.execute(
+                "SELECT id,operation_run_id FROM cluster_assignments WHERE id IN (?,?) ORDER BY id",
+                (master_id, kibana_id),
+            ).fetchall()
+        self.assertEqual(run["status"], "succeeded")
+        self.assertIn("Preparing managed workloads on the selected host.\n", run["log"])
+        self.assertIn("Staging the signed host reboot executor.\n", run["log"])
+        self.assertIn("Host reboot and boot transition were verified.\n", run["log"])
+        self.assertEqual([(row["id"], row["operation_run_id"]) for row in claims], [
+            (master_id, None),
+            (kibana_id, None),
+        ])
+
+    def test_host_rebooter_factory_binds_the_attached_run_and_exact_workload_units(self):
+        from app.modules.maintenance.container_maintenance import ManagedContainerTarget
+        from app.modules.maintenance.execution import MaintenanceAction, MaintenanceExecutionService
+        from app.modules.maintenance.lifecycle import MaintenanceState
+        from app.modules.maintenance.store import MaintenanceRepository
+
+        headers = self.login()
+        node_id = self.node(headers, "host-rebooter-factory-node")
+        cluster_id = self.cluster(headers, "host-rebooter-factory")
+        assignment_id = self.active_assignment(cluster_id, node_id, role="master")
+        now = datetime.now(timezone.utc)
+
+        with self.main.db() as connection:
+            repository = MaintenanceRepository(connection)
+            revision = connection.execute(
+                "SELECT revision FROM cluster_assignments WHERE id=?", (assignment_id,),
+            ).fetchone()["revision"]
+            created = repository.create_plan(
+                operation_kind="reboot",
+                plan={"policy": {}},
+                observation={
+                    "captured_at": now.isoformat().replace("+00:00", "Z"),
+                    "capability_revision": self.main.capability_revision(),
+                },
+                idempotency_key="host-rebooter-factory",
+                requested_by="operator",
+                expires_at=now + timedelta(minutes=5),
+                target_node_id=node_id,
+                target_cluster_id=cluster_id,
+                target_manifest={
+                    "public_operation": "host_maintenance",
+                    "assignment_revisions": [{"assignment_id": assignment_id, "revision": revision}],
+                },
+                initial_state=MaintenanceState.READY,
+            )
+            MaintenanceExecutionService(
+                repository,
+                capability_revision=self.main.capability_revision,
+            ).prepare(created.id, MaintenanceAction.EXECUTE, username="operator")
+            plan = repository.get_plan(created.id)
+            target = ManagedContainerTarget(
+                assignment_id=assignment_id,
+                cluster_id=cluster_id,
+                node_id=node_id,
+                role="master",
+                unit=f"ecp-host-rebooter-factory-master-{node_id}.service",
+                data_bearing=False,
+            )
+
+            rebooter = self.main._host_maintenance_rebooter_factory(connection, repository)(
+                plan,
+                (target,),
+            )
+
+        self.assertEqual(rebooter.runtime.node_id, node_id)
+        self.assertTrue(rebooter.orchestrator.execution_enabled)
+        self.assertEqual(rebooter.orchestrator.sequence_base, 5000)
+        self.assertEqual(rebooter.orchestrator.predicates.expected_assignment_ids, (assignment_id,))
+        runner = rebooter.runtime.io.ansible_runner
+        self.assertEqual(runner.run_id, plan.run_id)
+        self.assertEqual(runner.allowed_playbooks, frozenset({
+            "host-maintenance-executor-stage.yml",
+            "host-maintenance-reboot.yml",
+        }))
+
+    def test_host_post_return_resolver_uses_cached_ca_and_redacts_monitoring_key(self):
+        headers = self.login()
+        node_id = self.node(headers, "post-return-resolver-node")
+        cluster_id = self.cluster(headers, "post-return-resolver")
+        self.active_assignment(cluster_id, node_id, role="master")
+        raw_key = "ApiKey resolver-key-material"
+        ca_path = self.main.cluster_ca_path(self.main.console.CA_CACHE, cluster_id)
+        ca_path.parent.mkdir(parents=True, exist_ok=True)
+        ca_path.write_text("test-ca", encoding="ascii")
+
+        with self.main.db() as connection:
+            credentials = self.main.open_config(
+                connection.execute(
+                    "SELECT secrets_json FROM clusters WHERE id=?", (cluster_id,),
+                ).fetchone()["secrets_json"],
+            )
+            credentials["monitoring_api_key"] = raw_key
+            connection.execute(
+                "UPDATE clusters SET secrets_json=? WHERE id=?",
+                (self.main.seal_config(json.dumps(credentials)), cluster_id),
+            )
+            resolved = self.main._HostPostReturnElasticsearchResolver(connection).resolve(cluster_id)
+
+        self.assertEqual(resolved.endpoint, "https://192.0.2.101:9200")
+        self.assertEqual(resolved.ca_path, str(ca_path))
+        self.assertEqual(resolved.api_key.get_secret_value(), "resolver-key-material")
+        self.assertNotIn("resolver-key-material", repr(resolved))
+
+        ca_path.unlink()
+        with self.main.db() as connection:
+            with self.assertRaisesRegex(RuntimeError, "CA material") as raised:
+                self.main._HostPostReturnElasticsearchResolver(connection).resolve(cluster_id)
+        self.assertNotIn("resolver-key-material", str(raised.exception))
+
+    def test_managed_endpoint_probe_targets_are_exact_and_skip_malformed_runtime_addresses(self):
+        headers = self.login()
+        node_id = self.node(headers, "managed-endpoint-targets")
+        cluster_id = self.cluster(headers, "managed-endpoint-targets")
+        assignment_ids = {"master": self.active_assignment(cluster_id, node_id, role="master")}
+        with self.main.db() as connection:
+            for role in ("kibana", "fleet-server", "logstash", "hot", "elastic-agent"):
+                assignment_id = connection.execute(
+                    "INSERT INTO cluster_assignments(cluster_id,node_id,role,config_json,state) "
+                    "VALUES(?,?,?,?, 'active')",
+                    (cluster_id, node_id, role, self.main.seal_config("{}")),
+                ).lastrowid
+                connection.execute(
+                    "INSERT INTO workload_observations(assignment_id,image,digest,version,running,cached,error) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (assignment_id, f"example/{role}:8.19.0", "sha256:" + "c" * 64, "8.19.0", 1, 1, ""),
+                )
+                assignment_ids[role] = assignment_id
+            targets = self.main._managed_endpoint_probe_targets(connection)
+
+        self.assertEqual(set(targets), {
+            f"assignment-{assignment_ids['master']}",
+            f"assignment-{assignment_ids['kibana']}",
+            f"assignment-{assignment_ids['fleet-server']}",
+            f"assignment-{assignment_ids['logstash']}",
+        })
+        self.assertEqual(
+            targets[f"assignment-{assignment_ids['master']}"].url,
+            "https://192.0.2.101:9200/",
+        )
+        self.assertEqual(
+            targets[f"assignment-{assignment_ids['kibana']}"].url,
+            "https://192.0.2.101:5601/api/status",
+        )
+        self.assertEqual(
+            targets[f"assignment-{assignment_ids['fleet-server']}"].url,
+            "https://192.0.2.101:8220/api/status",
+        )
+        self.assertEqual(
+            targets[f"assignment-{assignment_ids['logstash']}"].url,
+            "http://192.0.2.101:9600/",
+        )
+        self.assertIsNotNone(targets[f"assignment-{assignment_ids['master']}"].ca_path)
+        self.assertIsNone(targets[f"assignment-{assignment_ids['logstash']}"].ca_path)
+
+        with self.main.db() as connection:
+            connection.execute(
+                "UPDATE memberships SET user_address=? WHERE cluster_id=? AND node_id=?",
+                ("not-a-literal-ip", cluster_id, node_id),
+            )
+            malformed_targets = self.main._managed_endpoint_probe_targets(connection)
+        self.assertEqual(malformed_targets, {})
+
+    def test_data_container_workflow_composes_and_restores_the_allocation_guard(self):
+        from app.modules.maintenance.lifecycle import MaintenanceState
+        from app.modules.maintenance.store import MaintenanceRepository
+
+        headers = self.login()
+        node_id = self.node(headers, "data-maintenance-node")
+        cluster_id = self.cluster(headers, "data-maintenance")
+        assignment_id = self.active_assignment(cluster_id, node_id, role="hot")
+        self.main.MAINTENANCE_CAPABILITIES["container_stop"] = True
+        now = datetime.now(timezone.utc)
+        with self.main.db() as connection:
+            assignment = connection.execute(
+                "SELECT revision FROM cluster_assignments WHERE id=?", (assignment_id,),
+            ).fetchone()
+            plan = MaintenanceRepository(connection).create_plan(
+                operation_kind="workload_restart",
+                plan={"policy": {"observation_max_age_seconds": 120}},
+                observation={
+                    "captured_at": now.isoformat().replace("+00:00", "Z"),
+                    "capability_revision": self.main.capability_revision(),
+                },
+                idempotency_key="data-container-workflow-main-integration",
+                requested_by="operator",
+                expires_at=now + timedelta(minutes=5),
+                target_node_id=node_id,
+                target_cluster_id=cluster_id,
+                target_assignment_id=assignment_id,
+                target_manifest={
+                    "public_operation": "container_maintenance",
+                    "affected_cluster_ids": [cluster_id],
+                    "assignment_revisions": [{"assignment_id": assignment_id, "revision": assignment["revision"]}],
+                },
+                initial_state=MaintenanceState.READY,
+            )
+
+        remote_calls = []
+        clients = []
+
+        class FakeElasticsearchClient:
+            def __init__(self, config, credential):
+                self.config = config
+                self.credential = credential
+                self.layers = {"persistent": {}, "transient": {}}
+                self.calls = []
+                self.closed = False
+                clients.append(self)
+
+            async def settings(self):
+                return {key: dict(value) for key, value in self.layers.items()}
+
+            async def put_settings(self, *, persistent=None, transient=None):
+                self.calls.append((persistent, transient))
+                for layer_name, values in (("persistent", persistent), ("transient", transient)):
+                    if values is None:
+                        continue
+                    for key, value in values.items():
+                        if value is None:
+                            self.layers[layer_name].pop(key, None)
+                        else:
+                            self.layers[layer_name][key] = value
+                return {key: dict(value) for key, value in self.layers.items()}
+
+            async def aclose(self):
+                self.closed = True
+
+        async def remote_command(node, *argv, timeout=8):
+            remote_calls.append((node["id"], argv, timeout))
+            return b""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            ca_path = Path(temporary) / "ca.crt"
+            ca_path.write_text("test-ca", encoding="ascii")
+            with (
+                patch.object(self.main.console, "remote_command", new=remote_command),
+                patch.object(self.main, "active_ssh_key_path", return_value="/tmp/controller.key"),
+                patch.object(self.main, "known_hosts_path", return_value="/tmp/known-hosts"),
+                patch.object(
+                    self.main,
+                    "ssh_host_key_args",
+                    return_value=("UserKnownHostsFile=/tmp/known-hosts", "StrictHostKeyChecking=yes"),
+                ),
+                patch.object(self.main, "launch_filebeat_assignment_reconcile", return_value=92),
+                patch.object(self.main, "cluster_ca_path", return_value=ca_path),
+                patch.object(self.main, "ElasticsearchMaintenanceClient", FakeElasticsearchClient),
+            ):
+                self.assertEqual(
+                    self.client.post(f"/api/maintenance/workflows/{plan.id}/prepare", headers=headers).status_code,
+                    200,
+                )
+                self.assertEqual(
+                    self.client.post(f"/api/maintenance/workflows/{plan.id}/stop", headers=headers).status_code,
+                    200,
+                )
+                returned = self.client.post(f"/api/maintenance/workflows/{plan.id}/return", headers=headers)
+                self.assertEqual(returned.status_code, 200, returned.text)
+
+        self.assertEqual(len(clients), 2)
+        self.assertEqual(clients[0].calls, [({"cluster.routing.allocation.enable": "primaries"}, None)])
+        self.assertEqual(clients[1].calls, [
+            ({"cluster.routing.allocation.enable": None}, {"cluster.routing.allocation.enable": None}),
+        ])
+        self.assertTrue(all(client.closed for client in clients))
+        self.assertEqual(remote_calls[0][1][:3], ("systemctl", "stop", "--"))
+        with self.main.db() as connection:
+            guard = connection.execute(
+                "SELECT phase FROM maintenance_allocation_guards WHERE owner_plan_id=?", (plan.id,),
+            ).fetchone()
+        self.assertEqual(guard["phase"], "restored")
 
     def test_policy_defaults_and_expected_revision_updates(self):
         headers = self.login()
@@ -334,6 +929,66 @@ class MaintenanceApiTests(unittest.TestCase):
         self.assertEqual(stale.json()["lifecycle_state"], "blocked")
         self.assertEqual(stale.json()["view"]["header"]["freshness"]["state"], "stale")
 
+    def test_explicit_host_and_container_maintenance_previews_are_read_only_and_isolated(self):
+        headers = self.login()
+        node_id = self.node(headers)
+        first_cluster_id = self.cluster(headers)
+        second_cluster_id = self.cluster(headers, "cluster-b")
+        first_assignment_id = self.active_assignment(first_cluster_id, node_id, role="hot")
+        second_assignment_id = self.active_assignment(second_cluster_id, node_id, role="kibana")
+        self.observe_empty_host(node_id)
+        self.main.MAINTENANCE_CAPABILITIES["planning"] = True
+
+        host = self.client.post(
+            "/api/maintenance/plans/preview",
+            headers=headers,
+            json={
+                "operation": "host_maintenance",
+                "node_id": node_id,
+                "reason": "Host patching",
+                "idempotency_key": "host-maintenance-preview",
+            },
+        )
+        self.assertEqual(host.status_code, 201, host.text)
+        self.assertEqual(host.json()["view"]["header"]["target"]["kind"], "host")
+        self.assertEqual(host.json()["view"]["header"]["target"]["id"], node_id)
+        self.assertEqual({item["id"] for item in host.json()["view"]["impact"]["clusters"]}, {first_cluster_id, second_cluster_id})
+        with self.main.db() as connection:
+            row = connection.execute(
+                "SELECT target_manifest_json FROM maintenance_plans WHERE id=?",
+                (host.json()["plan_id"],),
+            ).fetchone()
+        manifest = json.loads(row["target_manifest_json"])
+        self.assertEqual(
+            manifest["assignment_revisions"],
+            [
+                {"assignment_id": first_assignment_id, "revision": 1},
+                {"assignment_id": second_assignment_id, "revision": 1},
+            ],
+        )
+
+        container = self.client.post(
+            "/api/maintenance/plans/preview",
+            headers=headers,
+            json={
+                "operation": "container_maintenance",
+                "assignment_id": first_assignment_id,
+                "reason": "Inspect one workload",
+                "idempotency_key": "container-maintenance-preview",
+            },
+        )
+        self.assertEqual(container.status_code, 201, container.text)
+        self.assertEqual(container.json()["view"]["header"]["target"]["kind"], "container")
+        self.assertEqual(container.json()["view"]["header"]["target"]["id"], first_assignment_id)
+        self.assertEqual(
+            {item["id"] for item in container.json()["view"]["impact"]["workloads"]},
+            {first_assignment_id},
+        )
+        self.assertNotIn(second_assignment_id, {item["id"] for item in container.json()["view"]["impact"]["workloads"]})
+        with self.main.db() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM maintenance_locks").fetchone()[0], 0)
+
     def test_generic_preview_rejects_bad_target_and_idempotency_conflict(self):
         headers = self.login()
         node_id = self.node(headers)
@@ -402,10 +1057,110 @@ class MaintenanceApiTests(unittest.TestCase):
 
     def test_execution_controls_remain_disabled(self):
         headers = self.login()
-        for action in ("execute", "pause", "resume", "cancel", "recover"):
+        for action in ("execute", "pause", "resume", "cancel"):
             response = self.client.post(f"/api/maintenance/plans/not-a-plan/{action}", headers=headers)
             self.assertEqual(response.status_code, 409)
             self.assertIn("disabled", response.json()["detail"].lower())
+        recovery = self.client.post("/api/maintenance/plans/not-a-plan/recover", headers=headers)
+        self.assertEqual(recovery.status_code, 404)
+
+    def test_recovery_action_is_available_without_host_execution_capability(self):
+        headers = self.login()
+        node_id = self.node(headers)
+        cluster_id = self.cluster(headers)
+        assignment_id = self.active_assignment(cluster_id, node_id, role="kibana")
+        with self.main.db() as connection:
+            from app.modules.maintenance.api import capability_revision
+            from app.modules.maintenance.execution import MaintenanceAction, MaintenanceExecutionService
+            from app.modules.maintenance.lifecycle import MaintenanceState
+            from app.modules.maintenance.store import MaintenanceRepository
+
+            repository = MaintenanceRepository(connection)
+            plan = repository.create_plan(
+                operation_kind="workload_restart",
+                plan={"policy": {"observation_max_age_seconds": 120}},
+                observation={
+                    "captured_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "capability_revision": capability_revision(),
+                },
+                idempotency_key="recover-container-workflow",
+                requested_by="operator",
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                target_node_id=node_id,
+                target_cluster_id=cluster_id,
+                target_assignment_id=assignment_id,
+                target_manifest={
+                    "public_operation": "container_maintenance",
+                    "affected_cluster_ids": [cluster_id],
+                    "assignment_revisions": [{"assignment_id": assignment_id, "revision": 1}],
+                },
+                initial_state=MaintenanceState.READY,
+            )
+            ticket = MaintenanceExecutionService(
+                repository,
+                capability_revision=capability_revision,
+            ).prepare(plan.id, MaintenanceAction.EXECUTE, username="operator")
+
+        self.assertFalse(self.main.MAINTENANCE_CAPABILITIES["host_reboot"])
+        recovered = self.client.post(
+            f"/api/maintenance/plans/{plan.id}/recover",
+            headers=headers,
+        )
+        self.assertEqual(recovered.status_code, 200, recovered.text)
+        self.assertEqual(recovered.json()["lifecycle_state"], "recovery_required")
+        self.assertEqual(recovered.json()["run_id"], ticket.run_id)
+        with self.main.db() as connection:
+            self.assertEqual(connection.execute("SELECT status FROM runs WHERE id=?", (ticket.run_id,)).fetchone()["status"], "recovery_required")
+            self.assertGreater(connection.execute("SELECT COUNT(*) FROM maintenance_locks WHERE released_at IS NULL").fetchone()[0], 0)
+
+    def test_plan_read_marks_an_expired_active_workflow_for_recovery(self):
+        headers = self.login()
+        node_id = self.node(headers)
+        cluster_id = self.cluster(headers)
+        assignment_id = self.active_assignment(cluster_id, node_id, role="kibana")
+        with self.main.db() as connection:
+            from app.modules.maintenance.api import capability_revision
+            from app.modules.maintenance.execution import MaintenanceAction, MaintenanceExecutionService
+            from app.modules.maintenance.lifecycle import MaintenanceState
+            from app.modules.maintenance.store import MaintenanceRepository
+
+            repository = MaintenanceRepository(connection)
+            plan = repository.create_plan(
+                operation_kind="workload_restart",
+                plan={"policy": {"observation_max_age_seconds": 120}},
+                observation={
+                    "captured_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "capability_revision": capability_revision(),
+                },
+                idempotency_key="expired-container-workflow",
+                requested_by="operator",
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                target_node_id=node_id,
+                target_cluster_id=cluster_id,
+                target_assignment_id=assignment_id,
+                target_manifest={
+                    "public_operation": "container_maintenance",
+                    "affected_cluster_ids": [cluster_id],
+                    "assignment_revisions": [{"assignment_id": assignment_id, "revision": 1}],
+                },
+                initial_state=MaintenanceState.READY,
+            )
+            ticket = MaintenanceExecutionService(
+                repository,
+                capability_revision=capability_revision,
+            ).prepare(plan.id, MaintenanceAction.EXECUTE, username="operator")
+            connection.execute(
+                "UPDATE maintenance_plans SET expires_at=? WHERE id=?",
+                ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat().replace("+00:00", "Z"), plan.id),
+            )
+
+        detail = self.client.get(f"/api/maintenance/plans/{plan.id}", headers=headers)
+
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["lifecycle_state"], "recovery_required")
+        with self.main.db() as connection:
+            self.assertEqual(connection.execute("SELECT status FROM runs WHERE id=?", (ticket.run_id,)).fetchone()["status"], "recovery_required")
+            self.assertGreater(connection.execute("SELECT COUNT(*) FROM maintenance_locks WHERE released_at IS NULL").fetchone()[0], 0)
 
     def test_enabled_execution_fails_closed_without_an_adapter_and_creates_nothing(self):
         headers = self.login()

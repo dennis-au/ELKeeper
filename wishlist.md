@@ -6,6 +6,13 @@ without attempting to recreate Kubernetes. ELKeeper should remain focused on
 managing Elastic Stack workloads directly on Linux hosts through SSH, Ansible,
 Podman, and an operator-friendly web console.
 
+## Capability Gap Assessment
+
+The [Elastic Stack capability gap assessment](elastic_stack_gap_assessment.md)
+records current implementation evidence, production risk, required outcomes,
+and acceptance criteria for Elastic lifecycle gaps. This roadmap remains the
+delivery-order source; the assessment is the evidence and prioritization record.
+
 ## Roadmap Principles
 
 - Protect data, quorum, and recoverability before expanding product coverage.

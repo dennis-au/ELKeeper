@@ -7,6 +7,7 @@ export { MaintenancePlanSteps } from './MaintenancePlanSteps';
 export { MaintenancePredicateGroups } from './MaintenancePredicateGroups';
 export { MaintenanceOperationActions } from './MaintenanceOperationActions';
 export { MaintenanceOperationProgress } from './MaintenanceOperationProgress';
+export { MaintenanceWorkflowActions } from './MaintenanceWorkflowActions';
 export type { MaintenancePlanPreviewProps } from './MaintenancePlanPreview';
 export type {
   MaintenanceOperationAction,
@@ -16,6 +17,10 @@ export type {
 export type {
   MaintenanceOperationProgressModel,
 } from './MaintenanceOperationProgress';
+export type {
+  MaintenanceWorkflowAction,
+  MaintenanceWorkflowActionControl,
+} from './MaintenanceWorkflowActions';
 export type {
   MaintenanceAction,
   MaintenanceActionControl,

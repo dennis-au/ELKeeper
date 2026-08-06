@@ -22,12 +22,15 @@ from .repository import ConflictObservation, MaintenanceRepository as Maintenanc
 
 from app.modules.maintenance.lifecycle import (
     HOST_TRANSITIONS,
+    LEGACY_HOST_WORKFLOW_STATE,
     PLAN_TRANSITIONS,
     STEP_TRANSITIONS,
+    WORKFLOW_TRANSITIONS,
     HostMaintenanceState,
     LockScope,
     MaintenanceState,
     MaintenanceStepState,
+    MaintenanceWorkflowState,
     PlanHashInput,
     SideEffectState,
     canonical_hash,
@@ -37,6 +40,7 @@ from app.modules.maintenance.lifecycle import (
     validate_host_transition,
     validate_plan_transition,
     validate_step_transition,
+    validate_workflow_transition,
 )
 from app.modules.maintenance.recovery import (
     MaintenanceStartupRecoveryCoordinator,
@@ -79,9 +83,52 @@ OBSERVATION_SCHEMA_CHECKSUM = canonical_hash({
     "schema": OBSERVATION_SCHEMA_NAME,
     "spec": OBSERVATION_SCHEMA_SPEC,
 })
-SCHEMA_VERSION = OBSERVATION_SCHEMA_VERSION
-SCHEMA_NAME = OBSERVATION_SCHEMA_NAME
-SCHEMA_CHECKSUM = OBSERVATION_SCHEMA_CHECKSUM
+WORKFLOW_SCHEMA_VERSION = 4
+WORKFLOW_SCHEMA_NAME = "phase_2_workflow_state"
+WORKFLOW_SCHEMA_SPEC = {
+    "host_maintenance_state_columns": ("workflow_state", "workflow_state_revision"),
+}
+WORKFLOW_SCHEMA_CHECKSUM = canonical_hash({
+    "version": WORKFLOW_SCHEMA_VERSION,
+    "schema": WORKFLOW_SCHEMA_NAME,
+    "spec": WORKFLOW_SCHEMA_SPEC,
+})
+ALLOCATION_GUARD_SCHEMA_VERSION = 5
+ALLOCATION_GUARD_SCHEMA_NAME = "phase_3_allocation_guard_ownership"
+ALLOCATION_GUARD_SCHEMA_SPEC = {
+    "table": "maintenance_allocation_guards",
+    "active_phases": ("captured", "active", "recovery_required"),
+}
+ALLOCATION_GUARD_SCHEMA_CHECKSUM = canonical_hash({
+    "version": ALLOCATION_GUARD_SCHEMA_VERSION,
+    "schema": ALLOCATION_GUARD_SCHEMA_NAME,
+    "spec": ALLOCATION_GUARD_SCHEMA_SPEC,
+})
+ASSIGNMENT_WORKFLOW_SCHEMA_VERSION = 6
+ASSIGNMENT_WORKFLOW_SCHEMA_NAME = "phase_4_assignment_workflow_state"
+ASSIGNMENT_WORKFLOW_SCHEMA_SPEC = {
+    "table": "assignment_maintenance_state",
+    "states": tuple(item.value for item in MaintenanceWorkflowState),
+}
+ASSIGNMENT_WORKFLOW_SCHEMA_CHECKSUM = canonical_hash({
+    "version": ASSIGNMENT_WORKFLOW_SCHEMA_VERSION,
+    "schema": ASSIGNMENT_WORKFLOW_SCHEMA_NAME,
+    "spec": ASSIGNMENT_WORKFLOW_SCHEMA_SPEC,
+})
+HOST_ASSIGNMENT_WORKFLOW_SCHEMA_VERSION = 7
+HOST_ASSIGNMENT_WORKFLOW_SCHEMA_NAME = "phase_5_host_assignment_workflow"
+HOST_ASSIGNMENT_WORKFLOW_SCHEMA_SPEC = {
+    "index": "ix_assignment_maintenance_active_plan",
+    "shared_plan_assignments": True,
+}
+HOST_ASSIGNMENT_WORKFLOW_SCHEMA_CHECKSUM = canonical_hash({
+    "version": HOST_ASSIGNMENT_WORKFLOW_SCHEMA_VERSION,
+    "schema": HOST_ASSIGNMENT_WORKFLOW_SCHEMA_NAME,
+    "spec": HOST_ASSIGNMENT_WORKFLOW_SCHEMA_SPEC,
+})
+SCHEMA_VERSION = HOST_ASSIGNMENT_WORKFLOW_SCHEMA_VERSION
+SCHEMA_NAME = HOST_ASSIGNMENT_WORKFLOW_SCHEMA_NAME
+SCHEMA_CHECKSUM = HOST_ASSIGNMENT_WORKFLOW_SCHEMA_CHECKSUM
 TERMINAL_PLAN_STATES = frozenset({
     MaintenanceState.SUCCEEDED,
     MaintenanceState.FAILED,
@@ -122,6 +169,14 @@ class StaleLockRequiresRecovery(LockConflict):
 
 
 class LockOwnershipError(MaintenanceStoreError):
+    pass
+
+
+class AllocationGuardConflict(MaintenanceStoreError):
+    pass
+
+
+class AllocationGuardOwnershipError(MaintenanceStoreError):
     pass
 
 
@@ -229,11 +284,36 @@ class CheckpointRecord:
 
 
 @dataclass(frozen=True)
+class AllocationGuardRecord:
+    id: int
+    cluster_id: int
+    owner_plan_id: str
+    phase: str
+    checkpoint: Mapping[str, Any]
+    state_revision: int
+    created_at: str
+    updated_at: str
+    restored_at: str | None
+
+
+@dataclass(frozen=True)
+class AssignmentStateRecord:
+    assignment_id: int
+    workflow_state: MaintenanceWorkflowState
+    active_plan_id: str | None
+    state_revision: int
+    entered_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class HostStateRecord:
     node_id: int
     state: HostMaintenanceState
     active_plan_id: str | None
     state_revision: int
+    workflow_state: MaintenanceWorkflowState
+    workflow_state_revision: int
     entered_at: str
     updated_at: str
 
@@ -373,6 +453,8 @@ def _create_tables(connection: sqlite3.Connection) -> None:
           state TEXT NOT NULL DEFAULT 'available',
           active_plan_id TEXT REFERENCES maintenance_plans(id) ON DELETE SET NULL,
           state_revision INTEGER NOT NULL DEFAULT 1 CHECK(state_revision > 0),
+          workflow_state TEXT NOT NULL DEFAULT 'available',
+          workflow_state_revision INTEGER NOT NULL DEFAULT 1 CHECK(workflow_state_revision > 0),
           entered_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         )
@@ -393,6 +475,29 @@ def _create_tables(connection: sqlite3.Connection) -> None:
           release_reason TEXT,
           release_observation_json TEXT NOT NULL DEFAULT '{}',
           recovered_by TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS maintenance_allocation_guards (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          cluster_id INTEGER NOT NULL REFERENCES clusters(id) ON DELETE CASCADE,
+          owner_plan_id TEXT NOT NULL REFERENCES maintenance_plans(id) ON DELETE CASCADE,
+          phase TEXT NOT NULL,
+          checkpoint_json TEXT NOT NULL DEFAULT '{}',
+          state_revision INTEGER NOT NULL DEFAULT 1 CHECK(state_revision > 0),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          restored_at TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS assignment_maintenance_state (
+          assignment_id INTEGER PRIMARY KEY REFERENCES cluster_assignments(id) ON DELETE CASCADE,
+          workflow_state TEXT NOT NULL DEFAULT 'available',
+          active_plan_id TEXT REFERENCES maintenance_plans(id) ON DELETE SET NULL,
+          state_revision INTEGER NOT NULL DEFAULT 1 CHECK(state_revision > 0),
+          entered_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
         )
         """,
     )
@@ -474,6 +579,8 @@ def _repair_partial_schema(connection: sqlite3.Connection) -> None:
         "state": "TEXT NOT NULL DEFAULT 'available'",
         "active_plan_id": "TEXT",
         "state_revision": "INTEGER NOT NULL DEFAULT 1",
+        "workflow_state": "TEXT NOT NULL DEFAULT 'available'",
+        "workflow_state_revision": "INTEGER NOT NULL DEFAULT 1",
         "entered_at": "TEXT NOT NULL DEFAULT ''",
         "updated_at": "TEXT NOT NULL DEFAULT ''",
     })
@@ -518,6 +625,10 @@ def _create_indexes_and_triggers(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS ix_maintenance_steps_plan_state ON maintenance_steps(plan_id,state,sequence)",
         "CREATE INDEX IF NOT EXISTS ix_maintenance_locks_owner ON maintenance_locks(owner_plan_id,released_at)",
         "CREATE INDEX IF NOT EXISTS ix_maintenance_locks_expiry ON maintenance_locks(expires_at) WHERE released_at IS NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_maintenance_allocation_guards_active_cluster ON maintenance_allocation_guards(cluster_id) WHERE phase IN ('captured','active','recovery_required')",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_maintenance_allocation_guards_owner_cluster ON maintenance_allocation_guards(cluster_id,owner_plan_id)",
+        "CREATE INDEX IF NOT EXISTS ix_maintenance_allocation_guards_owner ON maintenance_allocation_guards(owner_plan_id,created_at)",
+        "CREATE INDEX IF NOT EXISTS ix_assignment_maintenance_active_plan ON assignment_maintenance_state(active_plan_id) WHERE active_plan_id IS NOT NULL",
     )
     for statement in statements:
         connection.execute(statement)
@@ -526,8 +637,11 @@ def _create_indexes_and_triggers(connection: sqlite3.Connection) -> None:
         ("maintenance_plan_state_insert", "maintenance_plans", "lifecycle_state", tuple(item.value for item in MaintenanceState)),
         ("maintenance_step_state_insert", "maintenance_steps", "state", tuple(item.value for item in MaintenanceStepState)),
         ("maintenance_host_state_insert", "host_maintenance_state", "state", tuple(item.value for item in HostMaintenanceState)),
+        ("maintenance_host_workflow_state_insert", "host_maintenance_state", "workflow_state", tuple(item.value for item in MaintenanceWorkflowState)),
         ("maintenance_lock_scope_insert", "maintenance_locks", "scope_kind", tuple(item.value for item in LockScope)),
         ("maintenance_checkpoint_effect_insert", "maintenance_checkpoints", "side_effect_state", tuple(item.value for item in SideEffectState)),
+        ("maintenance_allocation_guard_phase_insert", "maintenance_allocation_guards", "phase", ("captured", "active", "restored", "recovery_required")),
+        ("assignment_maintenance_workflow_state_insert", "assignment_maintenance_state", "workflow_state", tuple(item.value for item in MaintenanceWorkflowState)),
     )
     for name, table, column, values in enum_triggers:
         allowed = ",".join(f"'{value}'" for value in values)
@@ -547,11 +661,18 @@ def _create_indexes_and_triggers(connection: sqlite3.Connection) -> None:
     plan_transitions = _transition_sql(PLAN_TRANSITIONS, "OLD.lifecycle_state", "NEW.lifecycle_state")
     step_transitions = _transition_sql(STEP_TRANSITIONS, "OLD.state", "NEW.state")
     host_transitions = _transition_sql(HOST_TRANSITIONS, "OLD.state", "NEW.state")
+    workflow_transitions = _transition_sql(WORKFLOW_TRANSITIONS, "OLD.workflow_state", "NEW.workflow_state")
     connection.execute(f"""
         CREATE TRIGGER IF NOT EXISTS maintenance_plan_legal_transition
         BEFORE UPDATE OF lifecycle_state ON maintenance_plans
         WHEN OLD.lifecycle_state <> NEW.lifecycle_state AND NOT ({plan_transitions})
         BEGIN SELECT RAISE(ABORT, 'illegal maintenance plan transition'); END
+    """)
+    connection.execute(f"""
+        CREATE TRIGGER IF NOT EXISTS maintenance_host_workflow_legal_transition
+        BEFORE UPDATE OF workflow_state ON host_maintenance_state
+        WHEN OLD.workflow_state <> NEW.workflow_state AND NOT ({workflow_transitions})
+        BEGIN SELECT RAISE(ABORT, 'illegal maintenance workflow transition'); END
     """)
     connection.execute(f"""
         CREATE TRIGGER IF NOT EXISTS maintenance_step_legal_transition
@@ -564,6 +685,22 @@ def _create_indexes_and_triggers(connection: sqlite3.Connection) -> None:
         BEFORE UPDATE OF state ON host_maintenance_state
         WHEN OLD.state <> NEW.state AND NOT ({host_transitions})
         BEGIN SELECT RAISE(ABORT, 'illegal host maintenance transition'); END
+    """)
+    connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS maintenance_allocation_guard_legal_transition
+        BEFORE UPDATE OF phase ON maintenance_allocation_guards
+        WHEN OLD.phase <> NEW.phase AND NOT (
+          (OLD.phase='captured' AND NEW.phase IN ('active','restored','recovery_required'))
+          OR (OLD.phase='active' AND NEW.phase IN ('restored','recovery_required'))
+          OR (OLD.phase='recovery_required' AND NEW.phase='restored')
+        )
+        BEGIN SELECT RAISE(ABORT, 'illegal allocation guard transition'); END
+    """)
+    connection.execute(f"""
+        CREATE TRIGGER IF NOT EXISTS assignment_maintenance_workflow_legal_transition
+        BEFORE UPDATE OF workflow_state ON assignment_maintenance_state
+        WHEN OLD.workflow_state <> NEW.workflow_state AND NOT ({workflow_transitions})
+        BEGIN SELECT RAISE(ABORT, 'illegal assignment maintenance workflow transition'); END
     """)
     connection.execute("""
         CREATE TRIGGER IF NOT EXISTS maintenance_plan_immutable_content
@@ -659,6 +796,83 @@ def _add_observation_identity_columns(connection: sqlite3.Connection) -> None:
     })
 
 
+def _add_workflow_state_columns(connection: sqlite3.Connection) -> None:
+    if not table_exists(connection, "host_maintenance_state"):
+        return
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(host_maintenance_state)")}
+    _ensure_columns(connection, "host_maintenance_state", {
+        "workflow_state": "TEXT NOT NULL DEFAULT 'available'",
+        "workflow_state_revision": "INTEGER NOT NULL DEFAULT 1",
+    })
+    if "workflow_state" not in existing:
+        connection.execute("""
+            UPDATE host_maintenance_state SET workflow_state=CASE state
+              WHEN 'planning' THEN 'preparing'
+              WHEN 'maintenance' THEN 'maintenance'
+              WHEN 'draining' THEN 'returning'
+              WHEN 'recovery_required' THEN 'recovery_required'
+              ELSE 'available'
+            END
+        """)
+
+
+def _add_allocation_guard_ownership_schema(connection: sqlite3.Connection) -> None:
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS maintenance_allocation_guards (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          cluster_id INTEGER NOT NULL REFERENCES clusters(id) ON DELETE CASCADE,
+          owner_plan_id TEXT NOT NULL REFERENCES maintenance_plans(id) ON DELETE CASCADE,
+          phase TEXT NOT NULL,
+          checkpoint_json TEXT NOT NULL DEFAULT '{}',
+          state_revision INTEGER NOT NULL DEFAULT 1 CHECK(state_revision > 0),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          restored_at TEXT
+        )
+    """)
+    _ensure_columns(connection, "maintenance_allocation_guards", {
+        "cluster_id": "INTEGER",
+        "owner_plan_id": "TEXT",
+        "phase": "TEXT NOT NULL DEFAULT 'captured'",
+        "checkpoint_json": "TEXT NOT NULL DEFAULT '{}'",
+        "state_revision": "INTEGER NOT NULL DEFAULT 1",
+        "created_at": "TEXT NOT NULL DEFAULT ''",
+        "updated_at": "TEXT NOT NULL DEFAULT ''",
+        "restored_at": "TEXT",
+    })
+
+
+def _add_assignment_workflow_state_schema(connection: sqlite3.Connection) -> None:
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS assignment_maintenance_state (
+          assignment_id INTEGER PRIMARY KEY REFERENCES cluster_assignments(id) ON DELETE CASCADE,
+          workflow_state TEXT NOT NULL DEFAULT 'available',
+          active_plan_id TEXT REFERENCES maintenance_plans(id) ON DELETE SET NULL,
+          state_revision INTEGER NOT NULL DEFAULT 1 CHECK(state_revision > 0),
+          entered_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )
+    """)
+    _ensure_columns(connection, "assignment_maintenance_state", {
+        "assignment_id": "INTEGER",
+        "workflow_state": "TEXT NOT NULL DEFAULT 'available'",
+        "active_plan_id": "TEXT",
+        "state_revision": "INTEGER NOT NULL DEFAULT 1",
+        "entered_at": "TEXT NOT NULL DEFAULT ''",
+        "updated_at": "TEXT NOT NULL DEFAULT ''",
+    })
+
+
+def _allow_host_plan_assignment_states(connection: sqlite3.Connection) -> None:
+    """Permit one host plan to own multiple assignment workflow rows."""
+
+    connection.execute("DROP INDEX IF EXISTS ux_assignment_maintenance_active_plan")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS ix_assignment_maintenance_active_plan "
+        "ON assignment_maintenance_state(active_plan_id) WHERE active_plan_id IS NOT NULL"
+    )
+
+
 MAINTENANCE_MIGRATIONS = (
     (
         FOUNDATION_SCHEMA_VERSION,
@@ -682,6 +896,30 @@ MAINTENANCE_MIGRATIONS = (
         OBSERVATION_SCHEMA_CHECKSUM,
         _add_observation_identity_columns,
     ),
+    (
+        WORKFLOW_SCHEMA_VERSION,
+        WORKFLOW_SCHEMA_NAME,
+        WORKFLOW_SCHEMA_CHECKSUM,
+        _add_workflow_state_columns,
+    ),
+    (
+        ALLOCATION_GUARD_SCHEMA_VERSION,
+        ALLOCATION_GUARD_SCHEMA_NAME,
+        ALLOCATION_GUARD_SCHEMA_CHECKSUM,
+        _add_allocation_guard_ownership_schema,
+    ),
+    (
+        ASSIGNMENT_WORKFLOW_SCHEMA_VERSION,
+        ASSIGNMENT_WORKFLOW_SCHEMA_NAME,
+        ASSIGNMENT_WORKFLOW_SCHEMA_CHECKSUM,
+        _add_assignment_workflow_state_schema,
+    ),
+    (
+        HOST_ASSIGNMENT_WORKFLOW_SCHEMA_VERSION,
+        HOST_ASSIGNMENT_WORKFLOW_SCHEMA_NAME,
+        HOST_ASSIGNMENT_WORKFLOW_SCHEMA_CHECKSUM,
+        _allow_host_plan_assignment_states,
+    ),
 )
 
 
@@ -701,6 +939,10 @@ def _reconcile_installed_schema(connection: sqlite3.Connection) -> None:
     _create_indexes_and_triggers(connection)
     _add_provider_ownership_columns(connection)
     _add_observation_identity_columns(connection)
+    _add_workflow_state_columns(connection)
+    _add_allocation_guard_ownership_schema(connection)
+    _add_assignment_workflow_state_schema(connection)
+    _allow_host_plan_assignment_states(connection)
 
 
 def install_maintenance_schema(connection: sqlite3.Connection) -> int:
@@ -790,7 +1032,16 @@ def _checkpoint_record(row: sqlite3.Row) -> CheckpointRecord:
 
 
 def _host_record(row: sqlite3.Row) -> HostStateRecord:
-    return HostStateRecord(row["node_id"], HostMaintenanceState(row["state"]), row["active_plan_id"], row["state_revision"], row["entered_at"], row["updated_at"])
+    return HostStateRecord(
+        row["node_id"],
+        HostMaintenanceState(row["state"]),
+        row["active_plan_id"],
+        row["state_revision"],
+        MaintenanceWorkflowState(row["workflow_state"]),
+        row["workflow_state_revision"],
+        row["entered_at"],
+        row["updated_at"],
+    )
 
 
 def _lock_record(row: sqlite3.Row) -> LockRecord:
@@ -800,6 +1051,31 @@ def _lock_record(row: sqlite3.Row) -> LockRecord:
         expires_at=row["expires_at"], released_at=row["released_at"], stale_released_at=row["stale_released_at"],
         release_reason=row["release_reason"], release_observation=_load_json(row["release_observation_json"], {}),
         recovered_by=row["recovered_by"],
+    )
+
+
+def _allocation_guard_record(row: sqlite3.Row) -> AllocationGuardRecord:
+    return AllocationGuardRecord(
+        id=row["id"],
+        cluster_id=row["cluster_id"],
+        owner_plan_id=row["owner_plan_id"],
+        phase=row["phase"],
+        checkpoint=_load_json(row["checkpoint_json"], {}),
+        state_revision=row["state_revision"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        restored_at=row["restored_at"],
+    )
+
+
+def _assignment_state_record(row: sqlite3.Row) -> AssignmentStateRecord:
+    return AssignmentStateRecord(
+        assignment_id=row["assignment_id"],
+        workflow_state=MaintenanceWorkflowState(row["workflow_state"]),
+        active_plan_id=row["active_plan_id"],
+        state_revision=row["state_revision"],
+        entered_at=row["entered_at"],
+        updated_at=row["updated_at"],
     )
 
 
@@ -1281,6 +1557,172 @@ class MaintenanceRepository:
         ).fetchone()
         return _checkpoint_record(row) if row else None
 
+    def find_allocation_guard(
+        self,
+        *,
+        cluster_id: int,
+        owner_plan_id: str,
+    ) -> AllocationGuardRecord | None:
+        row = self.connection.execute("""
+            SELECT * FROM maintenance_allocation_guards
+            WHERE cluster_id=? AND owner_plan_id=?
+            ORDER BY id DESC LIMIT 1
+        """, (cluster_id, owner_plan_id)).fetchone()
+        return _allocation_guard_record(row) if row else None
+
+    def find_active_allocation_guard(self, cluster_id: int) -> AllocationGuardRecord | None:
+        row = self.connection.execute("""
+            SELECT * FROM maintenance_allocation_guards
+            WHERE cluster_id=? AND phase IN ('captured','active','recovery_required')
+            ORDER BY id DESC LIMIT 1
+        """, (cluster_id,)).fetchone()
+        return _allocation_guard_record(row) if row else None
+
+    def create_allocation_guard(
+        self,
+        *,
+        cluster_id: int,
+        owner_plan_id: str,
+        checkpoint: Mapping[str, Any],
+        phase: str = "captured",
+        now: datetime | None = None,
+    ) -> AllocationGuardRecord:
+        if phase != "captured":
+            raise ValueError("A new allocation guard must start captured")
+        if checkpoint.get("plan_id") != owner_plan_id or checkpoint.get("cluster_id") != cluster_id:
+            raise ValueError("Allocation guard checkpoint identity does not match its owner")
+        existing = self.find_allocation_guard(cluster_id=cluster_id, owner_plan_id=owner_plan_id)
+        checkpoint_json = _json(checkpoint)
+        if existing:
+            if existing.phase == phase and _json(existing.checkpoint) == checkpoint_json:
+                return existing
+            raise AllocationGuardConflict("Allocation guard already exists for this plan and cluster")
+        active = self.find_active_allocation_guard(cluster_id)
+        if active:
+            raise AllocationGuardConflict("Cluster allocation guard is owned by another maintenance plan")
+        timestamp = iso_timestamp(now)
+        try:
+            cursor = self.connection.execute("""
+                INSERT INTO maintenance_allocation_guards(
+                  cluster_id,owner_plan_id,phase,checkpoint_json,state_revision,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?)
+            """, (cluster_id, owner_plan_id, phase, checkpoint_json, 1, timestamp, timestamp))
+        except sqlite3.IntegrityError as error:
+            raise AllocationGuardConflict("Cluster allocation guard was acquired concurrently") from error
+        return self.get_allocation_guard(cursor.lastrowid)
+
+    def get_allocation_guard(self, guard_id: int) -> AllocationGuardRecord:
+        row = self.connection.execute(
+            "SELECT * FROM maintenance_allocation_guards WHERE id=?", (guard_id,),
+        ).fetchone()
+        if not row:
+            raise RecordNotFound(f"Maintenance allocation guard {guard_id} was not found")
+        return _allocation_guard_record(row)
+
+    def transition_allocation_guard(
+        self,
+        guard_id: int,
+        *,
+        owner_plan_id: str,
+        expected_revision: int,
+        phase: str,
+        checkpoint: Mapping[str, Any],
+        now: datetime | None = None,
+    ) -> AllocationGuardRecord:
+        allowed = {"captured", "active", "restored", "recovery_required"}
+        if phase not in allowed:
+            raise ValueError("Unsupported allocation guard phase")
+        current = self.get_allocation_guard(guard_id)
+        if current.owner_plan_id != owner_plan_id:
+            raise AllocationGuardOwnershipError("Maintenance plan does not own this allocation guard")
+        if current.state_revision != expected_revision:
+            raise RevisionConflict("Allocation guard revision changed")
+        if checkpoint.get("plan_id") != owner_plan_id or checkpoint.get("cluster_id") != current.cluster_id:
+            raise ValueError("Allocation guard checkpoint identity does not match its owner")
+        timestamp = iso_timestamp(now)
+        restored_at = timestamp if phase == "restored" else current.restored_at
+        try:
+            result = self.connection.execute("""
+                UPDATE maintenance_allocation_guards
+                SET phase=?,checkpoint_json=?,state_revision=state_revision+1,updated_at=?,restored_at=?
+                WHERE id=? AND owner_plan_id=? AND state_revision=? AND phase=?
+            """, (
+                phase,
+                _json(checkpoint),
+                timestamp,
+                restored_at,
+                guard_id,
+                owner_plan_id,
+                expected_revision,
+                current.phase,
+            ))
+        except sqlite3.IntegrityError as error:
+            raise AllocationGuardConflict("Illegal allocation guard transition") from error
+        if result.rowcount != 1:
+            raise RevisionConflict("Allocation guard revision changed")
+        return self.get_allocation_guard(guard_id)
+
+    def find_assignment_state(self, assignment_id: int) -> AssignmentStateRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM assignment_maintenance_state WHERE assignment_id=?", (assignment_id,),
+        ).fetchone()
+        return _assignment_state_record(row) if row else None
+
+    def get_assignment_state(self, assignment_id: int) -> AssignmentStateRecord:
+        row = self.connection.execute(
+            "SELECT * FROM assignment_maintenance_state WHERE assignment_id=?", (assignment_id,),
+        ).fetchone()
+        if row is None:
+            now = iso_timestamp()
+            try:
+                self.connection.execute("""
+                    INSERT INTO assignment_maintenance_state(
+                      assignment_id,workflow_state,active_plan_id,state_revision,entered_at,updated_at
+                    ) VALUES(?,?,?,?,?,?)
+                """, (assignment_id, MaintenanceWorkflowState.AVAILABLE.value, None, 1, now, now))
+            except sqlite3.IntegrityError as error:
+                raise RecordNotFound(f"Workload assignment {assignment_id} was not found") from error
+            row = self.connection.execute(
+                "SELECT * FROM assignment_maintenance_state WHERE assignment_id=?", (assignment_id,),
+            ).fetchone()
+        return _assignment_state_record(row)
+
+    def transition_assignment_state(
+        self,
+        assignment_id: int,
+        expected_revision: int,
+        target: MaintenanceWorkflowState | str,
+        active_plan_id: str | None,
+        *,
+        now: datetime | None = None,
+    ) -> AssignmentStateRecord:
+        current = self.get_assignment_state(assignment_id)
+        if current.state_revision != expected_revision:
+            raise RevisionConflict("Assignment maintenance workflow revision changed")
+        target_state = MaintenanceWorkflowState(target)
+        validate_workflow_transition(current.workflow_state, target_state)
+        if target_state == MaintenanceWorkflowState.AVAILABLE:
+            active_plan_id = None
+        elif not active_plan_id:
+            raise ValueError("An active plan is required outside the available assignment state")
+        timestamp = iso_timestamp(now)
+        result = self.connection.execute("""
+            UPDATE assignment_maintenance_state
+            SET workflow_state=?,active_plan_id=?,state_revision=state_revision+1,entered_at=?,updated_at=?
+            WHERE assignment_id=? AND state_revision=? AND workflow_state=?
+        """, (
+            target_state.value,
+            active_plan_id,
+            timestamp,
+            timestamp,
+            assignment_id,
+            expected_revision,
+            current.workflow_state.value,
+        ))
+        if result.rowcount != 1:
+            raise RevisionConflict("Assignment maintenance workflow revision changed")
+        return self.get_assignment_state(assignment_id)
+
     def classify_checkpoint(
         self,
         checkpoint_id: int,
@@ -1362,8 +1804,10 @@ class MaintenanceRepository:
         if not row:
             now = iso_timestamp()
             self.connection.execute(
-                "INSERT INTO host_maintenance_state(node_id,state,active_plan_id,state_revision,entered_at,updated_at) VALUES(?,?,?,?,?,?)",
-                (node_id, HostMaintenanceState.AVAILABLE.value, None, 1, now, now),
+                "INSERT INTO host_maintenance_state("
+                "node_id,state,active_plan_id,state_revision,workflow_state,workflow_state_revision,entered_at,updated_at"
+                ") VALUES(?,?,?,?,?,?,?,?)",
+                (node_id, HostMaintenanceState.AVAILABLE.value, None, 1, MaintenanceWorkflowState.AVAILABLE.value, 1, now, now),
             )
             row = self.connection.execute("SELECT * FROM host_maintenance_state WHERE node_id=?", (node_id,)).fetchone()
         return _host_record(row)
@@ -1386,12 +1830,50 @@ class MaintenanceRepository:
         elif not active_plan_id:
             raise ValueError("An active plan is required outside the available host state")
         timestamp = iso_timestamp(now)
+        target_workflow_state = LEGACY_HOST_WORKFLOW_STATE[target_state]
         result = self.connection.execute("""
             UPDATE host_maintenance_state SET state=?,active_plan_id=?,state_revision=state_revision+1,
-              entered_at=?,updated_at=? WHERE node_id=? AND state_revision=? AND state=?
-        """, (target_state.value, active_plan_id, timestamp, timestamp, node_id, expected_revision, current.state.value))
+              workflow_state=?,workflow_state_revision=workflow_state_revision+1,entered_at=?,updated_at=?
+            WHERE node_id=? AND state_revision=? AND state=?
+        """, (
+            target_state.value,
+            active_plan_id,
+            target_workflow_state.value,
+            timestamp,
+            timestamp,
+            node_id,
+            expected_revision,
+            current.state.value,
+        ))
         if result.rowcount != 1:
             raise RevisionConflict("Host maintenance state revision changed")
+        return self.get_host_state(node_id)
+
+    def transition_host_workflow_state(
+        self,
+        node_id: int,
+        expected_revision: int,
+        target: MaintenanceWorkflowState | str,
+        now: datetime | None = None,
+    ) -> HostStateRecord:
+        current = self.get_host_state(node_id)
+        if current.workflow_state_revision != expected_revision:
+            raise RevisionConflict("Host maintenance workflow revision changed")
+        target_state = MaintenanceWorkflowState(target)
+        validate_workflow_transition(current.workflow_state, target_state)
+        timestamp = iso_timestamp(now)
+        result = self.connection.execute("""
+            UPDATE host_maintenance_state SET workflow_state=?,workflow_state_revision=workflow_state_revision+1,
+              updated_at=? WHERE node_id=? AND workflow_state_revision=? AND workflow_state=?
+        """, (
+            target_state.value,
+            timestamp,
+            node_id,
+            expected_revision,
+            current.workflow_state.value,
+        ))
+        if result.rowcount != 1:
+            raise RevisionConflict("Host maintenance workflow revision changed")
         return self.get_host_state(node_id)
 
     def acquire_locks(

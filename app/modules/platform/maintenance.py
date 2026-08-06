@@ -31,6 +31,19 @@ def _approved_environment_capability(capability: str, variable: str) -> bool:
 
 MAINTENANCE_CAPABILITIES = {
     "planning": _environment_flag("MAINTENANCE_PLANNING_ENABLED"),
+    "manual_maintenance_entry": _approved_environment_capability(
+        "manual_maintenance_entry", "MAINTENANCE_MANUAL_MAINTENANCE_ENABLED"
+    ),
+    "container_stop": _approved_environment_capability(
+        "container_stop", "MAINTENANCE_CONTAINER_STOP_ENABLED"
+    ),
+    "host_shutdown": _approved_environment_capability(
+        "host_shutdown", "MAINTENANCE_HOST_SHUTDOWN_ENABLED"
+    ),
+    # Active maintenance windows must always retain a supported path to safe
+    # cleanup and state recovery. These are not new-entry mutation gates.
+    "manual_maintenance_exit": True,
+    "recovery": True,
     "host_reboot": _approved_environment_capability("host_reboot", "MAINTENANCE_HOST_REBOOT_ENABLED"),
     "rolling_restart": _approved_environment_capability("rolling_restart", "MAINTENANCE_ROLLING_RESTART_ENABLED"),
     "upgrade": _approved_environment_capability("upgrade", "MAINTENANCE_UPGRADE_ENABLED"),

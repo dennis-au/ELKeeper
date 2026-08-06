@@ -5,7 +5,11 @@ import unittest
 from datetime import datetime, timezone
 
 from app.maintenance_models import SourceStatus
-from app.maintenance_observation import collect_host_reboot_planning_data
+from app.maintenance_observation import (
+    collect_generic_preview_data,
+    collect_host_reboot_planning_data,
+)
+from app.modules.maintenance.store import install_maintenance_schema
 
 
 NOW = datetime(2026, 8, 3, 4, 0, tzinfo=timezone.utc)
@@ -46,7 +50,18 @@ class MaintenanceObservationTests(unittest.TestCase):
           node_id INTEGER NOT NULL,
           role TEXT NOT NULL,
           state TEXT NOT NULL,
-          revision INTEGER NOT NULL
+          revision INTEGER NOT NULL,
+          operation_run_id INTEGER
+        );
+        CREATE TABLE runs (
+          id INTEGER PRIMARY KEY,
+          target TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL,
+          context_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE workload_change_batches (
+          run_id INTEGER PRIMARY KEY,
+          cluster_id INTEGER NOT NULL
         );
         CREATE TABLE workload_observations (
           assignment_id INTEGER PRIMARY KEY,
@@ -62,6 +77,7 @@ class MaintenanceObservationTests(unittest.TestCase):
           last_error TEXT NOT NULL
         );
         """)
+        install_maintenance_schema(self.connection)
         self.connection.execute("INSERT INTO nodes VALUES(1,'node-a',1)")
         self.telemetry = TelemetryStub()
         self.telemetry.host_states[1] = {
@@ -75,12 +91,13 @@ class MaintenanceObservationTests(unittest.TestCase):
         self.connection.close()
 
     def add_cluster(self, *, role="master", workload_observed_at=NOW, cluster_observed_at=NOW):
-        self.connection.execute("INSERT INTO clusters VALUES(1,'cluster-a')")
+        self.connection.execute("INSERT INTO clusters(id,name) VALUES(1,'cluster-a')")
         self.connection.execute(
             "INSERT INTO memberships VALUES(1,1,'shared','ens18','192.0.2.10','ens18','192.0.2.10')"
         )
         self.connection.execute(
-            "INSERT INTO cluster_assignments VALUES(1,1,1,?,'active',1)",
+            "INSERT INTO cluster_assignments(id,cluster_id,node_id,role,state,revision) "
+            "VALUES(1,1,1,?,'active',1)",
             (role,),
         )
         stored_workload_time = (
@@ -88,7 +105,7 @@ class MaintenanceObservationTests(unittest.TestCase):
             else workload_observed_at
         )
         self.connection.execute(
-            "INSERT INTO workload_observations VALUES(1,1,?,'')",
+            "INSERT INTO workload_observations(assignment_id,running,observed_at,error) VALUES(1,1,?,'')",
             (stored_workload_time,),
         )
         self.telemetry.cluster_states[1] = {
@@ -107,12 +124,13 @@ class MaintenanceObservationTests(unittest.TestCase):
             "stale_shutdown_record": False,
         }
 
-    def collect(self):
+    def collect(self, *, include_post_return_expectations=False):
         return collect_host_reboot_planning_data(
             self.connection,
             self.telemetry,
             node_id=1,
             capability_revision="test-capabilities",
+            include_post_return_expectations=include_post_return_expectations,
             clock=lambda: NOW,
         )
 
@@ -189,6 +207,37 @@ class MaintenanceObservationTests(unittest.TestCase):
         self.assertIsNone(data.clusters[0].configured_uuid)
         self.assertFalse(data.clusters[0].identity_matches)
         self.assertEqual(self.source(data, "cluster-identity").status, SourceStatus.MISSING)
+
+    def test_generic_host_preview_retains_immutable_runtime_return_evidence(self):
+        self.telemetry.host_states[1]["network_interfaces"] = {
+            "ens18": ["192.0.2.10"],
+        }
+        self.add_cluster()
+        self.connection.execute("ALTER TABLE clusters ADD COLUMN slug TEXT")
+        self.connection.execute("UPDATE clusters SET slug='cluster-a' WHERE id=1")
+        self.connection.execute("ALTER TABLE workload_observations ADD COLUMN version TEXT")
+        self.connection.execute("UPDATE workload_observations SET version='8.19.0' WHERE assignment_id=1")
+        self.telemetry.cluster_states[1]["node_breakdown"] = [{
+            "id": "persistent-node-1",
+            "name": "ecp-cluster-a-master-1",
+        }]
+
+        data = collect_generic_preview_data(
+            self.connection,
+            self.telemetry,
+            node_ids=(1,),
+            capability_revision="test-capabilities",
+            include_post_return_expectations=True,
+            clock=lambda: NOW,
+        )
+
+        expectations = data.post_return_expectations
+        self.assertIsNotNone(expectations)
+        assert expectations is not None
+        self.assertEqual(expectations.clusters[0].nodes[0].persistent_node_id, "persistent-node-1")
+        self.assertEqual(expectations.clusters[0].nodes[0].version, "8.19.0")
+        self.assertEqual(expectations.clusters[0].nodes[0].cluster_uuid, "observed-cluster-uuid")
+        self.assertEqual(expectations.endpoints[0].endpoint_ref, "assignment-1")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping
 
+from .planned_contracts import MaintenanceWorkflowState
+
 
 class MaintenanceState(str, Enum):
     DRAFT = "draft"
@@ -37,6 +39,15 @@ class HostMaintenanceState(str, Enum):
     MAINTENANCE = "maintenance"
     DRAINING = "draining"
     RECOVERY_REQUIRED = "recovery_required"
+
+
+LEGACY_HOST_WORKFLOW_STATE: dict[HostMaintenanceState, MaintenanceWorkflowState] = {
+    HostMaintenanceState.AVAILABLE: MaintenanceWorkflowState.AVAILABLE,
+    HostMaintenanceState.PLANNING: MaintenanceWorkflowState.PREPARING,
+    HostMaintenanceState.MAINTENANCE: MaintenanceWorkflowState.MAINTENANCE,
+    HostMaintenanceState.DRAINING: MaintenanceWorkflowState.RETURNING,
+    HostMaintenanceState.RECOVERY_REQUIRED: MaintenanceWorkflowState.RECOVERY_REQUIRED,
+}
 
 
 class LockScope(str, Enum):
@@ -86,6 +97,56 @@ HOST_TRANSITIONS: dict[HostMaintenanceState, frozenset[HostMaintenanceState]] = 
     HostMaintenanceState.RECOVERY_REQUIRED: frozenset({HostMaintenanceState.AVAILABLE, HostMaintenanceState.PLANNING, HostMaintenanceState.MAINTENANCE}),
 }
 
+WORKFLOW_TRANSITIONS: dict[MaintenanceWorkflowState, frozenset[MaintenanceWorkflowState]] = {
+    MaintenanceWorkflowState.AVAILABLE: frozenset({MaintenanceWorkflowState.PREPARING}),
+    MaintenanceWorkflowState.PREPARING: frozenset({
+        MaintenanceWorkflowState.AVAILABLE,
+        MaintenanceWorkflowState.READY_TO_STOP,
+        MaintenanceWorkflowState.MAINTENANCE,
+        MaintenanceWorkflowState.BLOCKED,
+        MaintenanceWorkflowState.RECOVERY_REQUIRED,
+    }),
+    MaintenanceWorkflowState.READY_TO_STOP: frozenset({
+        MaintenanceWorkflowState.AVAILABLE,
+        MaintenanceWorkflowState.STOPPING,
+        MaintenanceWorkflowState.BLOCKED,
+        MaintenanceWorkflowState.RECOVERY_REQUIRED,
+    }),
+    MaintenanceWorkflowState.STOPPING: frozenset({
+        MaintenanceWorkflowState.MAINTENANCE,
+        MaintenanceWorkflowState.BLOCKED,
+        MaintenanceWorkflowState.RECOVERY_REQUIRED,
+    }),
+    MaintenanceWorkflowState.MAINTENANCE: frozenset({
+        MaintenanceWorkflowState.AVAILABLE,
+        MaintenanceWorkflowState.RETURNING,
+        MaintenanceWorkflowState.BLOCKED,
+        MaintenanceWorkflowState.RECOVERY_REQUIRED,
+    }),
+    MaintenanceWorkflowState.RETURNING: frozenset({
+        MaintenanceWorkflowState.AVAILABLE,
+        MaintenanceWorkflowState.VERIFYING,
+        MaintenanceWorkflowState.BLOCKED,
+        MaintenanceWorkflowState.RECOVERY_REQUIRED,
+    }),
+    MaintenanceWorkflowState.VERIFYING: frozenset({
+        MaintenanceWorkflowState.AVAILABLE,
+        MaintenanceWorkflowState.BLOCKED,
+        MaintenanceWorkflowState.RECOVERY_REQUIRED,
+    }),
+    MaintenanceWorkflowState.BLOCKED: frozenset({
+        MaintenanceWorkflowState.AVAILABLE,
+        MaintenanceWorkflowState.PREPARING,
+        MaintenanceWorkflowState.RECOVERY_REQUIRED,
+    }),
+    MaintenanceWorkflowState.RECOVERY_REQUIRED: frozenset({
+        MaintenanceWorkflowState.AVAILABLE,
+        MaintenanceWorkflowState.PREPARING,
+        MaintenanceWorkflowState.MAINTENANCE,
+        MaintenanceWorkflowState.RETURNING,
+    }),
+}
+
 
 def validate_transition(current: Enum, target: Enum, transitions: Mapping[Enum, frozenset[Enum]]) -> None:
     if current == target:
@@ -104,6 +165,13 @@ def validate_step_transition(current: MaintenanceStepState | str, target: Mainte
 
 def validate_host_transition(current: HostMaintenanceState | str, target: HostMaintenanceState | str) -> None:
     validate_transition(HostMaintenanceState(current), HostMaintenanceState(target), HOST_TRANSITIONS)
+
+
+def validate_workflow_transition(
+    current: MaintenanceWorkflowState | str,
+    target: MaintenanceWorkflowState | str,
+) -> None:
+    validate_transition(MaintenanceWorkflowState(current), MaintenanceWorkflowState(target), WORKFLOW_TRANSITIONS)
 
 
 SENSITIVE_KEY_PARTS = ("api_key", "credential", "enrollment", "passphrase", "password", "private_key", "secret", "token")

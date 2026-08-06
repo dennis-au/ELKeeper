@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.maintenance_lifecycle import MaintenanceState, MaintenanceStepState, SideEffectState
 from app.maintenance_status import MaintenanceActionCapabilities, serialize_maintenance_operation
+from app.modules.maintenance.planned_contracts import MaintenanceWorkflowState
 from app.modules.maintenance.store import MaintenanceRepository, install_maintenance_schema
 
 
@@ -132,6 +133,15 @@ class MaintenanceStatusTests(unittest.TestCase):
         payload = self.status(capabilities=MaintenanceActionCapabilities(pause=True, resume=True, cancel=True, recover=True))
         self.assertEqual(payload["progress"]["progress"], {"completed": 1, "total": 1})
         self.assertEqual(payload["action_controls"], {})
+
+    def test_persisted_workflow_state_is_available_to_the_operator_read_model(self):
+        payload = self.status(
+            workflow_state=MaintenanceWorkflowState.READY_TO_STOP,
+            workflow_scope="host_maintenance",
+        )
+
+        self.assertEqual(payload["progress"]["workflowState"], "ready_to_stop")
+        self.assertEqual(payload["progress"]["workflowScope"], "host_maintenance")
 
 
 if __name__ == "__main__":

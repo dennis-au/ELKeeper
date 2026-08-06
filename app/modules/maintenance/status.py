@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.modules.maintenance.lifecycle import HostMaintenanceState, MaintenanceState, MaintenanceStepState, SideEffectState, redact_structure
+from app.modules.maintenance.planned_contracts import MaintenanceWorkflowState
 from app.modules.maintenance.store import CheckpointRecord, HostStateRecord, PlanRecord, StepRecord
 
 _STEP_STATES = {
@@ -81,7 +82,17 @@ def _actions(state: MaintenanceState, capabilities: MaintenanceActionCapabilitie
     return controls
 
 
-def serialize_maintenance_operation(plan: PlanRecord, *, steps: Sequence[StepRecord] = (), checkpoints: Sequence[CheckpointRecord] = (), host_state: HostStateRecord | None = None, capabilities: MaintenanceActionCapabilities | None = None, evidence: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def serialize_maintenance_operation(
+    plan: PlanRecord,
+    *,
+    steps: Sequence[StepRecord] = (),
+    checkpoints: Sequence[CheckpointRecord] = (),
+    host_state: HostStateRecord | None = None,
+    workflow_state: MaintenanceWorkflowState | None = None,
+    workflow_scope: str | None = None,
+    capabilities: MaintenanceActionCapabilities | None = None,
+    evidence: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Build the redacted persisted progress contract used by the maintenance UI."""
 
     ordered_steps = tuple(sorted(steps, key=lambda item: item.sequence))
@@ -101,6 +112,8 @@ def serialize_maintenance_operation(plan: PlanRecord, *, steps: Sequence[StepRec
         active_checkpoint = {"id": active_step.step_key, "label": _checkpoint_label(active_step.step_kind), "state": "recovery_required" if active_step.state == MaintenanceStepState.RECOVERY_REQUIRED else "active", "safeForOperatorAction": safe, "detail": safe_reason, "updatedAt": active_step.updated_at}
     progress = {
         "lifecycleState": plan.lifecycle_state.value, "progress": {"completed": completed, "total": len(ordered_steps)},
+        "workflowState": workflow_state.value if workflow_state is not None else None,
+        "workflowScope": workflow_scope,
         "activeCheckpoint": active_checkpoint,
         "lastVerifiedCheckpoint": ({"label": _checkpoint_label(last_verified.step_kind), "verifiedAt": last_verified.finished_at} if last_verified else None),
         "hostBoot": _host_boot(ordered_checkpoints, evidence.get("host_boot", {})),

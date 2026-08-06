@@ -11,7 +11,7 @@ export type MaintenancePlanState =
 
 export type MaintenanceFreshnessState = 'fresh' | 'stale' | 'expired';
 export type MaintenancePredicateOutcome = 'passed' | 'warning' | 'blocking';
-export type MaintenanceTargetKind = 'host' | 'cluster' | 'assignment';
+export type MaintenanceTargetKind = 'host' | 'cluster' | 'assignment' | 'container';
 export type MaintenanceAvailability = 'preserved' | 'degraded' | 'unavailable';
 
 export type MaintenanceStepState =
@@ -38,6 +38,7 @@ export interface MaintenancePlanHeaderData {
   state: MaintenancePlanState;
   target: {
     kind: MaintenanceTargetKind;
+    id?: string | number;
     name: string;
   };
   operation: string;

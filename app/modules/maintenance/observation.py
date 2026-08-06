@@ -16,6 +16,12 @@ from .models import (
     SourceStatus,
     WorkloadObservation,
 )
+from .post_return import (
+    ClusterExpectation,
+    EndpointExpectation,
+    NodeIdentityExpectation,
+    PostReturnExpectations,
+)
 from .service import HostRebootPlanningData
 from .provider import provider_profile_from_record
 from .repository import MaintenanceRepository
@@ -174,6 +180,86 @@ def _disk_watermarks_safe(state: dict, data_affected: bool) -> bool:
     return ((total - available) / total) < 0.9
 
 
+def _host_maintenance_post_return_expectations(
+    *,
+    target_node_id: int,
+    assignment_rows: list[sqlite3.Row],
+    cluster_rows: list[sqlite3.Row],
+    telemetry: Any,
+) -> PostReturnExpectations | None:
+    """Build immutable return evidence from the current runtime projection.
+
+    The monitoring collector's ``node_breakdown`` is derived from the
+    CA-verified Elasticsearch nodes-stats response. It supplies the persistent
+    node ID and node name, while the workload runtime projection supplies the
+    observed container version. Neither source is inferred from desired state.
+    """
+
+    targets = [row for row in assignment_rows if int(row["node_id"]) == target_node_id]
+    if not targets:
+        return None
+    clusters_by_id = {int(row["id"]): row for row in cluster_rows}
+    affected_cluster_ids = tuple(sorted({int(row["cluster_id"]) for row in targets}))
+    if set(affected_cluster_ids) != set(clusters_by_id):
+        return None
+
+    try:
+        expectations = []
+        endpoint_refs = []
+        for cluster_id in affected_cluster_ids:
+            cluster = clusters_by_id[cluster_id]
+            state = _cluster_runtime(telemetry, cluster_id)
+            cluster_uuid = state.get("cluster_uuid")
+            nodes = state.get("node_breakdown")
+            if not isinstance(cluster_uuid, str) or not cluster_uuid or not isinstance(nodes, list):
+                return None
+            by_name = {
+                str(item.get("name")): item
+                for item in nodes
+                if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+            }
+            cluster_nodes = []
+            for assignment in sorted(
+                (
+                    row for row in targets
+                    if int(row["cluster_id"]) == cluster_id and row["role"] in ELASTICSEARCH_ROLES
+                ),
+                key=lambda row: int(row["id"]),
+            ):
+                expected_name = f"ecp-{cluster['slug']}-{assignment['role']}-{assignment['node_id']}"
+                observed_node = by_name.get(expected_name)
+                observed_version = assignment["observed_version"]
+                if (
+                    observed_node is None
+                    or not isinstance(observed_node.get("id"), str)
+                    or not observed_node.get("id")
+                    or not isinstance(observed_version, str)
+                    or not observed_version
+                ):
+                    return None
+                cluster_nodes.append(NodeIdentityExpectation(
+                    cluster_id=cluster_id,
+                    assignment_id=int(assignment["id"]),
+                    persistent_node_id=observed_node["id"],
+                    node_name=expected_name,
+                    version=observed_version,
+                    cluster_uuid=cluster_uuid,
+                ))
+            for assignment in targets:
+                if int(assignment["cluster_id"]) == cluster_id and assignment["role"] in ENDPOINT_ROLES:
+                    endpoint_refs.append(f"assignment-{int(assignment['id'])}")
+            expectations.append(ClusterExpectation(
+                cluster_id=cluster_id,
+                nodes=tuple(cluster_nodes),
+            ))
+        return PostReturnExpectations(
+            endpoints=tuple(EndpointExpectation(endpoint_ref=item) for item in sorted(endpoint_refs)),
+            clusters=tuple(expectations),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def collect_host_reboot_planning_data(
     connection: sqlite3.Connection,
     telemetry: Any,
@@ -182,6 +268,7 @@ def collect_host_reboot_planning_data(
     capability_revision: str,
     conflicting_operations: tuple[str, ...] = (),
     node_shutdown_backend_enabled: bool = False,
+    include_post_return_expectations: bool = False,
     clock=utc_now,
 ) -> HostRebootPlanningData:
     captured_at = clock().astimezone(timezone.utc)
@@ -194,9 +281,19 @@ def collect_host_reboot_planning_data(
     affected_cluster_ids = tuple(sorted({row.cluster_id for row in target_assignments}))
     if affected_cluster_ids:
         placeholders = ",".join("?" for _ in affected_cluster_ids)
+        workload_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(workload_observations)").fetchall()
+        }
+        observed_version = (
+            "workload_observations.version AS observed_version"
+            if "version" in workload_columns
+            else "'' AS observed_version"
+        )
         assignment_rows = connection.execute(
             "SELECT cluster_assignments.*,nodes.name AS node_name,"
-            "workload_observations.running AS observed_running,workload_observations.observed_at,"
+            "workload_observations.running AS observed_running," + observed_version + ","
+            "workload_observations.observed_at,"
             "workload_observations.error AS observation_error "
             "FROM cluster_assignments JOIN nodes ON nodes.id=cluster_assignments.node_id "
             "LEFT JOIN workload_observations ON workload_observations.assignment_id=cluster_assignments.id "
@@ -425,6 +522,16 @@ def collect_host_reboot_planning_data(
         workloads=tuple(workload_observations),
         assignment_revisions=tuple(revisions),
         conflicting_operations=conflicting_operations,
+        post_return_expectations=(
+            _host_maintenance_post_return_expectations(
+                target_node_id=node_id,
+                assignment_rows=assignment_rows,
+                cluster_rows=cluster_rows,
+                telemetry=telemetry,
+            )
+            if include_post_return_expectations
+            else None
+        ),
     )
 
 
@@ -437,6 +544,7 @@ def collect_generic_preview_data(
     additional_cluster_ids: tuple[int, ...] = (),
     additional_assignment_ids: tuple[int, ...] = (),
     node_shutdown_backend_enabled: bool = False,
+    include_post_return_expectations: bool = False,
     clock=utc_now,
 ) -> HostRebootPlanningData:
     """Collect a merged, read-only observation for a generic preview target.
@@ -448,6 +556,7 @@ def collect_generic_preview_data(
     """
 
     anchors = set(int(item) for item in node_ids)
+    post_return_node_id = next(iter(node_ids), None)
     cluster_ids = tuple(sorted(set(int(item) for item in additional_cluster_ids)))
     assignment_ids = tuple(sorted(set(int(item) for item in additional_assignment_ids)))
     if assignment_ids:
@@ -493,6 +602,9 @@ def collect_generic_preview_data(
             capability_revision=capability_revision,
             conflicting_operations=conflicts.conflict_identifiers,
             node_shutdown_backend_enabled=node_shutdown_backend_enabled,
+            include_post_return_expectations=(
+                include_post_return_expectations and node_id == post_return_node_id
+            ),
             clock=clock,
         ))
     first = observations[0]
@@ -514,4 +626,5 @@ def collect_generic_preview_data(
         conflicting_operations=tuple(sorted({
             conflict for item in observations for conflict in item.conflicting_operations
         })),
+        post_return_expectations=first.post_return_expectations,
     )

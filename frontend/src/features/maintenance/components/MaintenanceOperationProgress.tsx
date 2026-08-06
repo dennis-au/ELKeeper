@@ -75,6 +75,8 @@ export interface MaintenanceExecutorEvidence {
 
 export interface MaintenanceOperationProgressModel {
   lifecycleState: MaintenancePlanState;
+  workflowState?: 'available' | 'preparing' | 'ready_to_stop' | 'stopping' | 'maintenance' | 'returning' | 'verifying' | 'blocked' | 'recovery_required' | null;
+  workflowScope?: 'host_maintenance' | 'container_maintenance' | null;
   progress?: { completed: number; total: number };
   activeCheckpoint?: MaintenanceCheckpointEvidence;
   lastVerifiedCheckpoint?: { label: string; verifiedAt?: string };

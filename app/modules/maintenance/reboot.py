@@ -283,6 +283,7 @@ class MaintenanceRepositoryRebootJournal:
         *,
         plan_id: str,
         captures: Sequence[tuple[int, Mapping[str, Any]]],
+        sequence_base: int = 0,
     ) -> CheckpointRecord:
         connection = self.repository.connection
         connection.execute("SAVEPOINT reboot_cluster_preparation")
@@ -291,14 +292,14 @@ class MaintenanceRepositoryRebootJournal:
                 self.record(
                     plan_id=plan_id,
                     key=f"reboot.cluster.{cluster_id}.captured",
-                    sequence=100 + offset,
+                    sequence=sequence_base + 100 + offset,
                     side_effect_state=SideEffectState.NOT_STARTED,
                     payload={"cluster_id": cluster_id, "capture": capture},
                 )
             aggregate = self.record(
                 plan_id=plan_id,
                 key="reboot.clusters-prepared",
-                sequence=200,
+                sequence=sequence_base + 200,
                 side_effect_state=SideEffectState.PREPARED,
                 payload={"cluster_ids": [item[0] for item in captures]},
             )
@@ -324,6 +325,7 @@ class RebootOrchestrator:
         host: RebootGatewayProtocol,
         control: RebootControlProtocol | None = None,
         execution_enabled: bool = False,
+        sequence_base: int = 0,
     ):
         self.repository = repository
         self.journal = MaintenanceRepositoryRebootJournal(repository)
@@ -332,6 +334,9 @@ class RebootOrchestrator:
         self.host = host
         self.control = control or RebootControl()
         self.execution_enabled = execution_enabled
+        if sequence_base < 0 or sequence_base > 1_000_000:
+            raise ValueError("reboot checkpoint sequence base is invalid")
+        self.sequence_base = sequence_base
 
     async def run(self, request: RebootRequest, *, resume: bool = False) -> RebootOrchestrationResult:
         if not self.execution_enabled:
@@ -463,7 +468,7 @@ class RebootOrchestrator:
             self.journal.record(
                 plan_id=request.plan_id,
                 key="reboot.intent",
-                sequence=700,
+                sequence=self._sequence(700),
                 side_effect_state=SideEffectState.PREPARED,
                 payload={"operation_id": operation_id, "node_id": request.node_id},
                 observation={"pre_reboot_boot_id": request.pre_reboot_boot_id},
@@ -497,7 +502,7 @@ class RebootOrchestrator:
             acknowledged = self.journal.record(
                 plan_id=request.plan_id,
                 key="reboot.invocation-acknowledged",
-                sequence=800,
+                sequence=self._sequence(800),
                 side_effect_state=SideEffectState.MAY_HAVE_STARTED,
                 payload=_jsonable(invocation),
             )
@@ -520,7 +525,7 @@ class RebootOrchestrator:
             disconnected = self.journal.record(
                 plan_id=request.plan_id,
                 key="reboot.ssh-disconnected",
-                sequence=900,
+                sequence=self._sequence(900),
                 side_effect_state=SideEffectState.MAY_HAVE_STARTED,
                 payload=_jsonable(disconnect),
             )
@@ -546,7 +551,7 @@ class RebootOrchestrator:
             reconnected = self.journal.record(
                 plan_id=request.plan_id,
                 key="reboot.host-reconnected",
-                sequence=1000,
+                sequence=self._sequence(1000),
                 side_effect_state=SideEffectState.MAY_HAVE_STARTED,
                 payload=_jsonable(reconnect),
             )
@@ -586,7 +591,7 @@ class RebootOrchestrator:
         completed = self.journal.record(
             plan_id=request.plan_id,
             key="reboot.return-discovered",
-            sequence=1100,
+            sequence=self._sequence(1100),
             side_effect_state=SideEffectState.VERIFIED,
             payload={
                 "operation_id": operation_id,
@@ -651,7 +656,11 @@ class RebootOrchestrator:
             serialized = _jsonable(raw)
             captures.append((item.cluster_id, serialized))
             hydrated[item.cluster_id] = raw
-        self.journal.record_cluster_preparation(plan_id=request.plan_id, captures=captures)
+        self.journal.record_cluster_preparation(
+            plan_id=request.plan_id,
+            captures=captures,
+            sequence_base=self.sequence_base,
+        )
         return hydrated
 
     def _load_capture(self, plan_id: str, item: ClusterGuardSpec) -> Any:
@@ -679,7 +688,7 @@ class RebootOrchestrator:
         self.journal.record(
             plan_id=request.plan_id,
             key=f"{prefix}{attempt}",
-            sequence=(300 if stage == "prepare" else 600) + attempt,
+            sequence=self._sequence((300 if stage == "prepare" else 600) + attempt),
             side_effect_state=SideEffectState.NOT_STARTED if stage == "prepare" else SideEffectState.PREPARED,
             payload=_jsonable(evaluation),
         )
@@ -731,7 +740,7 @@ class RebootOrchestrator:
         self.journal.record(
             plan_id=request.plan_id,
             key="reboot.cluster-guards-active",
-            sequence=400,
+            sequence=self._sequence(400),
             side_effect_state=SideEffectState.VERIFIED,
             payload={"guards": {str(key): _jsonable(value) for key, value in active.items()}},
         )
@@ -767,7 +776,7 @@ class RebootOrchestrator:
         self.journal.record(
             plan_id=request.plan_id,
             key=f"reboot.cluster-guards-restored-{trigger}",
-            sequence=650,
+            sequence=self._sequence(650),
             side_effect_state=SideEffectState.VERIFIED if verified else SideEffectState.MAY_HAVE_STARTED,
             payload={"verified": verified, "results": results},
         )
@@ -790,7 +799,7 @@ class RebootOrchestrator:
         self.journal.record(
             plan_id=request.plan_id,
             key="reboot.executor-staged",
-            sequence=500,
+            sequence=self._sequence(500),
             side_effect_state=SideEffectState.VERIFIED if receipt.acknowledged else SideEffectState.MAY_HAVE_STARTED,
             payload=_jsonable(receipt),
         )
@@ -815,7 +824,7 @@ class RebootOrchestrator:
         self.journal.record(
             plan_id=request.plan_id,
             key=f"{prefix}{attempt}",
-            sequence=250 + attempt,
+            sequence=self._sequence(250 + attempt),
             side_effect_state=SideEffectState.NOT_STARTED,
             payload={"safe_checkpoint": checkpoint},
         )
@@ -849,6 +858,9 @@ class RebootOrchestrator:
         if plan.lifecycle_state in {MaintenanceState.EXECUTING, MaintenanceState.PAUSED}:
             return plan
         raise RuntimeError(f"maintenance plan cannot execute from {plan.lifecycle_state.value}")
+
+    def _sequence(self, value: int) -> int:
+        return self.sequence_base + value
 
     @staticmethod
     def _validate_plan(plan: PlanRecord, request: RebootRequest) -> None:

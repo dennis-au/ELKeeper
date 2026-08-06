@@ -5,9 +5,11 @@ import ipaddress
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from app.modules.maintenance.post_return import CleanupProof, CleanupStatus, ExecutorCleanupTarget
 from app.modules.maintenance.reboot import ReconnectObservation, SshDisconnectObservation
@@ -28,6 +30,7 @@ from app.modules.maintenance.executor import executor_instance_unit, validate_cl
 NODE_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 SSH_USER_PATTERN = r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$"
 INVOCATION_PATTERN = r"^[A-Za-z0-9._:-]+$"
+ASSIGNMENT_ENDPOINT_REF_PATTERN = r"^assignment-[1-9][0-9]*$"
 MAX_REMOTE_OUTPUT_BYTES = 262144
 
 
@@ -122,6 +125,31 @@ class SSHRunner(Protocol):
     async def run(self, request: SSHCommandRequest) -> SSHCommandResult: ...
 
 
+class PooledRemoteCommandSSHRunner:
+    """Adapt the controller-owned pooled SSH callback to maintenance I/O.
+
+    The callback is injected by application assembly after the console runtime
+    owns its multiplexed sessions. Remote exception text is intentionally not
+    surfaced through the maintenance action or its run stream.
+    """
+
+    def __init__(self, remote_command: Callable[..., Any]) -> None:
+        self._remote_command = remote_command
+
+    async def run(self, request: SSHCommandRequest) -> SSHCommandResult:
+        try:
+            output = await self._remote_command(
+                _node_mapping(request.node),
+                *request.argv,
+                timeout=request.timeout_seconds,
+            )
+        except (OSError, RuntimeError, TimeoutError) as error:
+            raise RemoteOutcomeUnknown("pooled SSH command failed") from error
+        if not isinstance(output, (bytes, bytearray)):
+            raise RuntimeError("pooled SSH command returned an invalid result")
+        return SSHCommandResult(return_code=0, stdout=bytes(output))
+
+
 class AnsibleInvocation:
     def __init__(
         self,
@@ -162,6 +190,63 @@ class EndpointProbe(Protocol):
     async def __call__(self, *, node: ControllerNodeRecord, endpoint_ref: str) -> bool: ...
 
 
+@dataclass(frozen=True)
+class ManagedEndpointProbeTarget:
+    """A controller-generated endpoint readiness target for one assignment.
+
+    The target contains no credentials. HTTPS probes validate the workload's
+    mounted cluster CA and use only an allowlisted HTTP status response.
+    """
+
+    endpoint_ref: str
+    node_id: int
+    url: str
+    ca_path: str | None
+    accepted_statuses: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(ASSIGNMENT_ENDPOINT_REF_PATTERN, self.endpoint_ref):
+            raise ValueError("endpoint reference is invalid")
+        if self.node_id < 1:
+            raise ValueError("endpoint target node is invalid")
+        parsed = urlsplit(self.url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.port is None
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/", "/api/status"}
+        ):
+            raise ValueError("endpoint target URL is invalid")
+        try:
+            ipaddress.ip_address(parsed.hostname)
+        except ValueError as error:
+            raise ValueError("endpoint target host must be a literal IP address") from error
+        if parsed.scheme == "https":
+            if self.ca_path is None:
+                raise ValueError("HTTPS endpoint target requires a CA path")
+            _managed_endpoint_ca_path(self.ca_path)
+        elif self.ca_path is not None:
+            raise ValueError("HTTP endpoint target may not specify a CA path")
+        statuses = tuple(sorted(set(self.accepted_statuses)))
+        if not statuses or any(status < 100 or status > 599 for status in statuses):
+            raise ValueError("endpoint target statuses are invalid")
+        object.__setattr__(self, "accepted_statuses", statuses)
+
+    def command(self) -> tuple[str, ...]:
+        return (
+            "python3",
+            "-c",
+            _ENDPOINT_PROBE_SCRIPT,
+            self.url,
+            self.ca_path or "",
+            ",".join(str(status) for status in self.accepted_statuses),
+        )
+
+
 class RemoteFileObserver(Protocol):
     async def __call__(
         self, *, node: ControllerNodeRecord, path: str, maximum_bytes: int,
@@ -184,6 +269,15 @@ def _managed_observation_path(value: str) -> str:
     )
     if not any(path == root or root in path.parents for root in roots):
         raise ValueError("remote file path is outside the controller-owned maintenance roots")
+    return value
+
+
+def _managed_endpoint_ca_path(value: str) -> str:
+    value = _absolute_path(value, "endpoint CA path")
+    path = PurePosixPath(value)
+    root = PurePosixPath("/etc/elastic-control/clusters")
+    if root not in path.parents:
+        raise ValueError("endpoint CA path is outside the managed cluster root")
     return value
 
 
@@ -232,14 +326,40 @@ _CLEANUP_SCRIPT = r'''import os,re,stat,subprocess,sys
 unit=sys.argv[1]; paths=sys.argv[2:]
 if not re.fullmatch(r"ecp-maintenance-resume@[0-9a-f]{32}\.service",unit): raise SystemExit(20)
 subprocess.run(["systemctl","disable",unit],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False,timeout=30)
+operation_dir=None
 for value in paths:
     path=os.path.abspath(value)
     if not (path.startswith("/var/lib/elastic-control/maintenance/operations/") and path == os.path.normpath(value)): raise SystemExit(21)
+    parent=os.path.dirname(path)
+    if operation_dir is None: operation_dir=parent
+    elif operation_dir != parent: raise SystemExit(21)
     try: item=os.lstat(path)
     except FileNotFoundError: continue
     if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode) or item.st_uid != 0 or stat.S_IMODE(item.st_mode) != 0o600: raise SystemExit(22)
     os.unlink(path)
+if operation_dir:
+    try: os.rmdir(operation_dir)
+    except FileNotFoundError: pass
+    except OSError: raise SystemExit(23)
 raise SystemExit(0)'''
+
+_ENDPOINT_PROBE_SCRIPT = r'''import ssl,sys,urllib.error,urllib.request
+url,ca_path,statuses=sys.argv[1:]
+allowed={int(item) for item in statuses.split(",") if item}
+try:
+    context=ssl.create_default_context(cafile=ca_path) if ca_path else None
+    try:
+        response=urllib.request.urlopen(url,timeout=5,context=context)
+        code=response.getcode()
+    except urllib.error.HTTPError as error:
+        code=error.code
+    except Exception:
+        raise SystemExit(1)
+    raise SystemExit(0 if code in allowed else 1)
+except SystemExit:
+    raise
+except Exception:
+    raise SystemExit(1)'''
 
 
 class ControllerMaintenanceIOAdapter(ControllerMaintenanceIO):
@@ -253,9 +373,10 @@ class ControllerMaintenanceIOAdapter(ControllerMaintenanceIO):
         known_hosts_path: Callable[[Sequence[int]], str],
         host_key_args: Callable[[Mapping[str, Any], str], Sequence[str]],
         ssh_runner: SSHRunner,
-        ansible_runner: AnsibleRunner,
+        ansible_runner: AnsibleRunner | None,
         reboot_runner: RebootRunner | None = None,
         endpoint_probes: Mapping[str, EndpointProbe] | None = None,
+        endpoint_targets: Mapping[str, ManagedEndpointProbeTarget] | None = None,
         remote_file_observer: RemoteFileObserver | None = None,
         flags: MaintenanceRuntimeFlags | None = None,
         clock: Callable[[], datetime] = _utc_now,
@@ -268,6 +389,11 @@ class ControllerMaintenanceIOAdapter(ControllerMaintenanceIO):
         self.ansible_runner = ansible_runner
         self.reboot_runner = reboot_runner
         self.endpoint_probes = dict(endpoint_probes or {})
+        self.endpoint_targets = dict(endpoint_targets or {})
+        if set(self.endpoint_probes).intersection(self.endpoint_targets):
+            raise ValueError("endpoint probe references must be unique")
+        if any(reference != target.endpoint_ref for reference, target in self.endpoint_targets.items()):
+            raise ValueError("endpoint target reference does not match its mapping key")
         self.remote_file_observer = remote_file_observer
         self.flags = flags or MaintenanceRuntimeFlags()
         self.clock = clock
@@ -291,8 +417,10 @@ class ControllerMaintenanceIOAdapter(ControllerMaintenanceIO):
         )
 
     async def run_playbook(self, request: PlaybookExecutionRequest) -> ExecutionReceipt:
-        if not self.flags.executor_staging_enabled:
+        if not (self.flags.executor_staging_enabled or self.flags.reboot_enabled):
             raise RuntimeMutationDisabled("maintenance playbook execution is disabled")
+        if self.ansible_runner is None:
+            raise RuntimeMutationDisabled("no maintenance Ansible runner is configured")
         node = self._node(request.node_id)
         key_path = self.active_key_path()
         known_hosts = self.known_hosts_path((node.node_id,))
@@ -310,12 +438,42 @@ class ControllerMaintenanceIOAdapter(ControllerMaintenanceIO):
     async def request_reboot(self, *, node_id: int, operation_id: str) -> RebootRequestReceipt:
         if not self.flags.reboot_enabled:
             raise RuntimeMutationDisabled("maintenance reboot execution is disabled")
-        if self.reboot_runner is None:
-            raise RuntimeMutationDisabled("no low-level reboot runner is configured")
-        return await self.reboot_runner.request(
-            node=self._node(node_id),
-            operation_id=validate_operation_id(operation_id),
+        operation_id = validate_operation_id(operation_id)
+        if self.reboot_runner is not None:
+            return await self.reboot_runner.request(
+                node=self._node(node_id),
+                operation_id=operation_id,
+            )
+        receipt = await self.run_playbook(
+            PlaybookExecutionRequest(
+                node_id=node_id,
+                playbook="host-maintenance-reboot.yml",
+                variables={
+                    "maintenance_host_reboot_enabled": True,
+                    "maintenance_executor_operation_id": operation_id,
+                },
+                timeout_seconds=60,
+            )
         )
+        return RebootRequestReceipt(
+            operation_id=operation_id,
+            invocation_id=receipt.invocation_id,
+            outcome=receipt.outcome,
+            observed_at=receipt.observed_at,
+            error_category=receipt.error_category,
+        )
+
+    async def stop_managed_unit(self, *, node_id: int, unit: str) -> bool:
+        if not self.flags.workload_lifecycle_enabled:
+            raise RuntimeMutationDisabled("managed workload lifecycle execution is disabled")
+        unit = validate_managed_unit(unit)
+        return await self._successful(node_id, ("systemctl", "stop", "--", unit), 120)
+
+    async def start_managed_unit(self, *, node_id: int, unit: str) -> bool:
+        if not self.flags.workload_lifecycle_enabled:
+            raise RuntimeMutationDisabled("managed workload lifecycle execution is disabled")
+        unit = validate_managed_unit(unit)
+        return await self._successful(node_id, ("systemctl", "start", "--", unit), 120)
 
     async def wait_for_disconnect(self, *, node_id: int, invocation_id: str) -> SshDisconnectObservation:
         if not re.fullmatch(INVOCATION_PATTERN, invocation_id):
@@ -408,6 +566,11 @@ class ControllerMaintenanceIOAdapter(ControllerMaintenanceIO):
         return states
 
     async def endpoint_ready(self, *, node_id: int, endpoint_ref: str) -> bool:
+        target = self.endpoint_targets.get(endpoint_ref)
+        if target is not None:
+            if target.node_id != node_id:
+                return False
+            return await self._successful(node_id, target.command(), 15)
         probe = self.endpoint_probes.get(endpoint_ref)
         if probe is None:
             raise ValueError("endpoint reference is not allowlisted")

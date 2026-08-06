@@ -25,6 +25,7 @@ from app.maintenance_post_return import (
     ClusterExpectation,
     EndpointExpectation,
     ExecutorCleanupTarget,
+    HostMaintenancePostReturnRequest,
     NodeIdentityExpectation,
     NodeIdentityObservation,
     PostReturnCoordinator,
@@ -151,6 +152,35 @@ def request():
             ),
         ),
         executor_cleanup=cleanup_target(),
+    )
+
+
+def host_maintenance_request():
+    return HostMaintenancePostReturnRequest(
+        plan_id=PLAN_ID,
+        node_id=4,
+        host_return_timeout_seconds=900,
+        workloads=(WorkloadExpectation(assignment_id=11, unit=UNIT),),
+        endpoints=(EndpointExpectation(endpoint_ref="elasticsearch-http"),),
+        clusters=(
+            ClusterExpectation(
+                cluster_id=7,
+                required_health="yellow",
+                nodes=(
+                    NodeIdentityExpectation(
+                        cluster_id=7,
+                        assignment_id=11,
+                        persistent_node_id="persistent-node-1",
+                        node_name="alpha-hot-1",
+                        version="9.1.0",
+                        cluster_uuid=CLUSTER_UUID,
+                    ),
+                ),
+            ),
+        ),
+        service_budgets=(
+            ServiceBudgetExpectation(cluster_id=7, role="hot", minimum_available=2),
+        ),
     )
 
 
@@ -294,6 +324,22 @@ def coordinator(
 
 
 class MaintenancePostReturnTests(unittest.IsolatedAsyncioTestCase):
+    async def test_host_maintenance_verification_proves_runtime_cluster_and_budget_return(self):
+        result = await coordinator().verify_host_maintenance(host_maintenance_request())
+
+        self.assertEqual(result.state, "complete")
+        self.assertEqual(result.error_categories, ())
+        self.assertTrue(all(check.status == "passed" for check in result.checks))
+
+    async def test_host_maintenance_verification_keeps_return_in_recovery_on_identity_mismatch(self):
+        cluster = ClusterFake()
+        cluster.identity = cluster.identity.model_copy(update={"version": "9.2.0"})
+
+        result = await coordinator(cluster=cluster).verify_host_maintenance(host_maintenance_request())
+
+        self.assertEqual(result.state, "recovery_required")
+        self.assertIn(PostReturnErrorCategory.NODE_VERSION_MISMATCH, result.error_categories)
+
     async def test_success_verifies_return_restores_cluster_then_releases_locks(self):
         events = []
         result = await coordinator(events=events).verify_and_cleanup(request())

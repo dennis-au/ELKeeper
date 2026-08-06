@@ -36,6 +36,11 @@ class ManualMaintenanceApiTests(unittest.TestCase):
     def setUp(self):
         self.main.MAINTENANCE_CAPABILITIES.update({
             "planning": True,
+            "manual_maintenance_entry": True,
+            "container_stop": False,
+            "host_shutdown": False,
+            "manual_maintenance_exit": True,
+            "recovery": True,
             "host_reboot": False,
             "rolling_restart": False,
             "upgrade": False,
@@ -151,6 +156,42 @@ class ManualMaintenanceApiTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT status FROM runs").fetchone()[0], "succeeded")
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM maintenance_locks WHERE released_at IS NULL").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT action FROM audit_events WHERE action='manual-maintenance-exited'").fetchone()[0], "manual-maintenance-exited")
+
+    def test_planning_does_not_authorize_entry_but_active_mode_can_exit_after_entry_is_disabled(self):
+        headers = self.login()
+        node_id = self.node(headers)
+        self.main.MAINTENANCE_CAPABILITIES.update({
+            "planning": True,
+            "manual_maintenance_entry": False,
+        })
+        blocked = self.client.post(
+            f"/api/nodes/{node_id}/maintenance-mode/enter",
+            headers=headers,
+            json={"reason": "kernel maintenance", "duration_seconds": 600},
+        )
+        self.assertEqual(blocked.status_code, 409, blocked.text)
+        self.assertIn("entry", blocked.json()["detail"].lower())
+
+        self.main.MAINTENANCE_CAPABILITIES["manual_maintenance_entry"] = True
+        entered = self.client.post(
+            f"/api/nodes/{node_id}/maintenance-mode/enter",
+            headers=headers,
+            json={"reason": "kernel maintenance", "duration_seconds": 600},
+        )
+        self.assertEqual(entered.status_code, 201, entered.text)
+        self.observe(node_id)
+
+        self.main.MAINTENANCE_CAPABILITIES.update({
+            "planning": False,
+            "manual_maintenance_entry": False,
+        })
+        exited = self.client.post(
+            f"/api/nodes/{node_id}/maintenance-mode/exit",
+            headers=headers,
+            json={"reason": "maintenance complete"},
+        )
+        self.assertEqual(exited.status_code, 200, exited.text)
+        self.assertEqual(exited.json()["state"], "available")
 
     def test_exit_with_expired_lock_requires_recovery_without_remote_action(self):
         headers = self.login()

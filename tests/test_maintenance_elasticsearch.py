@@ -14,6 +14,7 @@ from app.maintenance_elasticsearch import (
     AllocationGuardController,
     AllocationGuardPhase,
     ApiKeyCredential,
+    BasicAuthCredential,
     DocumentedRollingBackend,
     ElasticsearchClientConfig,
     ElasticsearchMaintenanceClient,
@@ -96,6 +97,12 @@ class ElasticsearchMaintenanceClientSecurityTests(unittest.IsolatedAsyncioTestCa
         self.assertNotIn(SECRET, repr(client))
         self.assertNotIn(SECRET, str(raised.exception))
         self.assertNotIn(SECRET, repr(raised.exception))
+
+    def test_basic_credential_is_header_only_and_redacts_its_password(self):
+        credential = BasicAuthCredential(username="elastic", password=SecretStr("maint-password"))
+
+        self.assertEqual(credential.authorization_header(), "Basic ZWxhc3RpYzptYWludC1wYXNzd29yZA==")
+        self.assertNotIn("maint-password", repr(credential))
 
 
 class ElasticsearchMaintenanceClientContractTests(unittest.IsolatedAsyncioTestCase):

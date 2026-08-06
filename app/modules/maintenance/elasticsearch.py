@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import re
 import ssl
 from collections.abc import Mapping
@@ -102,6 +103,32 @@ class ApiKeyCredential(FrozenModel):
 
     def authorization_header(self) -> str:
         return f"ApiKey {self.value.get_secret_value()}"
+
+
+class BasicAuthCredential(FrozenModel):
+    """Header-only Basic credentials for the existing secured controller path."""
+
+    username: str = Field(min_length=1, max_length=256)
+    password: SecretStr = Field(repr=False)
+
+    @field_validator("username")
+    @classmethod
+    def username_is_header_safe(cls, value):
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", value):
+            raise ValueError("Basic authentication username is invalid")
+        return value
+
+    @field_validator("password")
+    @classmethod
+    def password_is_non_empty(cls, value):
+        raw = value.get_secret_value()
+        if not raw or len(raw) > 8192 or any(character in raw for character in "\r\n"):
+            raise ValueError("Basic authentication password is invalid")
+        return value
+
+    def authorization_header(self) -> str:
+        raw = f"{self.username}:{self.password.get_secret_value()}".encode("utf-8")
+        return "Basic " + base64.b64encode(raw).decode("ascii")
 
 
 class NodeShutdownCapability(FrozenModel):

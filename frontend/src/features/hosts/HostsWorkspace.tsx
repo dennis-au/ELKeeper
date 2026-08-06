@@ -3,7 +3,7 @@ import {
   EuiBadge, EuiBasicTable, EuiButton, EuiButtonEmpty, EuiCallOut, EuiCheckbox, EuiConfirmModal,
   EuiFieldNumber, EuiFieldPassword, EuiFieldText, EuiForm, EuiFormRow, EuiHealth, EuiModal,
   EuiIcon, EuiModalBody, EuiModalFooter, EuiModalHeader, EuiModalHeaderTitle, EuiOverlayMask, EuiPanel,
-  EuiRadioGroup, EuiSelect, EuiSpacer, EuiSwitch, EuiText, EuiTextArea, EuiTitle,
+  EuiRadioGroup, EuiSelect, EuiSpacer, EuiSwitch, EuiText, EuiTextArea, EuiTitle, EuiToolTip,
 } from '@elastic/eui';
 import type { EuiBasicTableColumn } from '@elastic/eui';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -19,6 +19,7 @@ import {
 import { formatDateTime, timeAgo } from '../../shared/format';
 import type { Cluster } from '../clusters';
 import type { HostRuntime, NodeRecord } from './types';
+import type { MaintenancePlanHistoryResponse } from '../maintenance';
 import type {
   MaintenanceAction,
   MaintenanceActionControl,
@@ -44,6 +45,18 @@ interface HostMaintenancePlanResponse {
 }
 
 const terminalMaintenanceStates = new Set(['succeeded', 'failed', 'cancelled']);
+const hostMaintenanceColor: Record<string, 'primary' | 'success' | 'warning' | 'danger' | 'hollow'> = {
+  ready: 'success', executing: 'primary', paused: 'warning', recovery_required: 'danger',
+  blocked: 'danger', failed: 'danger', cancelled: 'warning', succeeded: 'success',
+};
+
+export function activeHostMaintenanceByNode(plans: MaintenancePlanHistoryResponse['items']) {
+  return new Map(plans
+    .filter((plan) => plan.view.header.target.kind === 'host'
+      && typeof plan.view.header.target.id === 'number'
+      && !terminalMaintenanceStates.has(plan.lifecycle_state))
+    .map((plan) => [plan.view.header.target.id as number, plan]));
+}
 
 export function maintenancePlanRefetchInterval(response?: {
   lifecycle_state?: string;
@@ -141,6 +154,12 @@ export function HostsWorkspace() {
     queryFn: maintenanceApi.capabilities,
     retry: false,
   });
+  const { data: maintenanceHistory } = useQuery<MaintenancePlanHistoryResponse>({
+    queryKey: ['maintenance-plans', 'hosts'],
+    queryFn: () => maintenanceApi.listPlans<MaintenancePlanHistoryResponse>({ limit: 100 }),
+    retry: false,
+    refetchInterval: 10000,
+  });
   const [editing, setEditing] = useState<NodeRecord | 'new'>();
   const [confirm, setConfirm] = useState<{ action: 'initialize' | 'reboot' | 'deinitialize' | 'delete' | 'removeLegacyKnownHosts'; node: NodeRecord }>();
   const [keyInstall, setKeyInstall] = useState<NodeRecord>();
@@ -177,6 +196,7 @@ export function HostsWorkspace() {
   const runtime = new Map((dashboard?.hosts || []).map((host) => [host.id, host]));
   const assignments = new Map<number, number>();
   clusters.forEach((cluster) => cluster.assignments.forEach((item) => assignments.set(item.node_id, (assignments.get(item.node_id) || 0) + 1)));
+  const hostMaintenance = activeHostMaintenanceByNode(maintenanceHistory?.items || []);
 
   const runAction = async () => {
     if (!confirm) return;
@@ -282,6 +302,10 @@ export function HostsWorkspace() {
     { field: 'runtime.podman_socket_active', name: 'Podman socket', render: (value: boolean) => <EuiHealth color={value ? 'success' : 'subdued'}>{value ? 'active' : 'down'}</EuiHealth> },
     { field: 'runtime.podman_version', name: 'Podman version', render: (value: string, item: HostItem) => <span>{item.runtime?.podman_version || 'not installed or not observed'}</span> },
     { field: 'workload_count', name: 'Workloads' },
+    { field: 'id', name: 'Maintenance', render: (value: number) => {
+      const plan = hostMaintenance.get(value);
+      return plan ? <EuiToolTip content={`Plan ${plan.plan_id}: ${plan.view.header.operation}`}><EuiBadge color={hostMaintenanceColor[plan.lifecycle_state] || 'hollow'}>{plan.lifecycle_state.replaceAll('_', ' ')}</EuiBadge></EuiToolTip> : <span className="block-muted">none</span>;
+    } },
     { field: 'runtime.observed_at', name: 'Observed', render: (value?: string) => timeAgo(value) },
     { name: 'Actions', actions: [
       { name: 'Probe', description: 'Probe host over SSH', icon: 'inspect', type: 'icon' as const, onClick: probe },

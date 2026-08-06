@@ -329,6 +329,7 @@ def complete_controller_bootstrap(
     administrator: str,
     password_hash: str,
     default_timezone: str,
+    reconcile_maintenance_workflows: Callable[[], object] | None = None,
 ) -> frozenset[int]:
     """Finish startup recovery after schema upgrades have completed.
 
@@ -341,6 +342,8 @@ def complete_controller_bootstrap(
 
     run_migrations(connection, maintenance_migrations)
     recovery = prepare_maintenance_recovery()
+    if reconcile_maintenance_workflows is not None:
+        reconcile_maintenance_workflows()
     protected_run_ids = frozenset(int(value) for value in recovery.protected_run_ids)
     connection.execute("DELETE FROM assignments")
     connection.execute(
