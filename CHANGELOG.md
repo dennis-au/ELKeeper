@@ -2,6 +2,17 @@
 
 All notable changes to ELKeeper are documented in this file.
 
+## [1.5.0] - 2026-08-06
+
+### Reviewed changes
+
+- feat: add maintenance workflow safety controls
+
+### Verification
+
+- Scheduled review checks passed for changes since `v1.4.1`.
+- No live controller deployment or replacement is performed by this workflow.
+
 ## [1.4.1] - 2026-08-05
 
 ### Reviewed changes
